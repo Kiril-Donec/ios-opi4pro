@@ -16,7 +16,7 @@ with TemporaryDirectory() as temp:
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_text("\n".join(before for before, _ in anchors) + "\n")
     changes = adapt.prepare(root)
-    assert len(changes) == 5
+    assert len(changes) == 6
     for _, (before, after) in changes.items():
         assert before != after
     assert "0xBBF11000" in changes[root / "osfmk/arm64/sweet_early.c"][1]
@@ -26,6 +26,8 @@ with TemporaryDirectory() as temp:
     assert "glyph[gy * 2] | glyph[gy * 2 + 1]" in early
     assert "0xBA000000" in changes[root / "osfmk/arm64/start.s"][1]
     assert "0x1F11000" in changes[root / "osfmk/arm64/arm_vm_init.c"][1]
+    assert "return thread ? thread->machine.pcpu_data_base : 0;" in changes[
+        root / "osfmk/arm/cpu_common.c"][1]
     patch = root / "a733-overlay.patch"
     patch.write_text(adapt.make_patch(root, changes))
     subprocess.run(["git", "apply", "--check", str(patch)], cwd=root, check=True)

@@ -90,6 +90,17 @@ FIXES = {
             "sweet_early_relocate(SWEET_EARLY_FB_VA + 0x1F11000ULL);",
         ),
     ],
+    "osfmk/arm/cpu_common.c": [
+        # The first hardware abort is an access to address 0x220 inside
+        # current_percpu_base(): current_thread() is still NULL at entry.
+        # On the single boot A76, offset zero addresses the master per-CPU
+        # section until a first thread installs machine.pcpu_data_base.
+        (
+            "return current_thread()->machine.pcpu_data_base;",
+            "thread_t thread = current_thread();\n"
+            "\treturn thread ? thread->machine.pcpu_data_base : 0;",
+        ),
+    ],
 }
 
 

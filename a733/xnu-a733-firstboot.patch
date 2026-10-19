@@ -135,3 +135,16 @@ diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
  #endif
  	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
  
+diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -822,7 +822,8 @@
+ vm_offset_t
+ current_percpu_base(void)
+ {
+-	return current_thread()->machine.pcpu_data_base;
++	thread_t thread = current_thread();
++	return thread ? thread->machine.pcpu_data_base : 0;
+ }
+ 
+ vm_offset_t

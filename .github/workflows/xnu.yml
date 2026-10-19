@@ -25,6 +25,9 @@ on:
       - "a733/src/xnu_payload.c"
       - "a733/Makefile"
       - "a733/tools/mkadt_a733.py"
+      - "a733/tools/sd-boot-xnu-experimental.cmd"
+      - "a733/tests/test_xnu_script.py"
+      - "a733/TEST-XNU-RU.md"
       - ".github/workflows/xnu.yml"
 
 
@@ -178,7 +181,7 @@ jobs:
           name: xnu-kernel
           path: kernel
       - name: Install AArch64 Stage0 toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu u-boot-tools
       - name: Compile and test A733 Stage0
         run: make -C a733 test adt all test-boot
       - name: Audit, pack and validate real XNU payload
@@ -187,7 +190,9 @@ jobs:
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet a733/build/a733-early.adt a733/build/a733-xnu.payload
           cc -std=c11 -O2 -Wall -Wextra -Werror -DA733_HOST_TEST -I a733/src a733/src/xnu_payload.c a733/tests/test_real_xnu_payload.c -o a733/build/test_real_xnu_payload
           a733/build/test_real_xnu_payload a733/build/a733-xnu.payload
-          sha256sum a733/build/stage0.uimg a733/build/a733-xnu.payload
+          mkimage -A arm64 -O linux -T script -C none -n "a733-xnu-one-shot" -d a733/tools/sd-boot-xnu-experimental.cmd a733/build/a733-xnu-one-shot.scr
+          mkimage -l a733/build/a733-xnu-one-shot.scr
+          sha256sum a733/build/stage0.uimg a733/build/a733-xnu.payload a733/build/a733-xnu-one-shot.scr
       - uses: actions/upload-artifact@v4
         with:
           name: a733-firstboot-EXPERIMENTAL-no-flash
@@ -195,8 +200,10 @@ jobs:
             a733/build/stage0.uimg
             a733/build/a733-xnu.payload
             a733/build/a733-xnu.payload.sha256
+            a733/build/a733-xnu-one-shot.scr
             a733/build/a733-early.adt
             a733/tools/sd-boot-xnu-experimental.cmd
             a733/V4-XNU.md
+            a733/TEST-XNU-RU.md
           retention-days: 14
           if-no-files-found: error

@@ -31,8 +31,25 @@ Target: Orange Pi 4 Pro (Allwinner A733, 2×Cortex-A76 + 6×Cortex-A55, 4 GiB RA
 
 See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the user's sole boot card.
 
-## Pending next A733 CI check
+## Successful A733 packaging CI
 
 - `A733XNU1` is a board-tagged payload format, rejected by old Stage0 and rejecting legacy Xiaomi payloads in new Stage0.
 - `a733/tools/package_xnu_a733.py` statically audits the Mach-O before it packs the board-tagged payload.
 - XNU CI now adds `package-a733`: Linux Stage0 build, complete A733 payload and the actual Stage0 validator. The artifact is **not approved for flashing** until physical memory/boot protocol questions are resolved.
+
+## One-shot test artifact ready (still no hardware XNU execution)
+
+- Commit `e4054fecc069aea6ef07902b2b0e72724d286160` passed both macOS
+  XNU build/static audit and Linux Stage0 + real payload validation:
+  [run 39298193231](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39298193231).
+- The next bundle build also includes a compiled
+  `a733-xnu-one-shot.scr` alongside `stage0.uimg`, `a733-xnu.payload` and
+  the ADT. Script filenames match these exact binaries.
+- All existing U-Boot/SD autostart files must stay untouched. The owner has
+  only **one** SD card: first confirm `mmc 0:1`, existing device tree and
+  interactive U-Boot access. Never flash or overwrite `boot.scr`.
+- The static vendor DTB previously reported only 512 MiB; whether U-Boot's
+  `bootm` FDT fixup exposes usable A733 high DRAM needs a **board
+  observation**, not guesswork. Stage0 will refuse unsafe RAM.
+- Follow [TEST-XNU-RU.md](TEST-XNU-RU.md) for the supervised one-shot
+  procedure. No claim that real XNU has booted.

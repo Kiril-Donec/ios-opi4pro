@@ -110,7 +110,7 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
  			    early_col * EARLY_CELL_W;
  			for (unsigned int gx = 0; gx < 8; gx++) {
 -				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
-+				uint32_t pixel = (glyph[gy * 2] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
++				uint32_t pixel = ((glyph[gy * 2] | glyph[gy * 2 + 1]) & (1u << gx)) ? 0xffffffffu : 0xff000000u;
  				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
  					line[gx * EARLY_SCALE + sx] = pixel;
  				}

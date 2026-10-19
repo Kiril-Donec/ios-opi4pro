@@ -16,8 +16,8 @@ Target: Orange Pi 4 Pro (Allwinner A733, 2×Cortex-A76 + 6×Cortex-A55, 4 GiB RA
 
 ## NOT confirmed
 
-- No execution of any XNU instruction on A733.
-- No verified real XNU boot-args handoff, GIC timer, storage, IOKit framebuffer, touch, Wi-Fi or iOS userland.
+- No completed XNU bootstrap, kernel scheduler start, or iOS userland on A733.
+- GIC timer, storage, IOKit framebuffer, touch and Wi-Fi remain unverified.
 - A Qualcomm Xiaomi kernel packed into a payload is NOT adapted and must not be flashed.
 
 ## Current source and plans
@@ -77,3 +77,10 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - The SD/U-Boot/ext4 and artifact paths are confirmed operational. Next
   photo should reveal whether the patched FDT property passes and whether
   Stage0 reaches its A76/XNU diagnostic.
+
+## Physical AutoBoot v3: first XNU code execution (2026-10-19)
+
+- The board displayed the Stage0 portrait HDMI page and `XNU: JUMP`; on the same HDMI display, XNU's early unrotated exception console printed the full AArch64 register dump.
+- The photographed values include `PC=0xfffffe00074a925c`, `ESR=0x96000006`, `FAR=0x220`, `x0=0`. Symbolication against the **exact macOS CI kernel artifact** from run `39299998464` locates `PC` in `_current_percpu_base + 0xC`: a load from `current_thread()->machine.pcpu_data_base`, with a null current-thread pointer. This could be either the primary failure or a second fault during early exception handling.
+- **XNU instruction execution is now demonstrated, but XNU has not successfully bootstrapped.** This is not an iOS userland boot.
+- AutoBoot v4 keeps the working loader and adjusts only XNU's console renderer to show 24 compact lines instead of 12 within the same safe 1024x224 HDMI scanout. Kernel compile and payload packaging passed on [XNU run 39317422418](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39317422418); Stage0 tests passed on [run 39317422221](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39317422221). Physical v4 still untested.

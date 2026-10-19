@@ -7,6 +7,13 @@ Target: Orange Pi 4 Pro (Allwinner A733, 2×Cortex-A76 + 6×Cortex-A55, 4 GiB RA
 - Stage0 phone-shaped portrait HDMI diagnostic screen displayed.
 - U-Boot/PSCI `CPU_ON` entered one Cortex-A76, MPIDR `0x600`, and reported MMFR0 `0x0000000000101122`.
 
+## Automated validation on GitHub
+
+- Commit `a8729bc72595ffd12bcfe4cbd48da133896ce096` includes 20 upstream updates and the first A733 source overlay.
+- Linux Stage0 Actions run [39293622912](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39293622912): **SUCCESS** (cross-compile and host tests).
+- macOS XNU Actions run [39293623008](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39293623008): **SUCCESS** (XNU compilation, artifacts, static `audit_a733_macho.py`).
+- This validates a compiled A733 first-boot Mach-O, **NOT** its ability to execute on Orange Pi hardware.
+
 ## NOT confirmed
 
 - No execution of any XNU instruction on A733.

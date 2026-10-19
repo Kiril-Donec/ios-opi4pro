@@ -20,6 +20,8 @@ on:
     paths:
       - "xnu/patches/**"
       - "a733/xnu-a733-firstboot.patch"
+      - "a733/tools/adapt_xnu_a733.py"
+      - "a733/tests/test_adapt_xnu.py"
       - "a733/tools/audit_a733_macho.py"
       - "a733/tools/package_xnu_a733.py"
       - "a733/src/xnu_payload.c"

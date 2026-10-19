@@ -20,6 +20,10 @@ with TemporaryDirectory() as temp:
     for _, (before, after) in changes.items():
         assert before != after
     assert "0xBBF11000" in changes[root / "osfmk/arm64/sweet_early.c"][1]
+    early = changes[root / "osfmk/arm64/sweet_early.c"][1]
+    assert "#define EARLY_CELL_H (8u * EARLY_SCALE)" in early
+    assert "for (unsigned int gy = 0; gy < 8; gy++)" in early
+    assert "glyph[gy * 2]" in early
     assert "0xBA000000" in changes[root / "osfmk/arm64/start.s"][1]
     assert "0x1F11000" in changes[root / "osfmk/arm64/arm_vm_init.c"][1]
     patch = root / "a733-overlay.patch"

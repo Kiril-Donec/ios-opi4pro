@@ -68,6 +68,15 @@ FIXES = {
         ("#define EARLY_HEIGHT 2400u", "#define EARLY_HEIGHT 224u"),
         ("#define EARLY_STRIDE (4320u / 4)", "#define EARLY_STRIDE (4096u / 4)"),
         ("#define EARLY_SCALE 2u", "#define EARLY_SCALE 1u"),
+        # A real-board abort dumps more than twelve lines of registers and
+        # scrolls the original fault description off the clipped HDMI area.
+        # Render the 16-pixel BIOS glyph at half height to retain 24 lines.
+        ("#define EARLY_CELL_H (16u * EARLY_SCALE)",
+         "#define EARLY_CELL_H (8u * EARLY_SCALE)"),
+        ("for (unsigned int gy = 0; gy < 16; gy++) {",
+         "for (unsigned int gy = 0; gy < 8; gy++) {"),
+        ("(glyph[gy] & (1u << gx))",
+         "(glyph[gy * 2] & (1u << gx))"),
     ],
     "osfmk/arm64/arm_vm_init.c": [
         (
@@ -94,6 +103,7 @@ def verify_layout() -> None:
     # Marker bar: 21 marks * 48 px and 32 lines of height, inside 1024x224.
     assert 21 * 48 <= 1024
     assert 192 + 32 == 224
+    assert (224 - 32) // 8 == 24
 
 
 def prepare(root: Path) -> dict[Path, tuple[str, str]]:

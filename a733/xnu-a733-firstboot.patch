@@ -77,7 +77,7 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
-@@ -11,12 +11,12 @@
+@@ -11,14 +11,14 @@
  #include <stdint.h>
  #include <kern/misc_protos.h>
  
@@ -93,8 +93,27 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 +#define EARLY_STRIDE (4096u / 4)
 +#define EARLY_SCALE 1u
  #define EARLY_CELL_W (8u * EARLY_SCALE)
- #define EARLY_CELL_H (16u * EARLY_SCALE)
+-#define EARLY_CELL_H (16u * EARLY_SCALE)
++#define EARLY_CELL_H (8u * EARLY_SCALE)
  #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+ #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+ 
+@@ -62,13 +62,13 @@
+ 		}
+ 	}
+ 	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+-	for (unsigned int gy = 0; gy < 16; gy++) {
++	for (unsigned int gy = 0; gy < 8; gy++) {
+ 		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+ 			volatile uint32_t *line = EARLY_FB +
+ 			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+ 			    early_col * EARLY_CELL_W;
+ 			for (unsigned int gx = 0; gx < 8; gx++) {
+-				uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
++				uint32_t pixel = (glyph[gy * 2] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+ 				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+ 					line[gx * EARLY_SCALE + sx] = pixel;
+ 				}
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 --- a/osfmk/arm64/arm_vm_init.c
 +++ b/osfmk/arm64/arm_vm_init.c

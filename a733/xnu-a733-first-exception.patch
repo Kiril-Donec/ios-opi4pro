@@ -1,0 +1,93 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -153,10 +153,42 @@
+      * after TTBR0 removal; normal framebuffer serial takes over later. */
+     (void)base;
+     sweet_early_disable();
+ }
+ 
++
++/* A733: report the FIRST synchronous exception before XNU tries to inspect
++ * CPU data via current_thread() (TPIDR_EL1 is still NULL during bootstrap).
++ * These three values come directly from ELR_EL1, ESR_EL1 and FAR_EL1 in the
++ * exception entry assembly. No thread, malloc, locks, _doprnt or CPU number. */
++static void
++sweet_early_hex64(uint64_t value)
++{
++    static const char digits[] = "0123456789abcdef";
++    sweet_early_string("0x");
++    for (unsigned int n = 0; n < 16; n++) {
++        sweet_early_putc(digits[(value >> (60u - n * 4u)) & 15u]);
++    }
++}
++
++__attribute__((noreturn))
++void
++sweet_early_boot_fault(uint64_t pc, uint64_t esr, uint64_t far)
++{
++    sweet_early_string("\nA733 FIRST EXCEPTION (NO THREAD)\nPC  ");
++    sweet_early_hex64(pc);
++    sweet_early_string("\nESR ");
++    sweet_early_hex64(esr);
++    sweet_early_string("\nFAR ");
++    sweet_early_hex64(far);
++    sweet_early_string("\nBoot halted: photograph this screen.\n");
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (;;) {
++        __asm__ volatile("wfe");
++    }
++}
++
+ void
+ sweet_early_disable(void)
+ {
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -585,10 +585,22 @@
+ UNWIND_DIRECTIVES	
+ 	
+ 	mrs		x1, ESR_EL1							// Load exception syndrome
+ 	mrs		x2, FAR_EL1							// Load fault address
+ 
++#if defined(SWEET)
++	/* A733 boot may fault before TPIDR_EL1 has a thread. Normal trap/panic
++	 * handlers dereference current_thread(), masking the original exception.
++	 * Capture the true ELR/ESR/FAR first and deliberately halt. */
++	mrs		x3, TPIDR_EL1
++	cbnz		x3, Lsweet_sync_has_thread
++	mrs		x0, ELR_EL1
++	bl		EXT(sweet_early_boot_fault)
++	b		.
++Lsweet_sync_has_thread:
++#endif
++
+ 	/* At this point, the LR contains the value of ELR_EL1. In the case of an
+ 	 * instruction prefetch abort, this will be the faulting pc, which we know
+ 	 * to be invalid. This will prevent us from backtracing through the
+ 	 * exception if we put it in our stack frame, so we load the LR from the
+ 	 * exception saved state instead.
+@@ -758,10 +770,20 @@
+ fleh_synchronous_sp1:
+ 	mrs		x1, ESR_EL1							// Load exception syndrome
+ 	str		x1, [x0, SS64_ESR]
+ 	mrs		x2, FAR_EL1							// Load fault address
+ 	str		x2, [x0, SS64_FAR]
++#if defined(SWEET)
++	/* SP1 was selected during A733 kernel bootstrap. Bypass XNU's
++	 * threaded panic path while TPIDR_EL1 is still NULL. */
++	mrs		x3, TPIDR_EL1
++	cbnz		x3, Lsweet_sp1_has_thread
++	mrs		x0, ELR_EL1
++	bl		EXT(sweet_early_boot_fault)
++	b		.
++Lsweet_sp1_has_thread:
++#endif
+ 	PUSH_FRAME
+ 	bl		EXT(sleh_synchronous_sp1)
+ 	b 		.
+ 
+ 	.text

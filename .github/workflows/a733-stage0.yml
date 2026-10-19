@@ -1,0 +1,29 @@
+name: A733 Stage0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [topaz]
+    paths:
+      - "a733/**"
+      - ".github/workflows/a733-stage0.yml"
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install AArch64 toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Host-side tests
+        working-directory: a733
+        run: make test
+      - name: Build and check Stage0 image
+        working-directory: a733
+        run: make adt all test-boot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a733-stage0-dev-only
+          path: a733/build/stage0.uimg
+          if-no-files-found: error

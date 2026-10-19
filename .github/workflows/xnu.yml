@@ -1,4 +1,4 @@
-name: xnu
+name: A733 XNU
 
 on:
   workflow_dispatch:
@@ -16,9 +16,11 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    branches: [topaz]
     paths:
       - "xnu/patches/**"
+      - "a733/xnu-a733-firstboot.patch"
+      - "a733/tools/audit_a733_macho.py"
       - ".github/workflows/xnu.yml"
 
 
@@ -56,6 +58,7 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          cp a733/xnu-a733-firstboot.patch dxb/patches/9999-a733-firstboot.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -147,8 +150,13 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      - name: Audit compiled A733 kernel
+        run: |
+          test -s out/kernel.development.sweet
+          python3 a733/tools/audit_a733_macho.py out/kernel.development.sweet
+
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: success()
         with:
           name: xnu-kernel
           path: out/

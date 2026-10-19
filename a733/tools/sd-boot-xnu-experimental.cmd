@@ -11,11 +11,12 @@ if ext4load mmc 0:1 0x42000000 /ios-a733/stage0.uimg; then
         echo FDT LOADED
         if ext4load mmc 0:1 0x52000000 /ios-a733/a733-xnu.payload; then
             echo XNU PAYLOAD LOADED
-            if setexpr a733_end 0x52000000 + ${filesize}; then
+            # v59 setexpr emits a bare hex string; fdt cells require 0x.
+            if setexpr a733_end 0x52000000 + 0x${filesize}; then
                 if fdt addr 0x43000000; then
                     if fdt resize 0x2000; then
                         if fdt set /chosen a733,xnu-payload-start <0x0 0x52000000>; then
-                            if fdt set /chosen a733,xnu-payload-end <0x0 ${a733_end}>; then
+                            if fdt set /chosen a733,xnu-payload-end <0x0 0x${a733_end}>; then
                                 echo BOOTM HANDOFF - A76 MPIDR 0x600
                                 bootm 0x42000000 - 0x43000000
                                 echo ERROR: bootm returned.

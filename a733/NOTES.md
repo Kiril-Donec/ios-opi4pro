@@ -60,3 +60,20 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   `12211572340`, `a733-firstboot-EXPERIMENTAL-no-flash` (14-day retention).
   Stage0 source tests, macOS XNU compile/audit, Linux packer/validator and
   `mkimage -l` all passed. Physical XNU execution still unverified.
+
+## Real-board AutoBoot v2 diagnostic and hex fix (2026-10-19)
+
+- The owner flashed a 64-MiB experimental auto-SD image based on the v59
+  bootloader. U-Boot on the **physical Orange Pi 4 Pro** displayed:
+  `V4 SHIM LOADED` (17000 bytes), `FDT LOADED` (626816 bytes),
+  `XNU PAYLOAD LOADED` (17159328 bytes), then
+  `Sorry, I could not convert "...d4a0>"` and
+  `EXPERIMENTAL BOOT STOPPED`.
+- This is **not an XNU crash**. U-Boot's FDT integer parser rejected the bare
+  hex output from `setexpr` within an `<...>` cell list. The script now
+  explicitly prefixes `0x` for both ${filesize} in arithmetic and
+  ${a733_end} in the FDT cell value. A new auto-SD candidate is built with
+  this fix, but its physical XNU handoff is still untested.
+- The SD/U-Boot/ext4 and artifact paths are confirmed operational. Next
+  photo should reveal whether the patched FDT property passes and whether
+  Stage0 reaches its A76/XNU diagnostic.

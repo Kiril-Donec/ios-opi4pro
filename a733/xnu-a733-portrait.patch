@@ -1,0 +1,231 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -1,83 +1,98 @@
+ /*
+- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
++ * A733 early portrait console. No allocation, locks, ADT parsing or
+  * per-CPU state: panic() can reach this before a current thread exists.
+  * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
+- * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
+- * retain this console until the normal framebuffer serial console is ready.
++ * The 1024x600 framebuffer straddles two 32MiB MMU blocks. The A733
++ * bootstrap page tables map both; this portrait console stops before the
++ * single-block final kernel alias takes over. Later logs use normal serial.
+  */
+ #include <arm64/sweet_early.h>
+ 
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0xBBF11000;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1024u
+-#define EARLY_HEIGHT 224u
++#define EARLY_WIDTH 600u
++#define EARLY_HEIGHT 1024u
+ #define EARLY_STRIDE (4096u / 4)
+ #define EARLY_SCALE 1u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+-#define EARLY_CELL_H (8u * EARLY_SCALE)
++#define EARLY_CELL_H (16u * EARLY_SCALE)
+ #define EARLY_ROWS ((EARLY_HEIGHT - 32u) / EARLY_CELL_H)
+ #define EARLY_COLS (EARLY_WIDTH / EARLY_CELL_W)
+ 
+ extern unsigned char iso_font[256 * 16];
+ 
+ /* Initialized data must remain writable until disable, including panics. */
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++/* Stage0 and HDMI timing stay 1024x600. This is the same rotation used by
++ * a733/src/display.c for DISPLAY_MONITOR_CLOCKWISE. */
++static void
++sweet_early_pixel(unsigned int x, unsigned int y, uint32_t color)
++{
++    if (x < EARLY_WIDTH && y < EARLY_HEIGHT) {
++        EARLY_FB[(EARLY_WIDTH - 1u - x) * EARLY_STRIDE + y] = color;
++    }
++}
++
++static void
++sweet_early_clear_screen(void)
++{
++    for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
++        for (unsigned int y = 0; y < EARLY_HEIGHT; y++) {
++            sweet_early_pixel(x, y, 0xff000000u);
++        }
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
+ static void
+ sweet_early_clear_row(void)
+ {
+-	for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
+-		volatile uint32_t *line = EARLY_FB + (early_row * EARLY_CELL_H + y) * EARLY_STRIDE;
+-		for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
+-			line[x] = 0xff000000u;
+-		}
+-	}
++    for (unsigned int y = 0; y < EARLY_CELL_H; y++) {
++        for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
++            sweet_early_pixel(x, early_row * EARLY_CELL_H + y, 0xff000000u);
++        }
++    }
+ }
+ 
+ void
+ sweet_early_putc(char c)
+ {
+-	if (early_disabled) {
+-		return;
+-	}
+-	if (!early_started) {
+-		early_started = 1;
+-		sweet_early_clear_row();
+-	}
+-	if (c == '\r') {
+-		early_col = 0;
+-		return;
+-	}
+-	if (c == '\n' || early_col == EARLY_COLS) {
+-		early_col = 0;
+-		early_row = (early_row + 1) % EARLY_ROWS;
+-		sweet_early_clear_row();
+-		if (c == '\n') {
+-			return;
+-		}
+-	}
+-	const unsigned char *glyph = iso_font + (unsigned char)c * 16;
+-	for (unsigned int gy = 0; gy < 8; gy++) {
+-		for (unsigned int sy = 0; sy < EARLY_SCALE; sy++) {
+-			volatile uint32_t *line = EARLY_FB +
+-			    (early_row * EARLY_CELL_H + gy * EARLY_SCALE + sy) * EARLY_STRIDE +
+-			    early_col * EARLY_CELL_W;
+-			for (unsigned int gx = 0; gx < 8; gx++) {
+-				uint32_t pixel = ((glyph[gy * 2] | glyph[gy * 2 + 1]) & (1u << gx)) ? 0xffffffffu : 0xff000000u;
+-				for (unsigned int sx = 0; sx < EARLY_SCALE; sx++) {
+-					line[gx * EARLY_SCALE + sx] = pixel;
+-				}
+-			}
+-		}
+-	}
+-	early_col++;
++    if (early_disabled) {
++        return;
++    }
++    if (!early_started) {
++        early_started = 1;
++        sweet_early_clear_screen();
++    }
++    if (c == '\r') {
++        early_col = 0;
++        return;
++    }
++    if (c == '\n' || early_col == EARLY_COLS) {
++        early_col = 0;
++        early_row = (early_row + 1) % EARLY_ROWS;
++        sweet_early_clear_row();
++        if (c == '\n') {
++            return;
++        }
++    }
++    const unsigned char *glyph = iso_font + (unsigned char)c * 16;
++    for (unsigned int gy = 0; gy < 16; gy++) {
++        for (unsigned int gx = 0; gx < 8; gx++) {
++            uint32_t pixel = (glyph[gy] & (1u << gx)) ? 0xffffffffu : 0xff000000u;
++            sweet_early_pixel(early_col * EARLY_CELL_W + gx,
++                early_row * EARLY_CELL_H + gy, pixel);
++        }
++    }
++    early_col++;
+ }
+ 
+ static void
+ sweet_early_string(const char *s)
+ {
+@@ -90,16 +105,21 @@
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+-	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
+-		}
+-	}
++    if (!early_started) {
++        early_started = 1;
++        sweet_early_clear_screen();
++    }
++    /* Small status band at the bottom of the portrait display; stages 0..20. */
++    uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
++    for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++        for (unsigned int x = stage * 24u; x < (stage + 1u) * 24u; x++) {
++            sweet_early_pixel(x, y, color);
++        }
++    }
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_string("SWEET EARLY ");
+ 	if (stage >= 10) {
+ 		sweet_early_putc((char)('0' + stage / 10));
+ 	}
+@@ -126,14 +146,15 @@
+ }
+ 
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+-	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	sweet_early_mark(9, "kernel framebuffer VA live");
++    /* The final reserved kernel alias covers only the first 32MiB physical
++     * block. Never access the lower portion of this rotated framebuffer
++     * after TTBR0 removal; normal framebuffer serial takes over later. */
++    (void)base;
++    sweet_early_disable();
+ }
+ 
+ void
+ sweet_early_disable(void)
+ {
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -678,11 +678,12 @@
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+ #if defined(SWEET)
+ 	/*
+-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
++	 * A733 framebuffer straddles two adjacent 32MiB blocks. Map both into
++	 * the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+ 	 * create_bootstrap_mapping would replace the RAM L2 table.
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+@@ -690,10 +691,17 @@
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
++	str		x11, [x13, x12, lsl #TTE_SHIFT]
++	/* Physical 0xBC000000 contains the remaining 376 native scanlines. */
++	MOV64	x10, 0xBC000000
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	orr		x11, x11, x10
++	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish

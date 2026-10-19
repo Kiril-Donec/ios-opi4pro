@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* SWEETXNU v1 is produced by ios-topaz/tools/mkpayload.py. */
+/* A733XNU1 v1 is produced only after a guarded A733 Mach-O audit.
+ * Legacy SWEETXNU payloads from Xiaomi are rejected on Orange Pi. */
 #define A733_XNU_RAM_BASE 0x100000000ULL
 #define A733_XNU_RAM_SIZE 0x40000000ULL
 #define A733_XNU_PAYLOAD_PA 0x52000000ULL

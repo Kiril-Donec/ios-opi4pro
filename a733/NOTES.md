@@ -30,3 +30,9 @@ Target: Orange Pi 4 Pro (Allwinner A733, 2×Cortex-A76 + 6×Cortex-A55, 4 GiB RA
 - XNU first execution/panic visible on HDMI is the next milestone; there is no flash-ready candidate yet.
 
 See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the user's sole boot card.
+
+## Pending next A733 CI check
+
+- `A733XNU1` is a board-tagged payload format, rejected by old Stage0 and rejecting legacy Xiaomi payloads in new Stage0.
+- `a733/tools/package_xnu_a733.py` statically audits the Mach-O before it packs the board-tagged payload.
+- XNU CI now adds `package-a733`: Linux Stage0 build, complete A733 payload and the actual Stage0 validator. The artifact is **not approved for flashing** until physical memory/boot protocol questions are resolved.

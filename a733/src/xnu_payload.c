@@ -25,7 +25,7 @@ static int add_ok(uint64_t a, uint64_t b, uint64_t *out)
 
 static int magic_ok(const char bytes[8])
 {
-    const char expected[8] = {'S','W','E','E','T','X','N','U'};
+    const char expected[8] = {'A','7','3','3','X','N','U','1'};
     for (int i = 0; i < 8; ++i)
         if (bytes[i] != expected[i])
             return 0;
@@ -45,7 +45,7 @@ const char *xnu_validate(const struct xnu_payload *p, uint64_t len,
         return "payload address or length";
     if (!magic_ok(p->magic) || p->version != 1 ||
         p->nsegs == 0 || p->nsegs > A733_XNU_MAX_SEGS)
-        return "not SWEETXNU v1";
+        return "not A733XNU1 v1";
     if (!range_ok(hdr, (uint64_t)p->nsegs * sizeof(struct xnu_segment), len))
         return "truncated segments";
     if (p->phys_base != A733_XNU_RAM_BASE ||

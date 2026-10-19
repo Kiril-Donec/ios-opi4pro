@@ -85,16 +85,16 @@ test-hardware-fdt: build/test_fdt_region
 # is still Qualcomm-specific until the A733 source adaptations are rebuilt.
 TOPAZ_ROOT ?= ..
 XNU_MACHO ?= build/kernel.development.sweet
-build/a733-real-xnu-unadapted.payload: build/a733-early.adt $(XNU_MACHO)
-	python3 $(TOPAZ_ROOT)/tools/mkpayload.py $(XNU_MACHO) \
-		build/a733-early.adt $@ --cmdline 'debug=0x144 keepsyms=1 cpus=1 -v'
+build/a733-xnu.payload: build/a733-early.adt $(XNU_MACHO)
+	python3 tools/package_xnu_a733.py $(XNU_MACHO) build/a733-early.adt $@ \
+		--cmdline 'debug=0xc keepsyms=1 cpus=1 -v modem=0 wifi=0'
 
 build/test_real_xnu_payload: src/xnu_payload.c src/xnu_payload.h tests/test_real_xnu_payload.c | build
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Werror -DA733_HOST_TEST -I src \
 		src/xnu_payload.c tests/test_real_xnu_payload.c -o $@
 
-test-real-xnu: build/test_real_xnu_payload build/a733-real-xnu-unadapted.payload
-	./build/test_real_xnu_payload build/a733-real-xnu-unadapted.payload
+test-real-xnu: build/test_real_xnu_payload build/a733-xnu.payload
+	./build/test_real_xnu_payload build/a733-xnu.payload
 
 # Mandatory before a FIRST REAL XNU flash image. Deliberately FAILS against
 # the successful but UNADAPTED topaz CI kernel; packaging alone is not enough.

@@ -126,23 +126,26 @@ With the existing, **unadapted** topaz kernel present at
 `build/kernel.development.sweet`:
 
 ```sh
-make test-real-xnu
-# Real XNU payload validates against Stage0: PASS
-# This does NOT mean its CPU/HDMI hardware drivers are adapted.
+# This Xiaomi kernel is NOT safe for Orange Pi and is now rejected by
+# the A733-specific packer and Stage0 payload magic:
+make test-real-xnu   # Must FAIL for the unadapted Xiaomi kernel.
 make test-hardware-fdt
-make check-a733-xnu  # Must FAIL until a new A733-specific kernel is built.
+make check-a733-xnu # Must FAIL for the unadapted Xiaomi kernel.
 ```
 
 From a *separately compiled A733-adapted* XNU Mach-O (placeholder path):
 
 ```sh
-python3 ../ios-topaz/tools/mkpayload.py \
-  path/to/kernel.A733.vmapple build/a733-early.adt build/xnu.payload \
-  --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1'
+python3 tools/package_xnu_a733.py \
+  path/to/audited/kernel.development.sweet build/a733-early.adt build/a733-xnu.payload \
+  --cmdline 'debug=0xc cpus=1 keepsyms=1 -v modem=0 wifi=0'
+make test-real-xnu XNU_MACHO=path/to/audited/kernel.development.sweet
 ```
 
-The *XNU boot experiment* is not runnable until an A733-adapted XNU Mach-O is
-built. The A76-only probe already worked on the real board and need not be
+An A733-adapted Mach-O was compiled and passed a static marker audit in
+GitHub Actions on 2026-10-19 (run 39293623008). Its physical execution on
+Orange Pi has **not** been tested. This repository now requires the A733XNU1
+payload tag, emitted only by the audited wrapper. The A76-only probe already worked on the real board and need not be
 repeated. Do **not** flash or boot `build/a733-real-xnu-unadapted.payload`;
 its original Xiaomi startup writes to 0x9C000000 and its drivers still target
 Qualcomm peripherals.

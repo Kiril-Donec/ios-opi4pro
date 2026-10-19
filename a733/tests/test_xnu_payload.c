@@ -14,7 +14,7 @@ static struct xnu_payload *make_valid(void)
 {
     memset(blob, 0, sizeof(blob));
     struct xnu_payload *p = (struct xnu_payload *)blob;
-    memcpy(p->magic, "SWEETXNU", 8);
+    memcpy(p->magic, "A733XNU1", 8);
     p->version = 1;
     p->nsegs = 1;
     p->virt_base = 0xfffffff000000000ULL;
@@ -46,6 +46,8 @@ int main(void)
     CHECK(plan.boot_args_pa % 0x4000 == 0);
     CHECK(plan.top_of_kernel_data < A733_XNU_RAM_BASE + A733_XNU_RAM_SIZE);
 
+    p = make_valid(); memcpy(p->magic, "SWEETXNU", 8);
+    CHECK(xnu_validate(p, sizeof(blob), A733_XNU_PAYLOAD_PA, &plan));
     p = make_valid(); p->phys_base = 0x80000000;
     CHECK(xnu_validate(p, sizeof(blob), A733_XNU_PAYLOAD_PA, &plan));
     p = make_valid(); p->segs[0].file_off = sizeof(blob) - 8;

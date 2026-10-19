@@ -98,7 +98,11 @@ static void run_xnu_from_a76(const struct xnu_payload *p,
     }
     screen_message("XNU: INSTALLING KERNEL", "HIGH RAM 0x100000000");
     xnu_install(p, plan);
-    screen_message("XNU: JUMP", "If black: capture UART/log");
+    /* Hand over the physical HDMI framebuffer to the XNU panic console.
+     * Keep the portrait timing established by U-Boot/Stage0, but remove
+     * the old blue Stage0 panel; the early XNU renderer owns pixels now. */
+    display_rect(0, 0, A733_PORTRAIT_WIDTH, A733_PORTRAIT_HEIGHT, 0x000000);
+    cache_clean_framebuffer(A733_FB_BASE, A733_FB_WIDTH * A733_FB_HEIGHT * 4U);
     typedef void (*entry_fn)(uint64_t boot_args_pa);
     ((entry_fn)(uintptr_t)plan->entry_pa)(plan->boot_args_pa);
     screen_message("XNU RETURNED UNEXPECTEDLY", 0);

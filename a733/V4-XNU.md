@@ -5,9 +5,9 @@ was verified on the real Orange Pi (MMFR0=0x0000000000101122).
 A modified A733 XNU-8796 Mach-O **has compiled and passed static checks**
 on macOS GitHub Actions. A second Linux CI job **packed a guarded
 `A733XNU1` payload and validated it with the Stage0 parser**, plus compiled
-Stage0: [Actions run 39298193231](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39298193231).
+Stage0: [Actions run 39299998464](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39299998464).
 The artifact `a733-firstboot-EXPERIMENTAL-no-flash` is available.
-A followup CI job also packs a manual one-shot U-Boot `.scr` script.
+The successful CI also packaged a manual one-shot U-Boot `.scr` script.
 **No XNU instruction has yet run on the physical Orange Pi**; this is only
 a candidate for supervised, reversible U-Boot RAM tests. Do not flash a new
 SD image or change the existing autostart boot script.

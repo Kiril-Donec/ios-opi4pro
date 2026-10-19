@@ -5,8 +5,8 @@
 **XNU на самой плате ещё не запускался.** Первый запуск может зависнуть или
 показать исключение на HDMI. Это не готовая iOS.
 
-Проверенная сборка: [GitHub Actions 39298193231](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39298193231),
-артефакт `a733-firstboot-EXPERIMENTAL-no-flash`.
+Проверенная сборка: [GitHub Actions 39299998464](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39299998464),
+артефакт [`a733-firstboot-EXPERIMENTAL-no-flash`](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39299998464/artifacts/12211572340).
 Новые коммиты могут давать другие номера сборок.
 
 ## Важно для единственной рабочей microSD

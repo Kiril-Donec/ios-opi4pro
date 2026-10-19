@@ -53,3 +53,10 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   observation**, not guesswork. Stage0 will refuse unsafe RAM.
 - Follow [TEST-XNU-RU.md](TEST-XNU-RU.md) for the supervised one-shot
   procedure. No claim that real XNU has booted.
+
+- Final **bundle with compiled U-Boot `.scr` passed all CI jobs** on
+  [run 39299998464](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39299998464),
+  commit `3b6131f46785561351a16f77b88e47bc4acc4bef`. Artifact ID
+  `12211572340`, `a733-firstboot-EXPERIMENTAL-no-flash` (14-day retention).
+  Stage0 source tests, macOS XNU compile/audit, Linux packer/validator and
+  `mkimage -l` all passed. Physical XNU execution still unverified.

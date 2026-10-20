@@ -1,0 +1,15 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -852,6 +852,11 @@
+ 	// Enable NEON
+ 	mov		x0, #(CPACR_FPEN_ENABLE)
+ 	msr		CPACR_EL1, x0
++#if defined(SWEET)
++	/* A733 Cortex-A76: CPACR_EL1 is a context-changing register. Make
++	 * FP/ASIMD permission observable before C bootstrap uses NEON. */
++	isb		sy
++#endif
+ #endif
+ 
+ 	// Clear thread pointer

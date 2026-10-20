@@ -26,7 +26,7 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 
 **v12 milestone:** the RAM disk contains a small ad-hoc-signed **test** Mach-O named `/sbin/launchd`. This is **not** Apple's launchd. No success/failure is yet established for the userspace transition: the last visible line is the exec attempt. XNU framebuffer `kprintf` and the userspace `/dev/console` are different output paths.
 
-**Next diagnostic (v13, unverified until hardware test):** log the return from the initial `execve` and selected syscalls from PID 1 through the kernel framebuffer console. The test program will issue `getpid` **before** opening `/dev/console`, so syscall logs can prove that the CPU actually entered userspace even if the console cannot be opened. No second CPU is enabled for this test.
+**Next diagnostic (v13, not yet hardware-tested):** kernel-side logs report the initial `execve` result and PID 1 syscalls via the framebuffer. The prepared v13 AutoBoot image deliberately **reuses the physically tested v12 HFS+ RAM disk and original v12 PID 1 executable**, to isolate the XNU change: the first expected syscall is `open` (number 5), which tests `/dev/console`. A separate `getpid`-before-`open` probe has also been committed in `a733-init.S` for a later image but is **not present** in this particular v13 test IMG. No second CPU is enabled. On the current GitHub Ubuntu runner, building a fresh populated HFS+ disk fails because the runner lacks the HFS+ mount driver; this does not invalidate the already audited macOS XNU build or the v12 RAM disk.
 
 ## Current limitations
 

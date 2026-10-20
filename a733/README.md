@@ -3,17 +3,18 @@
 > **Latest status (2026-10-20):** XNU boots on the physical Orange Pi 4 Pro,
 > mounts an HFSX RAM disk and runs a test PID 1. v14 demonstrated a successful
 > `getpid()` syscall return (PID 1); the next `open()` call stalls. The v15
-> source adds diagnostics to isolate that stall. **The historical v4 notes
+> XNU/PID1/payload builds now pass CI and add diagnostics to isolate that stall;
+> the v15 image still needs a hardware test. **The historical v4 notes
 > below are retained for reference**, not the current boot status. The
 > experimental userspace binary is not a full iOS installation.
 
 Experimental native XNU/iOS 16 bring-up for Orange Pi 4 Pro (Allwinner A733).
 
-**Status:** the v3 stage0 screen diagnostic has booted on the physical board
+**Historical v4 status (superseded):** the v3 stage0 screen diagnostic has booted on the physical board
 and driven HDMI in the rotated 600x1024 view (photos from 2026-10-19).
 The v4 source adds an **experimental cross-compiled, not hardware-verified
 XNU handoff path**.
-It is **not yet an XNU or iOS boot**. See [V4-XNU.md](V4-XNU.md) for its
+This *v4 snapshot* was **not yet an XNU or iOS boot**; the current v14 hardware tests now reach XNU PID 1. See [V4-XNU.md](V4-XNU.md) for its
 new code, build requirements, experiments and limitations.
 
 SD diagnostic builds and the v2 ARM64-header/cache corrections are described

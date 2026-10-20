@@ -30,6 +30,8 @@ on:
       - "a733/tests/test_adapt_xnu.py"
       - "a733/tools/audit_a733_macho.py"
       - "a733/tools/package_xnu_a733.py"
+      - "a733/tools/make_test_ramdisk.sh"
+      - "a733/tests/test_ramdisk_pack.py"
       - "a733/src/xnu_payload.c"
       - "a733/Makefile"
       - "a733/tools/mkadt_a733.py"
@@ -195,7 +197,7 @@ jobs:
           name: xnu-kernel
           path: kernel
       - name: Install AArch64 Stage0 toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu u-boot-tools
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu u-boot-tools hfsprogs
       - name: Compile and test A733 Stage0
         run: make -C a733 test adt all test-boot
       - name: Audit, pack and validate real XNU payload
@@ -207,6 +209,47 @@ jobs:
           mkimage -A arm64 -O linux -T script -C none -n "a733-xnu-one-shot" -d a733/tools/sd-boot-xnu-experimental.cmd a733/build/a733-xnu-one-shot.scr
           mkimage -l a733/build/a733-xnu-one-shot.scr
           sha256sum a733/build/stage0.uimg a733/build/a733-xnu.payload a733/build/a733-xnu-one-shot.scr
+      - name: RAMDisk md0 integration (mount-only diagnostic)
+        run: |
+          python3 -m unittest discover -s a733/tests -p test_ramdisk_pack.py -v
+          bash a733/tools/make_test_ramdisk.sh a733/build/a733-test-root.hfs
+          python3 a733/tools/package_xnu_a733.py \
+            kernel/kernel.development.sweet a733/build/a733-early.adt \
+            a733/build/a733-xnu-ramroot.payload --ramdisk a733/build/a733-test-root.hfs
+          a733/build/test_real_xnu_payload a733/build/a733-xnu-ramroot.payload
+          python3 - <<'PY'
+          import struct, sys
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          import adt
+          p = Path('a733/build/a733-xnu-ramroot.payload').read_bytes()
+          assert p[:8] == b'A733XNU1'
+          _, n = struct.unpack_from('<II', p, 8)
+          off, size = struct.unpack_from('<2Q', p, 0x20)
+          dt, _ = adt.parse(p[off:off + size])
+          chosen = next(c for c in dt.children if c.name == 'chosen')
+          mmap = next(c for c in chosen.children if c.name == 'memory-map')
+          pa, length = struct.unpack('<2Q', mmap.prop('RAMDisk'))
+          assert length == 8 * 1024 * 1024
+          virtbase, = struct.unpack_from('<Q', p, 0x10)
+          physbase, = struct.unpack_from('<Q', p, 0x38)
+          assert any((physbase + vmaddr - virtbase == pa and vmsize == length)
+                     for vmaddr, vmsize, _, _ in
+                     (struct.unpack_from('<4Q', p, 0x2a8 + i * 32) for i in range(n)))
+          print(f'PASS RAMDisk ADT + payload segment: PA=0x{pa:x}, size={length}')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a733-RAMROOT-EXPERIMENTAL-md0-no-iOS-userland
+          path: |
+            a733/build/a733-test-root.hfs
+            a733/build/a733-xnu-ramroot.payload
+            a733/build/a733-xnu-ramroot.payload.sha256
+            a733/build/stage0.uimg
+            a733/build/a733-early.adt
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         with:
           name: a733-firstboot-EXPERIMENTAL-no-flash

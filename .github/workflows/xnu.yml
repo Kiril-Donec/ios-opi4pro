@@ -153,9 +153,10 @@ jobs:
           p = Path('xnu-build.log')
           lines = p.read_text(errors='replace').splitlines() if p.exists() else []
           matches = [i for i, line in enumerate(lines)
-                     if re.search(r'error:|fatal error|patch failed|FAILED|Error [0-9]|No rule to make target', line, re.I)]
+                     if re.search(r'error:|fatal error|patch failed|make\[\d+\]: \*\*\*|No rule to make target', line, re.I)
+                     and 'compile-time assertion failed' not in line]
           selected = set(range(max(0, len(lines) - 35), len(lines)))
-          for i in matches[-60:]:
+          for i in matches[:50] + matches[-50:]:
               selected.update(range(max(0, i - 2), min(len(lines), i + 4)))
           report = '\n'.join(f'{i + 1}: {lines[i]}' for i in sorted(selected))
           Path('xnu-build-errors.txt').write_text(report + '\n')
@@ -170,6 +171,14 @@ jobs:
           path: xnu-build-errors.txt
           if-no-files-found: warn
           retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xnu-build-full-log
+          path: xnu-build.log
+          if-no-files-found: warn
+          retention-days: 3
 
       - name: Package build tree for local compiles
         if: always()

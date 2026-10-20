@@ -137,8 +137,39 @@ jobs:
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: |
           ccache -z
-          bash build.sh
+          # Capture the entire build log so compiler errors remain available
+          # even when GitHub's public web log viewer refuses access.
+          set -o pipefail
+          bash build.sh 2>&1 | tee "${GITHUB_WORKSPACE}/xnu-build.log"
           ccache -s
+
+      - name: Save concise failure diagnostics
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('xnu-build.log')
+          lines = p.read_text(errors='replace').splitlines() if p.exists() else []
+          matches = [i for i, line in enumerate(lines)
+                     if re.search(r'error:|fatal error|patch failed|FAILED|Error [0-9]|No rule to make target', line, re.I)]
+          selected = set(range(max(0, len(lines) - 35), len(lines)))
+          for i in matches[-60:]:
+              selected.update(range(max(0, i - 2), min(len(lines), i + 4)))
+          report = '\n'.join(f'{i + 1}: {lines[i]}' for i in sorted(selected))
+          Path('xnu-build-errors.txt').write_text(report + '\n')
+          print('Compiler error matches:', len(matches))
+          print(report[-12000:])
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xnu-build-errors
+          path: xnu-build-errors.txt
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Package build tree for local compiles
         if: always()

@@ -1,0 +1,152 @@
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -685,8 +685,14 @@
+ 	vm_kernel_addrhash_salt_ext = early_random();
+ 
+ #ifdef  IOKIT
++#if defined(SWEET)
++	kprintf("A733 TRACE 01: PE_init_iokit begin\n");
++#endif
+ 	kernel_bootstrap_log("PE_init_iokit");
+ 	PE_init_iokit();
++#if defined(SWEET)
++	kprintf("A733 TRACE 02: PE_init_iokit returned\n");
++#endif
+ #endif
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+@@ -703,16 +709,26 @@
+ #endif
+ 	(void) spllo();         /* Allow interruptions */
+ 
++#if defined(SWEET)
++	/* A733 headless diagnostic: keep the framebuffer serial console visible.
++	 * The visual progress indicator is NOT a useful completion percentage and
++	 * can cover the last line when a boot thread waits indefinitely. */
++	kprintf("A733 TRACE 03: interrupts enabled; graphics progress suppressed\n");
++#else
+ 	/*
+ 	 * This will start displaying progress to the user, start as early as possible
+ 	 */
+ 	initialize_screen(NULL, kPEAcquireScreen);
++#endif
+ 
+ 	/*
+ 	 *	Initialize the shared region module.
+ 	 */
+ 	vm_commpage_init();
+ 	vm_commpage_text_init();
++#if defined(SWEET)
++	kprintf("A733 TRACE 04: commpage ready\n");
++#endif
+ 
+ #if CONFIG_MACF
+ 	kernel_bootstrap_log("mac_policy_initmach");
+@@ -769,8 +785,14 @@
+ #endif /* CONFIG_XNUPOST */
+ 
+ #ifdef  IOKIT
++#if defined(SWEET)
++	kprintf("A733 TRACE 05: IOKit matching begin\n");
++#endif
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
+ 	PE_lockdown_iokit();
++#if defined(SWEET)
++	kprintf("A733 TRACE 06: IOKit matching returned\n");
++#endif
+ #endif
+ 	/*
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
+@@ -787,7 +809,13 @@
+ 	 *	Start the user bootstrap.
+ 	 */
+ #ifdef  MACH_BSD
++#if defined(SWEET)
++	kprintf("A733 TRACE 07: entering BSD initialization\n");
++#endif
+ 	bsd_init();
++#if defined(SWEET)
++	kprintf("A733 TRACE 12: BSD initialization returned\n");
++#endif
+ #endif
+ 
+ 
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,7 +490,14 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
++#if defined(SWEET)
++/* During A733 bring-up, expose existing BSD milestones via framebuffer.
++ * No watchdog / panic / timer overrides: the last visible milestone tells us
++ * whether the kernel reached root-device discovery or hung before it. */
++#define DEBUG_BSDINIT 1
++#else
+ #define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
+@@ -797,8 +804,14 @@
+ 	bsd_init_kprintf("calling sysctl_mib_init\n");
+ 	sysctl_mib_init();
+ 
++#if defined(SWEET)
++	kprintf("A733 TRACE 08: BSD autoconf begin\n");
++#endif
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
+ 	bsd_autoconf();
++#if defined(SWEET)
++	kprintf("A733 TRACE 09: BSD autoconf returned\n");
++#endif
+ 
+ #if CONFIG_DTRACE
+ 	dtrace_postinit();
+@@ -872,8 +885,14 @@
+ 	while (TRUE) {
+ 		int err;
+ 
++#if defined(SWEET)
++		kprintf("A733 TRACE 10: searching for root device (no iOS rootfs bundled)\n");
++#endif
+ 		bsd_init_kprintf("calling setconf\n");
+ 		setconf();
++#if defined(SWEET)
++		kprintf("A733 TRACE 11: root device selection returned\n");
++#endif
+ #if CONFIG_NETBOOT
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -678,6 +678,9 @@
+ 
+ 	int xchar, dchar;
+ 
++#if defined(SWEET)
++	IOLog("A733 ROOT: IOFindBSDRoot entered; waiting for filesystem resources\n");
++#endif
+ 	// stall here for anyone matching on the IOBSD resource to finish (filesystems)
+ 	matching = IOService::serviceMatching(gIOResourcesKey);
+ 	assert(matching);
+@@ -860,6 +863,9 @@
+ 		}
+ 	}
+ 
++#if defined(SWEET)
++	IOLog("A733 ROOT: no direct memory root selected; checking IOMedia matches\n");
++#endif
+ 	if (!matching) {
+ 		OSString * astring;
+ 		// Match any HFS media
+@@ -897,6 +903,9 @@
+ 		t.tv_sec = ROOTDEVICETIMEOUT;
+ 		t.tv_nsec = 0;
+ 		matching->retain();
++#if defined(SWEET)
++		IOLog("A733 ROOT: waitForService starting (storage may be missing)\n");
++#endif
+ 		service = IOService::waitForService( matching, &t );
+ 		if ((!service) || (mountAttempts == 10)) {
+ #if !XNU_TARGET_OS_OSX || !defined(__arm64__)

@@ -102,10 +102,14 @@ def audit(buf: bytes) -> tuple[int, list[str]]:
                    b"A733 PID1 V15: NAMEI_COPY_ENTER",
                    b"A733 PID1 V15: NAMEI_LOOKUP_ENTER",
                    b"A733 PID1 V16: COPYINSTR_VALIDATE_DONE",
-                   b"A733 PID1 V16: COPYINSTR_ASM_ENTER",
-                   b"A733 PID1 V16: COPYINSTR_ASM_DONE"):
+                   b"A733 PID1 V16: COPYINSTR_ASM_DONE",
+                   b"A733 PID1 V17: COPYINSTR_LDTRB_ENTER"):
         if marker not in buf:
             errors.append("missing compiled A733 kernel identity: " + marker.decode())
+    # SWEET-only EL0-permission user load must be present in machine_routines_asm.s.
+    # LDTRB W5, [X0]; ADD X0, X0, #1. Check actual opcodes, not just log text.
+    if bytes.fromhex("0508403800040091") not in buf:
+        errors.append("v17 usercopy fix LDTRB W5,[X0] + ADD X0 missing from kernel")
     return start, errors
 
 

@@ -41,3 +41,16 @@ diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
  	if (result != EFAULT) {
  		*lencopied = bytes_copied;
  	}
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -62,7 +62,7 @@
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+-# topaz: Cortex-A53/A73 are ARMv8.0 (no LSE atomics, RCpc, PAN or FP16). An explicit
++# A733: Cortex-A76 implements ARMv8.2 with PAN; compile for the boot CPU.
+ # -mcpu: -arch arm64 otherwise keeps clang's apple-m1 default and its LSE/RCpc features
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a53
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -mcpu=cortex-a76
+ 
+ 

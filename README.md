@@ -2,7 +2,7 @@
 
 An experimental port of Apple's **XNU 8796** (iOS 16-era kernel) to the **Orange Pi 4 Pro** with an **Allwinner A733** (2× Cortex-A76 + 6× Cortex-A55).
 
-> **Current status (hardware-tested, 20 October 2026): XNU boots, reaches BSD, and mounts an HFS+ root filesystem in RAM. The iOS operating system and graphical shell do not boot yet. **PID 1 has now executed real ARM64 userspace instructions on the board (v13).** The first `open` syscall enters the kernel but no return from it has been observed.**
+> **Current hardware status (20 October 2026):** XNU boots, reaches BSD, mounts an HFS+ RAM root, and runs real ARM64 userspace instructions in the test PID 1 (v13). The first `open` syscall enters the kernel but does not visibly return. **Full iOS and SpringBoard are not running.**
 
 This project is an independent A733 port based on [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) and the underlying [ios-sweet](https://github.com/dipa-studio/ios-sweet) work. The original `ios-topaz` repository belongs to its author, not the owner of this fork.
 
@@ -27,6 +27,8 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 **v12 milestone:** the RAM disk contains a small ad-hoc-signed **test** Mach-O named `/sbin/launchd`. This is **not** Apple's launchd. No success/failure is yet established for the userspace transition: the last visible line is the exec attempt. XNU framebuffer `kprintf` and the userspace `/dev/console` are different output paths.
 
 **v13 hardware result (20 October 2026):** kernel-side framebuffer logs confirm `execve` returned 0 for `/sbin/launchd` and the experimental userspace program invoked syscall 5 (`open`). This confirms a real userspace-to-kernel transition on ARM64. No syscall exit log was seen, so execution beyond `open` remains unverified. The prepared v13 AutoBoot image deliberately **reuses the physically tested v12 HFS+ RAM disk and original v12 PID 1 executable**, to isolate the XNU change: the first expected syscall is `open` (number 5), which tests `/dev/console`. A separate `getpid`-before-`open` probe has also been committed in `a733-init.S` for a later image but is **not present** in this particular v13 test IMG. No second CPU is enabled. On the current GitHub Ubuntu runner, building a fresh populated HFS+ disk fails because the runner lacks the HFS+ mount driver; this does not invalidate the already audited macOS XNU build or the v12 RAM disk.
+
+**v14 development:** A test PID 1 will call `getpid()` before `open("/dev/console")`, with kernel-side checkpoints around audit and syscall dispatch. The populated HFSX image is built on macOS because the GitHub Ubuntu runner cannot mount HFS+. **v14 remains unverified on hardware until an actual board test.**
 
 ## Current limitations
 

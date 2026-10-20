@@ -27,12 +27,14 @@ on:
       - "a733/xnu-a733-fbcon-portrait.patch"
       - "a733/xnu-a733-boot-trace.patch"
       - "a733/xnu-a733-pid1-trace.patch"
+      - "a733/xnu-a733-pid1-v14-trace.patch"
       - "a733/tools/adapt_xnu_a733.py"
       - "a733/tests/test_adapt_xnu.py"
       - "a733/tools/audit_a733_macho.py"
       - "a733/tools/package_xnu_a733.py"
       - "a733/tools/make_test_ramdisk.sh"
       - "a733/tools/make_pid1_ramdisk.sh"
+      - "a733/tools/make_pid1_ramdisk_macos.sh"
       - "a733/src/a733-init.S"
       - "tools/mkinit.py"
       - "a733/tests/test_ramdisk_pack.py"
@@ -87,6 +89,7 @@ jobs:
           cp a733/xnu-a733-fbcon-portrait.patch dxb/patches/9999f-a733-fbcon-portrait.patch
           cp a733/xnu-a733-boot-trace.patch dxb/patches/9999g-a733-boot-trace.patch
           cp a733/xnu-a733-pid1-trace.patch dxb/patches/9999h-a733-pid1-trace.patch
+          cp a733/xnu-a733-pid1-v14-trace.patch dxb/patches/9999i-a733-pid1-v14-trace.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -183,6 +186,44 @@ jobs:
           test -s out/kernel.development.sweet
           python3 a733/tools/audit_a733_macho.py out/kernel.development.sweet
 
+      - name: Build static PID1 and HFSX root (native macOS, no Linux mount)
+        run: |
+          mkdir -p a733/build
+          xcrun clang -target arm64-apple-ios16.0 -x assembler-with-cpp -c \
+            a733/src/a733-init.S -o a733/build/a733-init.o
+          python3 tools/mkinit.py a733/build/a733-init.o a733/build/a733-init.macho
+          python3 - <<'PY'
+          import struct
+          from pathlib import Path
+          data = Path("a733/build/a733-init.macho").read_bytes()
+          magic, cputype, _, kind, ncmds, _, _, _ = struct.unpack_from("<8I", data)
+          assert (magic, cputype, kind) == (0xfeedfacf, 0x0100000c, 2)
+          p = 32
+          cmds = []
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from("<2I", data, p)
+              assert size >= 8
+              cmds.append(cmd)
+              p += size
+          assert 0x5 in cmds and 0x1d in cmds, "missing UNIXTHREAD or signature"
+          assert 0xe not in cmds and 0xc not in cmds, "static PID1 cannot require dyld"
+          assert struct.pack("<I", 0xd2800290) in data, "getpid(20) must precede open(5)"
+          assert struct.pack("<I", 0xd4001001) in data, "missing userspace SVC #0x80"
+          print("PASS: static signed ARM64 Mach-O with getpid first")
+          PY
+          bash a733/tools/make_pid1_ramdisk_macos.sh \
+            a733/build/a733-init.macho a733/build/a733-pid1-root.hfs A733PID1
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a733-pid1-root-macos
+          path: |
+            a733/build/a733-init.macho
+            a733/build/a733-pid1-root.hfs
+          if-no-files-found: error
+          retention-days: 14
+
       - uses: actions/upload-artifact@v4
         if: success()
         with:
@@ -243,36 +284,21 @@ jobs:
                      (struct.unpack_from('<4Q', p, 0x2a8 + i * 32) for i in range(n)))
           print(f'PASS RAMDisk ADT + payload segment: PA=0x{pa:x}, size={length}')
           PY
-      - name: Build static signed ARM64 PID1 and HFS+ md0
+      - uses: actions/download-artifact@v4
+        with:
+          name: a733-pid1-root-macos
+          path: a733/build
+
+      - name: Validate and pack macOS-prepared PID1 HFSX md0
         run: |
-          clang -target arm64-apple-ios16.0 -x assembler-with-cpp -c \
-            a733/src/a733-init.S -o a733/build/a733-init.o
-          python3 tools/mkinit.py a733/build/a733-init.o a733/build/a733-init.macho
-          python3 - <<'PY'
-          import struct
-          from pathlib import Path
-          b = Path("a733/build/a733-init.macho").read_bytes()
-          magic, cputype, _, filetype, ncmds, _, _, _ = struct.unpack_from("<8I", b)
-          assert (magic, cputype, filetype) == (0xfeedfacf, 0x0100000c, 2)
-          at = 32
-          cmds = []
-          for i in range(ncmds):
-              cmd, sz = struct.unpack_from("<II", b, at)
-              cmds.append(cmd)
-              at += sz
-          assert 0x5 in cmds, "missing LC_UNIXTHREAD"
-          assert 0x1d in cmds, "missing LC_CODE_SIGNATURE"
-          assert 0xe not in cmds and 0xc not in cmds, "dynamic loader / shared libraries forbidden"
-          print("PASS: ARM64 static signed Mach-O, no dyld dependency")
-          PY
-          bash a733/tools/make_pid1_ramdisk.sh \
-            a733/build/a733-init.macho a733/build/a733-pid1-root.hfs A733PID1
+          test -s a733/build/a733-init.macho
+          test "$(stat -c %s a733/build/a733-pid1-root.hfs)" = 8388608
           python3 a733/tools/package_xnu_a733.py \
             kernel/kernel.development.sweet a733/build/a733-early.adt \
             a733/build/a733-xnu-pid1.payload --ramdisk a733/build/a733-pid1-root.hfs
           a733/build/test_real_xnu_payload a733/build/a733-xnu-pid1.payload
-          # All the previous A733 safety checks apply to this new payload.
-          cmp a733/build/stage0.uimg a733/build/stage0.uimg
+          sha256sum a733/build/a733-init.macho a733/build/a733-pid1-root.hfs \
+            a733/build/a733-xnu-pid1.payload
 
       - uses: actions/upload-artifact@v4
         if: success()

@@ -1,11 +1,7 @@
 diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 --- a/bsd/dev/arm/systemcalls.c
 +++ b/bsd/dev/arm/systemcalls.c
-@@ -176,11 +176,35 @@
- 		}
- 	}
- #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
- 
+@@ -180,3 +180,27 @@
 -	AUDIT_SYSCALL_ENTER(code, proc, uthread);
 -	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
 -	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
@@ -36,7 +32,3 @@ diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 +		kprintf("A733 PID1 V14: AFTER_AUDIT_EXIT syscall=%u\n", (unsigned int)code);
 +	}
 +#endif
- 
- #if CONFIG_MACF
- skip_syscall:
- #endif /* CONFIG_MACF */

@@ -100,7 +100,10 @@ def audit(buf: bytes) -> tuple[int, list[str]]:
                    b"A733 PID1 V15: OPEN1_FALLOC_ENTER",
                    b"A733 PID1 V15: VN_AUTH_NAMEI_ENTER",
                    b"A733 PID1 V15: NAMEI_COPY_ENTER",
-                   b"A733 PID1 V15: NAMEI_LOOKUP_ENTER"):
+                   b"A733 PID1 V15: NAMEI_LOOKUP_ENTER",
+                   b"A733 PID1 V16: COPYINSTR_VALIDATE_DONE",
+                   b"A733 PID1 V16: COPYINSTR_ASM_ENTER",
+                   b"A733 PID1 V16: COPYINSTR_ASM_DONE"):
         if marker not in buf:
             errors.append("missing compiled A733 kernel identity: " + marker.decode())
     return start, errors

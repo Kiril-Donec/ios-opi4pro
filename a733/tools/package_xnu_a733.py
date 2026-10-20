@@ -25,7 +25,10 @@ LEGACY = b"SWEETXNU"
 PHYS_BASE = 0x100000000
 MEM_SIZE = 0x40000000
 MAX_BYTES = 128 * 1024 * 1024
-DEFAULT_CMDLINE = "debug=0xc cpus=1 keepsyms=1 -v modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0"
+# Development XNU filters kprintf unless -enable_kprintf_spam is supplied.
+# serial=1 routes those logs to the A733 framebuffer-backed serial device.
+# sweetfb_console=1 prevents a later graphics present from hiding diagnostics.
+DEFAULT_CMDLINE = "debug=0xc cpus=1 keepsyms=1 -v modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0 -enable_kprintf_spam serial=1 sweetfb_console=1"
 
 
 def pack(kernel: Path, adt: Path, cmdline: str) -> tuple[bytes, dict]:

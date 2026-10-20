@@ -1,12 +1,12 @@
 diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
-index a05c8e7..20b2553 100644
+index a05c8e7..3efc7d3 100644
 --- a/bsd/vfs/vfs_lookup.c
 +++ b/bsd/vfs/vfs_lookup.c
 @@ -85,6 +85,7 @@
  #include <sys/filedesc.h>
  #include <sys/proc_internal.h>
  #include <sys/kdebug.h>
-+#include <kern/debug.h>
++#include <pexpert/pexpert.h>
  #include <sys/unistd.h>         /* For _PC_NAME_MAX */
  #include <sys/uio_internal.h>
  #include <sys/kauth.h>
@@ -169,14 +169,14 @@ index 23ee4d5..2f4399c 100644
  }
  
 diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
-index 5b51e9c..4d8b897 100644
+index 5b51e9c..b5dfa5e 100644
 --- a/bsd/vfs/vfs_vnops.c
 +++ b/bsd/vfs/vfs_vnops.c
 @@ -109,6 +109,7 @@
  #endif
  
  #include <IOKit/IOBSD.h>
-+#include <kern/debug.h>
++#include <pexpert/pexpert.h>
  #include <libkern/section_keywords.h>
  
  static int vn_closefile(struct fileglob *fp, vfs_context_t ctx);

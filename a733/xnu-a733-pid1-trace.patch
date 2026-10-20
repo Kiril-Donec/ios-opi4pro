@@ -1,0 +1,79 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6825,11 +6825,20 @@
+ 
+ 	/*
+ 	 * So that init task is set with uid,gid 0 token
+ 	 */
+-	set_security_token(p);
+-
+-	return execve(p, &init_exec_args, retval);
++	set_security_token(p);
++
++#if defined(SWEET)
++	/* A733 PID1: report completion of exec, independently of /dev/console.
++	 * A zero errno means the Mach-O was accepted, NOT that user code ran. */
++	kprintf("A733 PID1: execve entering for %s\n", path);
++#endif
++	error = execve(p, &init_exec_args, retval);
++#if defined(SWEET)
++	kprintf("A733 PID1: execve returned errno=%d for %s\n", error, path);
++#endif
++	return error;
+ }
+ 
+ static const char * init_programs[] = {
+ #if DEBUG
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -147,11 +147,19 @@
+ 	if (do_count_syscalls > 0) {
+ 		syscalls_log[code]++;
+ 	}
+ #endif
+-	pid = proc_pid(proc);
+-
+-#ifdef CONFIG_IOCOUNT_TRACE
++	pid = proc_pid(proc);
++
++#if defined(SWEET)
++	/* Only trace syscalls from real userspace PID1. A successful kernel
++	 * execve return is not proof that userspace has executed instructions. */
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open || code == SYS_write)) {
++		kprintf("A733 PID1: syscall enter %u\n", (unsigned int)code);
++	}
++#endif
++
++#ifdef CONFIG_IOCOUNT_TRACE
+ 	uthread->uu_iocount = 0;
+ 	uthread->uu_vpindex = 0;
+ #endif
+ 	unix_syscall_kprintf("code %d (pid %d - %s, tid %lld)\n", code,
+@@ -180,13 +180,20 @@
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+ 
+-#if CONFIG_MACF
+-skip_syscall:
+-#endif /* CONFIG_MACF */
+-
+-	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
++#if CONFIG_MACF
++skip_syscall:
++#endif /* CONFIG_MACF */
++
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open || code == SYS_write)) {
++		kprintf("A733 PID1: syscall exit %u errno=%d result=%d\n",
++		    (unsigned int)code, error, uthread->uu_rval[0]);
++	}
++#endif
++
++	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
+ 	    uthread->uu_rval[0], uthread->uu_rval[1],
+ 	    pid, get_bsdtask_info(current_task()) ? proc->p_comm : "unknown", thread_tid(current_thread()));
+ 
+ #ifdef CONFIG_IOCOUNT_TRACE

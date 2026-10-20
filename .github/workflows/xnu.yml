@@ -31,6 +31,9 @@ on:
       - "a733/tools/audit_a733_macho.py"
       - "a733/tools/package_xnu_a733.py"
       - "a733/tools/make_test_ramdisk.sh"
+      - "a733/tools/make_pid1_ramdisk.sh"
+      - "a733/src/a733-init.S"
+      - "tools/mkinit.py"
       - "a733/tests/test_ramdisk_pack.py"
       - "a733/src/xnu_payload.c"
       - "a733/Makefile"
@@ -238,6 +241,50 @@ jobs:
                      (struct.unpack_from('<4Q', p, 0x2a8 + i * 32) for i in range(n)))
           print(f'PASS RAMDisk ADT + payload segment: PA=0x{pa:x}, size={length}')
           PY
+      - name: Build static signed ARM64 PID1 and HFS+ md0
+        run: |
+          clang -target arm64-apple-ios16.0 -x assembler-with-cpp -c \
+            a733/src/a733-init.S -o a733/build/a733-init.o
+          python3 tools/mkinit.py a733/build/a733-init.o a733/build/a733-init.macho
+          python3 - <<'PY'
+          import struct
+          from pathlib import Path
+          b = Path("a733/build/a733-init.macho").read_bytes()
+          magic, cputype, _, filetype, ncmds, _, _, _ = struct.unpack_from("<8I", b)
+          assert (magic, cputype, filetype) == (0xfeedfacf, 0x0100000c, 2)
+          at = 32
+          cmds = []
+          for i in range(ncmds):
+              cmd, sz = struct.unpack_from("<II", b, at)
+              cmds.append(cmd)
+              at += sz
+          assert 0x5 in cmds, "missing LC_UNIXTHREAD"
+          assert 0x1d in cmds, "missing LC_CODE_SIGNATURE"
+          assert 0xe not in cmds and 0xc not in cmds, "dynamic loader / shared libraries forbidden"
+          print("PASS: ARM64 static signed Mach-O, no dyld dependency")
+          PY
+          bash a733/tools/make_pid1_ramdisk.sh \
+            a733/build/a733-init.macho a733/build/a733-pid1-root.hfs A733PID1
+          python3 a733/tools/package_xnu_a733.py \
+            kernel/kernel.development.sweet a733/build/a733-early.adt \
+            a733/build/a733-xnu-pid1.payload --ramdisk a733/build/a733-pid1-root.hfs
+          a733/build/test_real_xnu_payload a733/build/a733-xnu-pid1.payload
+          # All the previous A733 safety checks apply to this new payload.
+          cmp a733/build/stage0.uimg a733/build/stage0.uimg
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a733-PID1-EXPERIMENTAL-HFSX-md0
+          path: |
+            a733/build/a733-init.macho
+            a733/build/a733-pid1-root.hfs
+            a733/build/a733-xnu-pid1.payload
+            a733/build/a733-xnu-pid1.payload.sha256
+            a733/build/stage0.uimg
+            a733/build/a733-early.adt
+          if-no-files-found: error
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: success()
         with:

@@ -1,28 +1,23 @@
 diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
 --- a/osfmk/arm64/copyio.c
 +++ b/osfmk/arm64/copyio.c
-@@ -35,6 +35,8 @@
+@@ -35,6 +35,7 @@
  #include <vm/vm_map.h>
  #include <san/kasan.h>
  #include <arm/pmap.h>
-+#include <sys/proc_internal.h>
 +#include <pexpert/pexpert.h>
  
  #undef copyin
  #undef copyout
-@@ -309,24 +311,53 @@
+@@ -309,24 +310,41 @@
  int
  copyinstr(const user_addr_t user_addr, char *kernel_addr, vm_size_t nbytes, vm_size_t *lencopied)
  {
  	int result;
  	vm_size_t bytes_copied = 0;
 +#if defined(SWEET)
-+	proc_t a733_proc = current_proc();
-+	bool a733_trace = a733_proc != NULL && proc_pid(a733_proc) == 1;
-+	if (a733_trace) {
-+		kprintf("A733 PID1 V16: COPYINSTR_ENTER user=0x%llx size=%lu\n",
-+		    (unsigned long long)user_addr, (unsigned long)nbytes);
-+	}
++	kprintf("A733 PID1 V16: COPYINSTR_ENTER user=0x%llx size=%lu\n",
++	    (unsigned long long)user_addr, (unsigned long)nbytes);
 +#endif
  
  	*lencopied = 0;
@@ -32,31 +27,23 @@ diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
  
  	result = copy_validate(user_addr, (uintptr_t)kernel_addr, nbytes, COPYIO_IN);
 +#if defined(SWEET)
-+	if (a733_trace) {
-+		kprintf("A733 PID1 V16: COPYINSTR_VALIDATE_DONE errno=%d\n", result);
-+	}
++	kprintf("A733 PID1 V16: COPYINSTR_VALIDATE_DONE errno=%d\n", result);
 +#endif
  	if (__improbable(result)) {
  		return result;
  	}
 +#if defined(SWEET)
-+	if (a733_trace) {
-+		kprintf("A733 PID1 V16: COPYINSTR_USER_ACCESS_ENTER\n");
-+	}
++	kprintf("A733 PID1 V16: COPYINSTR_USER_ACCESS_ENTER\n");
 +#endif
  	user_access_enable();
 +#if defined(SWEET)
-+	if (a733_trace) {
-+		kprintf("A733 PID1 V16: COPYINSTR_ASM_ENTER\n");
-+	}
++	kprintf("A733 PID1 V16: COPYINSTR_ASM_ENTER\n");
 +#endif
  	result = _bcopyinstr((const char *)user_addr, kernel_addr, nbytes,
  	    &bytes_copied);
 +#if defined(SWEET)
-+	if (a733_trace) {
-+		kprintf("A733 PID1 V16: COPYINSTR_ASM_DONE errno=%d len=%lu\n",
-+		    result, (unsigned long)bytes_copied);
-+	}
++	kprintf("A733 PID1 V16: COPYINSTR_ASM_DONE errno=%d len=%lu\n",
++	    result, (unsigned long)bytes_copied);
 +#endif
  	user_access_disable();
  	if (result != EFAULT) {

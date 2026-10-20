@@ -24,10 +24,10 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir -p "$work/mnt"
-# UDRW contains RAW disk data first, then the UDIF trailer. -layout NONE
+# A blank UDIF image contains RAW disk data before its trailer. -layout NONE
 # deliberately omits a partition map so HFSX starts at byte zero.
 hdiutil create -ov -size 8m -fs HFSX -layout NONE \
-  -volname "$label" -format UDRW -o "$work/root.dmg"
+  -volname "$label" -o "$work/root.dmg"
 hdiutil attach -nobrowse -mountpoint "$work/mnt" "$work/root.dmg"
 mounted=1
 mkdir -p "$work/mnt/sbin" "$work/mnt/dev" "$work/mnt/private" "$work/mnt/var" "$work/mnt/tmp" "$work/mnt/usr"

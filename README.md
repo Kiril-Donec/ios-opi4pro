@@ -2,7 +2,7 @@
 
 An experimental port of Apple's **XNU 8796** (iOS 16-era kernel) to the **Orange Pi 4 Pro** with an **Allwinner A733** (2× Cortex-A76 + 6× Cortex-A55).
 
-> **Current status (hardware-tested, 20 October 2026): XNU boots, reaches BSD, and mounts an HFS+ root filesystem in RAM. The iOS operating system and graphical shell do not boot yet. A first userspace process (PID 1) has NOT been confirmed to execute.**
+> **Current status (hardware-tested, 20 October 2026): XNU boots, reaches BSD, and mounts an HFS+ root filesystem in RAM. The iOS operating system and graphical shell do not boot yet. **PID 1 has now executed real ARM64 userspace instructions on the board (v13).** The first `open` syscall enters the kernel but no return from it has been observed.**
 
 This project is an independent A733 port based on [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) and the underlying [ios-sweet](https://github.com/dipa-studio/ios-sweet) work. The original `ios-topaz` repository belongs to its author, not the owner of this fork.
 
@@ -19,19 +19,20 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 | IOKit and BSD initialization | **Reached successfully:** `A733 TRACE 06: IOKit matching returned`, `A733 TRACE 12: BSD initialization returned`. |
 | In-memory root filesystem (v11) | **Works:** `BSD root: md0, major 1, minor 0`; `hfs: mounted A733RAM on device b(1, 0)`. |
 | HFS+ root with experimental Mach-O at `/sbin/launchd` (v12) | **Mount works:** `hfs: mounted A733PID1 on device b(1, 0)`. XNU prints `load_init_program: attempting to load /sbin/launchd`. |
-| First userspace program / PID 1 | **Not yet verified.** In v12 no userspace heartbeat or terminal panic was observed after the exec attempt, even after waiting. |
+| First userspace program / PID 1 (v13) | **CONFIRMED entering userspace** on real hardware: `execve returned errno=0 for /sbin/launchd` followed by `A733 PID1: syscall enter 5`. No `syscall exit 5` observed; the `open` handler or a subsequent step has not completed visibly. |
 | Real Apple launchd, SpringBoard, apps, iOS UI | **Not running.** This test RAM disk is a minimal HFS+ root, not a full iOS root filesystem. |
 
 **v11 milestone:** a blank RAM disk mounted successfully; PID 1 could not start because `/sbin/launchd` was absent (`errno 2`, expected).
 
 **v12 milestone:** the RAM disk contains a small ad-hoc-signed **test** Mach-O named `/sbin/launchd`. This is **not** Apple's launchd. No success/failure is yet established for the userspace transition: the last visible line is the exec attempt. XNU framebuffer `kprintf` and the userspace `/dev/console` are different output paths.
 
-**Next diagnostic (v13, not yet hardware-tested):** kernel-side logs report the initial `execve` result and PID 1 syscalls via the framebuffer. The prepared v13 AutoBoot image deliberately **reuses the physically tested v12 HFS+ RAM disk and original v12 PID 1 executable**, to isolate the XNU change: the first expected syscall is `open` (number 5), which tests `/dev/console`. A separate `getpid`-before-`open` probe has also been committed in `a733-init.S` for a later image but is **not present** in this particular v13 test IMG. No second CPU is enabled. On the current GitHub Ubuntu runner, building a fresh populated HFS+ disk fails because the runner lacks the HFS+ mount driver; this does not invalidate the already audited macOS XNU build or the v12 RAM disk.
+**v13 hardware result (20 October 2026):** kernel-side framebuffer logs confirm `execve` returned 0 for `/sbin/launchd` and the experimental userspace program invoked syscall 5 (`open`). This confirms a real userspace-to-kernel transition on ARM64. No syscall exit log was seen, so execution beyond `open` remains unverified. The prepared v13 AutoBoot image deliberately **reuses the physically tested v12 HFS+ RAM disk and original v12 PID 1 executable**, to isolate the XNU change: the first expected syscall is `open` (number 5), which tests `/dev/console`. A separate `getpid`-before-`open` probe has also been committed in `a733-init.S` for a later image but is **not present** in this particular v13 test IMG. No second CPU is enabled. On the current GitHub Ubuntu runner, building a fresh populated HFS+ disk fails because the runner lacks the HFS+ mount driver; this does not invalidate the already audited macOS XNU build or the v12 RAM disk.
 
 ## Current limitations
 
 - **Only one CPU is enabled** (`cpus=1`); SMP and the six A55 cores are deferred.
 - **No permanent XNU SD/eMMC storage driver.** U-Boot reads the test image from microSD; XNU's current root is an **8 MiB RAM-backed HFS+ volume** (`rd=md0`).
+- The first user process reaches `open("/dev/console")` but its syscall return has not yet appeared; this is the immediate diagnostic target.
 - No complete iOS rootfs, Apple userspace services, touch stack or functional graphics acceleration. Display output is an early framebuffer console.
 - The imported Xiaomi/Qualcomm sources still contain device-specific paths. Boot flags `modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0` keep the known incompatible ones disabled.
 - Some `sweet`, `SWEET`, and `topaz` identifiers remain in build configurations and inherited source files for compatibility; **the target is Allwinner A733**.
@@ -64,4 +65,4 @@ The guarded Stage0 rejects legacy Xiaomi `SWEETXNU` payloads and accepts only `A
 
 The board owner's primary microSD card is repeatedly reused for experiments. **No automatic flashing or destructive operations are performed by CI or this repository.** Verify the device and any backups before writing an IMG; a successful kernel build is not a guarantee of bootability.
 
-The current target is to confirm **one** working PID 1 on one A76 core. SMP, persistent storage and an adaptive iOS UI are deliberately later milestones.
+The current target is to make PID 1 **complete its first syscall and continue running** on one A76 core. Initial execution of user code is already confirmed on hardware. SMP, persistent storage and an adaptive iOS UI are later milestones.

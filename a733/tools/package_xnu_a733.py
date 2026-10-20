@@ -25,7 +25,7 @@ LEGACY = b"SWEETXNU"
 PHYS_BASE = 0x100000000
 MEM_SIZE = 0x40000000
 MAX_BYTES = 128 * 1024 * 1024
-DEFAULT_CMDLINE = "debug=0xc cpus=1 keepsyms=1 -v modem=0 wifi=0"
+DEFAULT_CMDLINE = "debug=0xc cpus=1 keepsyms=1 -v modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0"
 
 
 def pack(kernel: Path, adt: Path, cmdline: str) -> tuple[bytes, dict]:
@@ -36,8 +36,17 @@ def pack(kernel: Path, adt: Path, cmdline: str) -> tuple[bytes, dict]:
         raise ValueError(f"A733 kernel audit failed: {exc}") from exc
     if problems:
         raise ValueError("A733 kernel audit failed: " + "; ".join(problems))
-    if "modem=1" in cmdline or "wifi=1" in cmdline:
-        raise ValueError("Qualcomm modem=1/wifi=1 boot args are forbidden on A733")
+    # Xiaomi/Qualcomm MMIO is not valid on the Allwinner A733. Even the
+    # battery personality can touch Qualcomm QUP/I2C and cpufreq registers.
+    # Require explicit off switches in EVERY first-boot payload.
+    tokens = set(cmdline.split())
+    required_off = {"modem=0", "wifi=0", "sweetbattery=0", "sweetcpufreq=0"}
+    if not required_off.issubset(tokens) or any(
+        token.startswith(key + "=") and token != key + "=0"
+        for token in tokens
+        for key in ("modem", "wifi", "sweetbattery", "sweetcpufreq")
+    ):
+        raise ValueError("A733 first boot requires Qualcomm modem, Wi-Fi, battery I2C and cpufreq disabled")
     data, meta = mkpayload.build(str(kernel), str(adt), cmdline)
     if not data.startswith(LEGACY):
         raise ValueError("upstream payload format changed")

@@ -1,0 +1,24 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -2104,6 +2104,18 @@
+ 	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_EXCP_SERR_ARM, 0) | DBG_FUNC_START,
+ 	    esr, VM_KERNEL_ADDRHIDE(far));
+ 	arm_saved_state_t *state = &context->ss;
++#if defined(SWEET)
++	/*
++	 * A733 bring-up: upstream's platform-specific fallback hides ESR/ELR
++	 * behind "Unhandled implementation specific error". Report original
++	 * asynchronous SError state before entering the generic platform path.
++	 * Saved PC is NOT guaranteed to be the initiating instruction: SError
++	 * can be imprecise / deferred.
++	 */
++	panic_plain("A733 ARM64 ASYNC SError: ESR=0x%08x FAR=0x%016llx "
++	    "saved_PC=0x%016llx SPSR=0x%08x (PC may be delayed)",
++	    esr, (unsigned long long)far,
++	    (unsigned long long)get_saved_state_pc(state),
++	    saved_state64(state)->cpsr);
++#endif
+ #if MACH_ASSERT
+ 	int preemption_level = sleh_get_preemption_level();
+ #endif

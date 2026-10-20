@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -176,11 +176,35 @@
+ 		}
+ 	}
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
+ 
+-	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+-	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+-	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if defined(SWEET)
++	/* A733 bring-up, v14: determine precisely where the FIRST user
++	 * syscall stalls. This stays strictly PID1-only and keeps the
++	 * kernel's audit, MACF and syscall dispatch behavior unchanged. */
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: BEFORE_AUDIT_ENTER syscall=%u\n", (unsigned int)code);
++	}
++#endif
++	AUDIT_SYSCALL_ENTER(code, proc, uthread);
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: BEFORE_SY_CALL syscall=%u\n", (unsigned int)code);
++	}
++#endif
++	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: AFTER_SY_CALL syscall=%u errno=%d\n",
++		    (unsigned int)code, error);
++	}
++#endif
++	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: AFTER_AUDIT_EXIT syscall=%u\n", (unsigned int)code);
++	}
++#endif
+ 
+ #if CONFIG_MACF
+ skip_syscall:
+ #endif /* CONFIG_MACF */

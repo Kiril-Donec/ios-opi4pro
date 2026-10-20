@@ -1,34 +1,43 @@
-diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
---- a/osfmk/arm64/machine_routines_asm.s
-+++ b/osfmk/arm64/machine_routines_asm.s
-@@ -663,11 +663,20 @@
- 	PUSH_FRAME
- 	COPYIO_RECOVER_RANGE Lcopyinstr_done
- 	mov		x4, #0						// x4 - total bytes copied
- Lcopyinstr_loop:
-+#if defined(SWEET)
-+	/* A733 Cortex-A76: use EL0 permissions for user-memory reads from
-+	 * EL1. An ordinary LDRB may be blocked by PAN even when the user
-+	 * page is valid and executable at EL0. Do not bypass EFAULT or the
-+	 * normal copyio exception-recovery table. Keep other targets intact. */
-+	ldtrb	w5, [x0]
-+	add		x0, x0, #1
-+#else
- 	ldrb	w5, [x0], #1					// Load a byte from the user source
-+#endif
- 	strb	w5, [x1], #1				// Store a byte to the kernel dest
- 	add		x4, x4, #1					// Increment bytes copied
- 	cbz	x5, Lcopyinstr_done	  		// If this byte is null, we're done
- 	cmp		x4, x2						// If we're out of space, return an error
- 	b.ne	Lcopyinstr_loop
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -34,7 +34,9 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-/* topaz: Cortex-A53/A73 have no PAN (ARMv8.1); MSR PAN is undefined there */
++/* A733 only: Cortex-A76 (ARMv8.2) implements PAN; old A53/A73 did not.
++ * XNU must explicitly set PAN on EL1 entry and clear it for copyio. */
++#define __ARM_PAN_AVAILABLE__    1
+ #define __ARM_16K_PG__            1
+ 
+ #define HAS_GIC_V3                1
 diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
 --- a/osfmk/arm64/copyio.c
 +++ b/osfmk/arm64/copyio.c
-@@ -339,6 +339,6 @@
- 	user_access_enable();
+@@ -328,20 +328,17 @@
+ 	if (__improbable(result)) {
+ 		return result;
+ 	}
  #if defined(SWEET)
--	kprintf("A733 PID1 V16: COPYINSTR_ASM_ENTER\n");
-+	kprintf("A733 PID1 V17: COPYINSTR_LDTRB_ENTER\n");
+-	kprintf("A733 PID1 V16: COPYINSTR_USER_ACCESS_ENTER\n");
++	kprintf("A733 PID1 V17: COPYINSTR_ACCESS_BEGIN\n");
  #endif
+ 	user_access_enable();
+-#if defined(SWEET)
+-	kprintf("A733 PID1 V16: COPYINSTR_ASM_ENTER\n");
+-#endif
  	result = _bcopyinstr((const char *)user_addr, kernel_addr, nbytes,
  	    &bytes_copied);
+-#if defined(SWEET)
+-	kprintf("A733 PID1 V16: COPYINSTR_ASM_DONE errno=%d len=%lu\n",
+-	    result, (unsigned long)bytes_copied);
+-#endif
+ 	user_access_disable();
++#if defined(SWEET)
++	kprintf("A733 PID1 V17: COPYINSTR_ACCESS_END errno=%d len=%lu\n",
++	    result, (unsigned long)bytes_copied);
++#endif
+ 	if (result != EFAULT) {
+ 		*lencopied = bytes_copied;
+ 	}

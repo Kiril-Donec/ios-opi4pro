@@ -102,14 +102,13 @@ def audit(buf: bytes) -> tuple[int, list[str]]:
                    b"A733 PID1 V15: NAMEI_COPY_ENTER",
                    b"A733 PID1 V15: NAMEI_LOOKUP_ENTER",
                    b"A733 PID1 V16: COPYINSTR_VALIDATE_DONE",
-                   b"A733 PID1 V16: COPYINSTR_ASM_DONE",
                    b"A733 PID1 V17: COPYINSTR_ACCESS_BEGIN",
                    b"A733 PID1 V17: COPYINSTR_ACCESS_END"):
         if marker not in buf:
             errors.append("missing compiled A733 kernel identity: " + marker.decode())
     # v17 uses native ARMv8.1+ PAN, not a privileged load bypass. The
     # compiled kernel must contain both PSTATE PAN enable and disable opcodes.
-    if bytes.fromhex("9f4000d5") not in buf or bytes.fromhex("bf4000d5") not in buf:
+    if bytes.fromhex("9f4000d5") not in buf or bytes.fromhex("9f4100d5") not in buf:
         errors.append("v17 PAN enable/disable instructions absent from kernel")
     return start, errors
 

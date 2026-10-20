@@ -72,6 +72,14 @@ def audit(buf: bytes) -> tuple[int, list[str]]:
     expected = tuple(word_movk_x0((expected_address >> shift) & 0xFFFF, shift)
                      for shift in (48, 32, 16, 0))
     errors = []
+    # Early arm_init calls cpu_data_init(), which emits NEON on this XNU.
+    # CPACR_EL1.FPEN enable MUST be followed by ISB on Cortex-A76 before it
+    # can safely execute the compiler's MOVI/STP SIMD instructions.
+    # These are little-endian AArch64 opcodes:
+    #     msr CPACR_EL1, x0 ; isb
+    neon_sync = struct.pack("<II", 0xD5181040, 0xD5033FDF)
+    if neon_sync not in buf[start:start + 4096]:
+        errors.append("early NEON enable missing ISB after MSR CPACR_EL1")
     if first[:4] != expected:
         errors.append("XNU boot marker still has a non-A733 framebuffer address")
     if first[6] != (0xD2800000 | (4096 << 5) | 4):

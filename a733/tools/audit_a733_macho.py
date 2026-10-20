@@ -85,7 +85,8 @@ def audit(buf: bytes) -> tuple[int, list[str]]:
     if first[6] != (0xD2800000 | (4096 << 5) | 4):
         errors.append("XNU boot marker stride is not 4096 bytes")
     for marker in (b"expected boot MPIDR 0x600", b"Cortex-A76", 
-                   b"allwinner,a733", b"arm,cortex-a76"):
+                   b"allwinner,a733", b"arm,cortex-a76",
+                   b"A733 ARM64 ASYNC SError:"):
         if marker not in buf:
             errors.append("missing compiled A733 kernel identity: " + marker.decode())
     return start, errors

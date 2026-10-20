@@ -2,7 +2,7 @@
 
 An experimental port of Apple's **XNU 8796** (iOS 16-era kernel) to the **Orange Pi 4 Pro** with an **Allwinner A733** (2× Cortex-A76 + 6× Cortex-A55).
 
-> **Current hardware status (20 October 2026, v14):** XNU boots, reaches BSD, mounts an HFS+ RAM root, and executes test PID 1. The `getpid()` syscall **returns PID 1 successfully**, then userspace enters `open()` which stalls in the handler path. **v15 now passes kernel, PID1, and payload CI checks**, adding targeted `open`/VFS diagnostics and a regular-file probe; v15 is **not yet hardware-verified**. **Full iOS and SpringBoard are not running.**
+> **Current hardware status (20 October 2026, v15):** XNU boots on one Cortex-A76, mounts its HFS+ RAM root, and executes a test PID 1. `getpid()` returns 1 correctly. The v15 hardware photos show that `open("/sbin/launchd")` stalls while `namei()` copies its user-space pathname; the last trace is `NAMEI_COPY_ENTER`. After five minutes no new lines appeared. **v16 adds probes in `copyinstr()` to isolate validation versus ARM64 user-memory copying; it has not yet been tested on the board. Full iOS/SpringBoard are not running.**
 
 This project is an independent A733 port based on [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) and the underlying [ios-sweet](https://github.com/dipa-studio/ios-sweet) work. The original `ios-topaz` repository belongs to its author, not the owner of this fork.
 
@@ -21,6 +21,7 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 | HFS+ root with experimental Mach-O at `/sbin/launchd` (v12) | **Mount works:** `hfs: mounted A733PID1 on device b(1, 0)`. XNU prints `load_init_program: attempting to load /sbin/launchd`. |
 | First userspace program / PID 1 (v13) | **CONFIRMED entering userspace** on real hardware: `execve returned errno=0 for /sbin/launchd` followed by `A733 PID1: syscall enter 5`. No `syscall exit 5` observed; the `open` handler or a subsequent step has not completed visibly. |
 | PID 1 returns from a syscall (v14) | **Confirmed on physical board:** `syscall exit 20 errno=0 result=1`, followed by `syscall enter 5` and `BEFORE_SY_CALL syscall=5`. No `AFTER_SY_CALL syscall=5` appeared. The stall is inside the `open` handler path, not in the earlier audit or userspace transition. |
+| Open pathname copy stalls (v15) | **Confirmed on physical board:** `/sbin/launchd` returns from `execve` and from `getpid`; first `open` passes fd allocation and enters `namei()`. The final visible checkpoint after five minutes is `A733 PID1 V15: NAMEI_COPY_ENTER`, with no `NAMEI_COPY_DONE`. This is a location, not a proven root cause or fix. |
 | Real Apple launchd, SpringBoard, apps, iOS UI | **Not running.** This test RAM disk is a minimal HFS+ root, not a full iOS root filesystem. |
 
 **v11 milestone:** a blank RAM disk mounted successfully; PID 1 could not start because `/sbin/launchd` was absent (`errno 2`, expected).
@@ -33,13 +34,15 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 
 **v15 CI milestone (20 October 2026):** [GitHub Actions run #39464210361](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39464210361) **passed** macOS XNU compilation, Mach-O trace-string audit, signed static PID 1, populated HFSX RAM-disk creation, and Ubuntu `A733XNU1` payload integration. The [v15 PID1 artifact](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39464210361/artifacts/12284581494) contains `a733-xnu-pid1.payload` (SHA-256 `edc4d4098d53dc181b921c6c33a3804aa73a7e77b0a2b479c0b2586f302c6fe8`). A separate 64-MiB test SD IMG was prepared from the verified v14 layout by replacing only the payload in a *copy* of its ext4 partition; its SHA-256 is `975ad79943b246ddbcbeeee9f574fa33c4cf8a9e433a772eac104353666ecdd5`. The first 32 MiB of U-Boot/container bytes match the verified v14 base, ext4 `e2fsck -fn` passes, and payload filesystem readback matches the CI payload. **These are offline checks, not a successful v15 boot on hardware.**
 
+**v16 development (20 October 2026):** `a733/xnu-a733-pid1-v16-copyinstr.patch` instruments XNU 8796 ARM64 `copyinstr()` around user-address validation, access-enablement, and `_bcopyinstr()`. Its purpose is to distinguish an invalid user address from a missing translation or exception/recovery issue during a user-space read. The v16 patch requires new kernel compilation and a physical board test; until that happens, `open()` **is not fixed**. The existing v15 boot, Stage0 and single-core configuration are kept unchanged.
+
 ## Current limitations
 
-**v15 diagnostic build (CI passed; hardware test pending):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Use a spare microSD or an adequate backup before testing the offline-audited IMG.
+**v15 hardware result (stalled in user pathname copying):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Use a spare microSD or an adequate backup before testing the offline-audited IMG.
 
 - **Only one CPU is enabled** (`cpus=1`); SMP and the six A55 cores are deferred.
 - **No permanent XNU SD/eMMC storage driver.** U-Boot reads the test image from microSD; XNU's current root is an **8 MiB RAM-backed HFS+ volume** (`rd=md0`).
-- The first user process returns successfully from `getpid()`, but `open("/dev/console")` does not yet return; v15 compares regular-file HFS+ and devfs opens.
+- PID 1 returns from `getpid()` but first stalls within `open("/sbin/launchd")` before any `/dev/console` test. In v15, the last checkpoint is immediately before `copyinstr()` returns; v16 checks its internals.
 - No complete iOS rootfs, Apple userspace services, touch stack or functional graphics acceleration. Display output is an early framebuffer console.
 - The imported Xiaomi/Qualcomm sources still contain device-specific paths. Boot flags `modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0` keep the known incompatible ones disabled.
 - Some `sweet`, `SWEET`, and `topaz` identifiers remain in build configurations and inherited source files for compatibility; **the target is Allwinner A733**.

@@ -30,6 +30,7 @@ on:
       - "a733/xnu-a733-pid1-v14-trace.patch"
       - "a733/xnu-a733-pid1-v15-open.patch"
       - "a733/xnu-a733-pid1-v16-copyinstr.patch"
+      - "a733/xnu-a733-pid1-v17-usercopy.patch"
       - "a733/tools/adapt_xnu_a733.py"
       - "a733/tests/test_adapt_xnu.py"
       - "a733/tools/audit_a733_macho.py"
@@ -93,6 +94,7 @@ jobs:
           cp a733/xnu-a733-pid1-trace.patch dxb/patches/9999h-a733-pid1-trace.patch
           cp a733/xnu-a733-pid1-v15-open.patch dxb/patches/9999i-a733-pid1-v15-open.patch
           cp a733/xnu-a733-pid1-v16-copyinstr.patch dxb/patches/9999j-a733-pid1-v16-copyinstr.patch
+          cp a733/xnu-a733-pid1-v17-usercopy.patch dxb/patches/9999k-a733-pid1-v17-usercopy.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)

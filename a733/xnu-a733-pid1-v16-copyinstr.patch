@@ -10,7 +10,7 @@ diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
  
  #undef copyin
  #undef copyout
-@@ -309,27 +311,57 @@
+@@ -309,24 +311,53 @@
  int
  copyinstr(const user_addr_t user_addr, char *kernel_addr, vm_size_t nbytes, vm_size_t *lencopied)
  {

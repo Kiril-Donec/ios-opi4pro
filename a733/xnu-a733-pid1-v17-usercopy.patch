@@ -1,0 +1,34 @@
+diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -663,12 +663,20 @@
+ 	PUSH_FRAME
+ 	COPYIO_RECOVER_RANGE Lcopyinstr_done
+ 	mov		x4, #0						// x4 - total bytes copied
+ Lcopyinstr_loop:
++#if defined(SWEET)
++	/* A733 Cortex-A76: use EL0 permissions for user-memory reads from
++	 * EL1. An ordinary LDRB may be blocked by PAN even when the user
++	 * page is valid and executable at EL0. Do not bypass EFAULT or the
++	 * normal copyio exception-recovery table. Keep other targets intact. */
++	ldtrb	w5, [x0]
++	add		x0, x0, #1
++#else
+ 	ldrb	w5, [x0], #1					// Load a byte from the user source
++#endif
+ 	strb	w5, [x1], #1				// Store a byte to the kernel dest
+ 	add		x4, x4, #1					// Increment bytes copied
+ 	cbz	x5, Lcopyinstr_done	  		// If this byte is null, we're done
+ 	cmp		x4, x2						// If we're out of space, return an error
+ 	b.ne	Lcopyinstr_loop
+diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
+--- a/osfmk/arm64/copyio.c
++++ b/osfmk/arm64/copyio.c
+@@ -339,7 +339,7 @@
+ 	user_access_enable();
+ #if defined(SWEET)
+-	kprintf("A733 PID1 V16: COPYINSTR_ASM_ENTER\n");
++	kprintf("A733 PID1 V17: COPYINSTR_LDTRB_ENTER\n");
+ #endif
+ 	result = _bcopyinstr((const char *)user_addr, kernel_addr, nbytes,
+ 	    &bytes_copied);

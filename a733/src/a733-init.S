@@ -29,6 +29,14 @@ _start:
 	and	x9, x9, #~15
 	mov	sp, x9
 
+	/*
+	 * A733 v13: first enter the kernel via a harmless getpid syscall
+	 * BEFORE trying /dev/console. With kernel-side PID1 syscall tracing
+	 * this independently proves that arm64 userspace instructions ran.
+	 */
+	mov	x16, #SYS_getpid
+	svc	#0x80
+
 	adr	x0, path
 	mov	x1, #O_RDWR
 	mov	x2, #0

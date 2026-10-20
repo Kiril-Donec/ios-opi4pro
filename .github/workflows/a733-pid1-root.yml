@@ -1,0 +1,37 @@
+name: A733 PID1 HFSX root (macOS standalone)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [topaz]
+    paths:
+      - ".github/workflows/a733-pid1-root.yml"
+      - "a733/tools/make_pid1_ramdisk_macos.sh"
+      - "a733/src/a733-init.S"
+      - "tools/mkinit.py"
+
+jobs:
+  prepare-root:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile minimal Darwin PID1 and make HFSX image
+        run: |
+          mkdir -p a733/build
+          xcrun clang -target arm64-apple-ios16.0 -x assembler-with-cpp -c \
+            a733/src/a733-init.S -o a733/build/a733-init.o
+          python3 tools/mkinit.py a733/build/a733-init.o a733/build/a733-init.macho
+          bash a733/tools/make_pid1_ramdisk_macos.sh \
+            a733/build/a733-init.macho a733/build/a733-pid1-root.hfs A733PID1
+          test "$(stat -f %z a733/build/a733-pid1-root.hfs)" -eq 8388608
+          shasum -a 256 a733/build/a733-init.macho a733/build/a733-pid1-root.hfs
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a733-v14-PID1-root-test
+          path: |
+            a733/build/a733-init.macho
+            a733/build/a733-pid1-root.hfs
+          retention-days: 14
+          if-no-files-found: error

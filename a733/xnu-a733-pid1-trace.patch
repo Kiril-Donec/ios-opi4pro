@@ -28,7 +28,7 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 --- a/bsd/dev/arm/systemcalls.c
 +++ b/bsd/dev/arm/systemcalls.c
-@@ -147,11 +147,19 @@
+@@ -147,11 +147,18 @@
  	if (do_count_syscalls > 0) {
  		syscalls_log[code]++;
  	}
@@ -39,8 +39,7 @@ diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
 +	pid = proc_pid(proc);
 +
 +#if defined(SWEET)
-+	/* Only trace syscalls from real userspace PID1. A successful kernel
-+	 * execve return is not proof that userspace has executed instructions. */
++	/* v13/v14: real PID1 syscalls, independent of /dev/console. */
 +	if (pid == 1 && (code == SYS_getpid || code == SYS_open || code == SYS_write)) {
 +		kprintf("A733 PID1: syscall enter %u\n", (unsigned int)code);
 +	}
@@ -51,16 +50,44 @@ diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
  	uthread->uu_vpindex = 0;
  #endif
  	unix_syscall_kprintf("code %d (pid %d - %s, tid %lld)\n", code,
-@@ -180,13 +180,20 @@
- 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
- 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
- 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+@@ -176,17 +176,44 @@
+ 		}
+ 	}
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
  
+-	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+-	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+-	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+-
 -#if CONFIG_MACF
 -skip_syscall:
 -#endif /* CONFIG_MACF */
 -
 -	unix_syscall_kprintf("code %d, error %d, results %x, %x (pid %d - %s, tid %lld)\n", code, error,
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: BEFORE_AUDIT_ENTER syscall=%u\n", (unsigned int)code);
++	}
++#endif
++	AUDIT_SYSCALL_ENTER(code, proc, uthread);
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: BEFORE_SY_CALL syscall=%u\n", (unsigned int)code);
++	}
++#endif
++	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: AFTER_SY_CALL syscall=%u errno=%d\n", (unsigned int)code, error);
++	}
++#endif
++	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if defined(SWEET)
++	if (pid == 1 && (code == SYS_getpid || code == SYS_open)) {
++		kprintf("A733 PID1 V14: AFTER_AUDIT_EXIT syscall=%u\n", (unsigned int)code);
++	}
++#endif
++
 +#if CONFIG_MACF
 +skip_syscall:
 +#endif /* CONFIG_MACF */

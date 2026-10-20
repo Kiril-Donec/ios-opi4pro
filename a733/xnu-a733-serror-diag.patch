@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -2104,6 +2104,18 @@
+@@ -2104,6 +2104,20 @@
  	KDBG_RELEASE(MACHDBG_CODE(DBG_MACH_EXCP_SERR_ARM, 0) | DBG_FUNC_START,
  	    esr, VM_KERNEL_ADDRHIDE(far));
  	arm_saved_state_t *state = &context->ss;

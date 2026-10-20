@@ -2,7 +2,7 @@
 
 An experimental port of Apple's **XNU 8796** (iOS 16-era kernel) to the **Orange Pi 4 Pro** with an **Allwinner A733** (2× Cortex-A76 + 6× Cortex-A55).
 
-> **Current hardware status (20 October 2026, v15):** XNU boots on one Cortex-A76, mounts its HFS+ RAM root, and executes a test PID 1. `getpid()` returns 1 correctly. The v15 hardware photos show that `open("/sbin/launchd")` stalls while `namei()` copies its user-space pathname; the last trace is `NAMEI_COPY_ENTER`. After five minutes no new lines appeared. **v16 adds probes in `copyinstr()` to isolate validation versus ARM64 user-memory copying; it has not yet been tested on the board. Full iOS/SpringBoard are not running.**
+> **Current hardware status (20 October 2026, v16):** XNU boots on one Cortex-A76, mounts the RAM-root, and runs test PID 1. `getpid()` returns 1. The v16 hardware photos show `copyinstr` validates user VA `0x1000004e0` but stalls after `COPYINSTR_ASM_ENTER` while attempting its first `open("/sbin/launchd")`. Earlier kernel-side path copies succeeded. **v17 now tests an architectural correction: `SWEET.h` was inherited from PAN-less Cortex-A53/A73, while the A733's Cortex-A76 supports PAN. Native PAN handling is enabled and logging moved out of the PAN-disabled usercopy window. This is a code-level fix candidate, NOT a board-tested solution. Real iOS/SpringBoard are not running.**
 
 This project is an independent A733 port based on [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) and the underlying [ios-sweet](https://github.com/dipa-studio/ios-sweet) work. The original `ios-topaz` repository belongs to its author, not the owner of this fork.
 
@@ -38,6 +38,10 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 
 **v16 probe design:** `a733/xnu-a733-pid1-v16-copyinstr.patch` instruments XNU 8796 ARM64 `copyinstr()` around user-address validation, access-enablement, and `_bcopyinstr()`. Its purpose is to distinguish an invalid user address from a missing translation or exception/recovery issue during a user-space read. The v16 patch requires new kernel compilation and a physical board test; until that happens, `open()` **is not fixed**. The existing v15 boot, Stage0 and single-core configuration are kept unchanged.
 
+**v16 hardware result:** User photos confirm `A733 PID1 V16: COPYINSTR_ENTER user=0x1000004e0 size=256`, `COPYINSTR_VALIDATE_DONE errno=0`, `COPYINSTR_USER_ACCESS_ENTER`, and `COPYINSTR_ASM_ENTER`, with no corresponding `COPYINSTR_ASM_DONE`. Earlier copies inside `execve` return successfully. The reported user address passes range validation, but this does not prove the kernel's privileged access permissions or page mappings are correct. The failure manifests inside the low-level `_bcopyinstr` on the first real PID 1 `open`.
+
+**v17 PAN fix candidate:** The inherited `xnu/pexpert/pexpert/arm64/SWEET.h` disabled `__ARM_PAN_AVAILABLE__` for the original A53/A73 CPUs. A733 currently boots only on a Cortex-A76 (ARMv8.2, with Privileged Access Never support). [`a733/xnu-a733-pid1-v17-usercopy.patch`](a733/xnu-a733-pid1-v17-usercopy.patch) enables the XNU PAN mechanism for this configuration: PAN=1 during normal kernel execution, disabled by `user_access_enable()` for kernel reads of user memory, and restored by `user_access_disable()`. The patch also moves `kprintf` tracing outside the PAN-disabled section to avoid instrumentation while user accesses are temporarily permitted. One core remains enabled. This change is **not yet verified on the board**; if `open` still stalls we will investigate the TTBR0 mapping and exception path. It does not bypass kernel security checks.
+
 ## Current limitations
 
 **v15 hardware result (stalled in user pathname copying):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Use a spare microSD or an adequate backup before testing the offline-audited IMG.
@@ -56,7 +60,7 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 - [`a733/tools/make_pid1_ramdisk.sh`](a733/tools/make_pid1_ramdisk.sh) — builds the minimal test `/sbin/launchd` root with `/dev`.
 - [`a733/xnu-a733-boot-trace.patch`](a733/xnu-a733-boot-trace.patch) — visible BSD/rootfs milestones.
 - [`a733/xnu-a733-pid1-trace.patch`](a733/xnu-a733-pid1-trace.patch) — **experimental** PID 1 exec/syscall tracing (requires a new kernel build and hardware verification).
-- [`a733/xnu-a733-pid1-v15-open.patch`](a733/xnu-a733-pid1-v15-open.patch) — PID1-only `open`/VFS tracepoints; not yet hardware-tested.
+- [`a733/xnu-a733-pid1-v15-open.patch`](a733/xnu-a733-pid1-v15-open.patch) — PID1-only `open`/VFS tracepoints; board-tested, stopped at `copyinstr`.
 - [`.github/workflows/xnu.yml`](.github/workflows/xnu.yml) — builds patched XNU on macOS, audits the Mach-O, compiles Stage0, creates and validates HFS+ RAM-root payloads.
 - [`.github/workflows/a733-stage0.yml`](.github/workflows/a733-stage0.yml) — Linux Stage0 tests.
 - [`xnu/patches/`](xnu/patches/) — upstream-derived XNU patch series.

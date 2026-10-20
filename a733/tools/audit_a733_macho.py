@@ -94,7 +94,13 @@ def audit(buf: bytes) -> tuple[int, list[str]]:
                    b"A733 PID1: syscall enter",
                    b"A733 PID1: syscall exit",
                    b"A733 PID1 V14: BEFORE_SY_CALL",
-                   b"A733 PID1 V14: AFTER_SY_CALL"):
+                   b"A733 PID1 V14: AFTER_SY_CALL",
+                   b"A733 PID1 V15: OPEN_ENTER",
+                   b"A733 PID1 V15: OPENAT_ALLOC_ENTER",
+                   b"A733 PID1 V15: OPEN1_FALLOC_ENTER",
+                   b"A733 PID1 V15: VN_AUTH_NAMEI_ENTER",
+                   b"A733 PID1 V15: NAMEI_COPY_ENTER",
+                   b"A733 PID1 V15: NAMEI_LOOKUP_ENTER"):
         if marker not in buf:
             errors.append("missing compiled A733 kernel identity: " + marker.decode())
     return start, errors

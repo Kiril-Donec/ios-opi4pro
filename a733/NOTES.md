@@ -84,3 +84,11 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - The photographed values include `PC=0xfffffe00074a925c`, `ESR=0x96000006`, `FAR=0x220`, `x0=0`. Symbolication against the **exact macOS CI kernel artifact** from run `39299998464` locates `PC` in `_current_percpu_base + 0xC`: a load from `current_thread()->machine.pcpu_data_base`, with a null current-thread pointer. This could be either the primary failure or a second fault during early exception handling.
 - **XNU instruction execution is now demonstrated, but XNU has not successfully bootstrapped.** This is not an iOS userland boot.
 - AutoBoot v4 keeps the working loader and adjusts only XNU's console renderer to show 24 compact lines instead of 12 within the same safe 1024x224 HDMI scanout. Kernel compile and payload packaging passed on [XNU run 39317422418](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39317422418); Stage0 tests passed on [run 39317422221](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39317422221). Physical v4 still untested.
+
+## Physical v14: successful userspace syscall round-trip (2026-10-20)
+
+- macOS XNU, static PID1, and 8-MiB populated HFSX root compiled and packed on [CI run 39431933051](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39431933051), commit `96767d3`.
+- Real board HDMI photographs confirm BSD initialization, `hfs: mounted A733PID1 on device b(1, 0)`, and `execve returned errno=0 for /sbin/launchd` (our test binary, **not** Apple's launchd).
+- Logs show `syscall enter 20`, `AFTER_SY_CALL syscall=20 errno=0`, `AFTER_AUDIT_EXIT syscall=20`, `syscall exit 20 errno=0 result=1`, then `syscall enter 5`. This **proves a getpid userspace → kernel → userspace round-trip** on the board.
+- `open` syscall 5 prints `BEFORE_AUDIT_ENTER` and `BEFORE_SY_CALL` but not `AFTER_SY_CALL`. The stall is in the handler path; `__pthread_testcancel`, allocation, vnode lookup and devfs are not yet distinguished. One A76 core remains enabled. SMP is deferred.
+- v15 source adds PID1-only tracepoints through `open`, `openat_internal`, `open1`, `vn_open_auth`, and `namei`, plus a read-only test open of the HFS+ `/sbin/launchd` before `/dev/console`. V15 still needs CI and real-board validation. Preserve the known-working v14 ZIP and the existing SD/U-Boot layout.

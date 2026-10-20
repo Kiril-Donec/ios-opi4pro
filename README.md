@@ -2,7 +2,7 @@
 
 An experimental port of Apple's **XNU 8796** (iOS 16-era kernel) to the **Orange Pi 4 Pro** with an **Allwinner A733** (2× Cortex-A76 + 6× Cortex-A55).
 
-> **Current hardware status (20 October 2026):** XNU boots, reaches BSD, mounts an HFS+ RAM root, and runs real ARM64 userspace instructions in the test PID 1 (v13). The first `open` syscall enters the kernel but does not visibly return. **Full iOS and SpringBoard are not running.**
+> **Current hardware status (20 October 2026, v14):** XNU boots, reaches BSD, mounts an HFS+ RAM root, and executes test PID 1. The `getpid()` syscall **returns PID 1 successfully**, then userspace enters `open()` which stalls in the handler path. The v15 source adds targeted `open`/VFS diagnostics and a regular-file probe; v15 is **not yet hardware-verified**. **Full iOS and SpringBoard are not running.**
 
 This project is an independent A733 port based on [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) and the underlying [ios-sweet](https://github.com/dipa-studio/ios-sweet) work. The original `ios-topaz` repository belongs to its author, not the owner of this fork.
 
@@ -20,6 +20,7 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 | In-memory root filesystem (v11) | **Works:** `BSD root: md0, major 1, minor 0`; `hfs: mounted A733RAM on device b(1, 0)`. |
 | HFS+ root with experimental Mach-O at `/sbin/launchd` (v12) | **Mount works:** `hfs: mounted A733PID1 on device b(1, 0)`. XNU prints `load_init_program: attempting to load /sbin/launchd`. |
 | First userspace program / PID 1 (v13) | **CONFIRMED entering userspace** on real hardware: `execve returned errno=0 for /sbin/launchd` followed by `A733 PID1: syscall enter 5`. No `syscall exit 5` observed; the `open` handler or a subsequent step has not completed visibly. |
+| PID 1 returns from a syscall (v14) | **Confirmed on physical board:** `syscall exit 20 errno=0 result=1`, followed by `syscall enter 5` and `BEFORE_SY_CALL syscall=5`. No `AFTER_SY_CALL syscall=5` appeared. The stall is inside the `open` handler path, not in the earlier audit or userspace transition. |
 | Real Apple launchd, SpringBoard, apps, iOS UI | **Not running.** This test RAM disk is a minimal HFS+ root, not a full iOS root filesystem. |
 
 **v11 milestone:** a blank RAM disk mounted successfully; PID 1 could not start because `/sbin/launchd` was absent (`errno 2`, expected).
@@ -28,13 +29,15 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 
 **v13 hardware result (20 October 2026):** kernel-side framebuffer logs confirm `execve` returned 0 for `/sbin/launchd` and the experimental userspace program invoked syscall 5 (`open`). This confirms a real userspace-to-kernel transition on ARM64. No syscall exit log was seen, so execution beyond `open` remains unverified. The prepared v13 AutoBoot image deliberately **reuses the physically tested v12 HFS+ RAM disk and original v12 PID 1 executable**, to isolate the XNU change: the first expected syscall is `open` (number 5), which tests `/dev/console`. A separate `getpid`-before-`open` probe has also been committed in `a733-init.S` for a later image but is **not present** in this particular v13 test IMG. No second CPU is enabled. On the current GitHub Ubuntu runner, building a fresh populated HFS+ disk fails because the runner lacks the HFS+ mount driver; this does not invalidate the already audited macOS XNU build or the v12 RAM disk.
 
-**v14 CI milestone (20 October 2026):** [GitHub Actions run #39431933051](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39431933051) **passed** both the macOS kernel/userspace build and the Ubuntu packaging job at commit `96767d3`. The newly built, static ARM64 test PID 1 calls `getpid()` (syscall 20) **before** `open("/dev/console")` (syscall 5). XNU includes `A733 PID1 V14: BEFORE_AUDIT_ENTER`, `BEFORE_SY_CALL`, `AFTER_SY_CALL` and `AFTER_AUDIT_EXIT` checkpoints for these calls. macOS built a populated 8-MiB HFSX RAM-root with `/sbin/launchd` (our test program, not Apple launchd). The [v14 PID1 artifact](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39431933051/artifacts/12268801889) contains the audited `a733-xnu-pid1.payload`, `stage0.uimg`, HFSX image and support files. **It is not a complete flashable SD-card IMG.** A previously verified A733 U-Boot/SD layout is needed to prepare a full image, with careful backup and layout validation. **The v14 hardware boot and return from `getpid()` are not yet verified**; CI validates structure and build only. One A76 core remains enabled.
+**v14 CI milestone (20 October 2026):** [GitHub Actions run #39431933051](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39431933051) **passed** both the macOS kernel/userspace build and the Ubuntu packaging job at commit `96767d3`. The newly built, static ARM64 test PID 1 calls `getpid()` (syscall 20) **before** `open("/dev/console")` (syscall 5). XNU includes `A733 PID1 V14: BEFORE_AUDIT_ENTER`, `BEFORE_SY_CALL`, `AFTER_SY_CALL` and `AFTER_AUDIT_EXIT` checkpoints for these calls. macOS built a populated 8-MiB HFSX RAM-root with `/sbin/launchd` (our test program, not Apple launchd). The [v14 PID1 artifact](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39431933051/artifacts/12268801889) contains the audited `a733-xnu-pid1.payload`, `stage0.uimg`, HFSX image and support files. **It is not a complete flashable SD-card IMG.** A previously verified A733 U-Boot/SD layout is needed to prepare a full image, with careful backup and layout validation. **Subsequent physical v14 photos confirm `getpid()` returned PID 1 and the next `open()` stalls inside the syscall handler**; the original CI result alone did not prove this. One A76 core remains enabled.
 
 ## Current limitations
 
+**v15 source (awaiting CI and hardware verification):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Do not flash or claim v15 works until the payload and test SD image are audited.
+
 - **Only one CPU is enabled** (`cpus=1`); SMP and the six A55 cores are deferred.
 - **No permanent XNU SD/eMMC storage driver.** U-Boot reads the test image from microSD; XNU's current root is an **8 MiB RAM-backed HFS+ volume** (`rd=md0`).
-- The first user process reaches `open("/dev/console")` but its syscall return has not yet appeared; this is the immediate diagnostic target.
+- The first user process returns successfully from `getpid()`, but `open("/dev/console")` does not yet return; v15 compares regular-file HFS+ and devfs opens.
 - No complete iOS rootfs, Apple userspace services, touch stack or functional graphics acceleration. Display output is an early framebuffer console.
 - The imported Xiaomi/Qualcomm sources still contain device-specific paths. Boot flags `modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0` keep the known incompatible ones disabled.
 - Some `sweet`, `SWEET`, and `topaz` identifiers remain in build configurations and inherited source files for compatibility; **the target is Allwinner A733**.
@@ -46,6 +49,7 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 - [`a733/tools/make_pid1_ramdisk.sh`](a733/tools/make_pid1_ramdisk.sh) — builds the minimal test `/sbin/launchd` root with `/dev`.
 - [`a733/xnu-a733-boot-trace.patch`](a733/xnu-a733-boot-trace.patch) — visible BSD/rootfs milestones.
 - [`a733/xnu-a733-pid1-trace.patch`](a733/xnu-a733-pid1-trace.patch) — **experimental** PID 1 exec/syscall tracing (requires a new kernel build and hardware verification).
+- [`a733/xnu-a733-pid1-v15-open.patch`](a733/xnu-a733-pid1-v15-open.patch) — PID1-only `open`/VFS tracepoints; not yet hardware-tested.
 - [`.github/workflows/xnu.yml`](.github/workflows/xnu.yml) — builds patched XNU on macOS, audits the Mach-O, compiles Stage0, creates and validates HFS+ RAM-root payloads.
 - [`.github/workflows/a733-stage0.yml`](.github/workflows/a733-stage0.yml) — Linux Stage0 tests.
 - [`xnu/patches/`](xnu/patches/) — upstream-derived XNU patch series.
@@ -67,4 +71,4 @@ The guarded Stage0 rejects legacy Xiaomi `SWEETXNU` payloads and accepts only `A
 
 The board owner's primary microSD card is repeatedly reused for experiments. **No automatic flashing or destructive operations are performed by CI or this repository.** Verify the device and any backups before writing an IMG; a successful kernel build is not a guarantee of bootability.
 
-The current target is to make PID 1 **complete its first syscall and continue running** on one A76 core. Initial execution of user code is already confirmed on hardware. SMP, persistent storage and an adaptive iOS UI are later milestones.
+The current target is to make PID 1 **complete a file open** and continue running on one A76 core. The `getpid()` syscall already returned successfully on hardware. SMP, persistent storage and iOS UI are later milestones.

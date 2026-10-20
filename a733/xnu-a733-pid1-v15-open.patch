@@ -1,0 +1,222 @@
+diff --git a/bsd/vfs/vfs_lookup.c b/bsd/vfs/vfs_lookup.c
+index a05c8e7..60c1325 100644
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -173,6 +173,11 @@ namei(struct nameidata *ndp)
+ 	struct componentname *cnp = &ndp->ni_cnd;
+ 	vfs_context_t ctx = cnp->cn_context;
+ 	proc_t p = vfs_context_proc(ctx);
++#if defined(SWEET)
++	if (p != NULL && proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: NAMEI_ENTER\n");
++	}
++#endif
+ #if CONFIG_AUDIT
+ /* XXX ut should be from context */
+ 	uthread_t ut = current_uthread();
+@@ -248,6 +253,11 @@ vnode_recycled:
+ #endif /* LP64_DEBUG */
+ 
+ retry_copy:
++	#if defined(SWEET)
++	if (p != NULL && proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: NAMEI_COPY_ENTER\n");
++	}
++	#endif
+ 	if (UIO_SEG_IS_USER_SPACE(ndp->ni_segflg)) {
+ 		error = copyinstr(ndp->ni_dirp, cnp->cn_pnbuf,
+ 		    cnp->cn_pnlen, &bytes_copied);
+@@ -255,6 +265,11 @@ retry_copy:
+ 		error = copystr(CAST_DOWN(void *, ndp->ni_dirp), cnp->cn_pnbuf,
+ 		    cnp->cn_pnlen, &bytes_copied);
+ 	}
++	#if defined(SWEET)
++	if (p != NULL && proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: NAMEI_COPY_DONE errno=%d\n", error);
++	}
++	#endif
+ 	if (error == ENAMETOOLONG && !(cnp->cn_flags & HASBUF)) {
+ 		cnp->cn_pnbuf = zalloc(ZV_NAMEI);
+ 		cnp->cn_flags |= HASBUF;
+@@ -461,9 +476,19 @@ retry_copy:
+ 		ndp->ni_startdir = dp;
+ 		dp = NULLVP;
+ 
++		#if defined(SWEET)
++		if (p != NULL && proc_pid(p) == 1) {
++			kprintf("A733 PID1 V15: NAMEI_LOOKUP_ENTER\n");
++		}
++		#endif
+ 		if ((error = lookup(ndp))) {
+ 			goto error_out;
+ 		}
++		#if defined(SWEET)
++		if (p != NULL && proc_pid(p) == 1) {
++			kprintf("A733 PID1 V15: NAMEI_LOOKUP_DONE\n");
++		}
++		#endif
+ 
+ 		/*
+ 		 * Check for symbolic link
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 23ee4d5..2f4399c 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -4554,9 +4554,19 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+ 	AUDIT_ARG(fflags, oflags);
+ 	AUDIT_ARG(mode, vap->va_mode);
+ 
++	#if defined(SWEET)
++	if (proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: OPEN1_FALLOC_ENTER\n");
++	}
++	#endif
+ 	if ((error = falloc_withinit(p, &fp, &indx, ctx, fp_init, initarg)) != 0) {
+ 		return error;
+ 	}
++	#if defined(SWEET)
++	if (proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: OPEN1_FALLOC_DONE\n");
++	}
++	#endif
+ 	if (flags & O_CLOEXEC) {
+ 		fp->fp_flags |= FP_CLOEXEC;
+ 	}
+@@ -4583,6 +4593,11 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+ 		}
+ 	}
+ 
++	#if defined(SWEET)
++	if (proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: OPEN1_VN_AUTH_ENTER\n");
++	}
++	#endif
+ 	if ((error = vn_open_auth(ndp, &flags, vap, authvp))) {
+ 		if (authvp != NULLVP) {
+ 			vnode_put(authvp);
+@@ -4599,6 +4614,11 @@ open1(vfs_context_t ctx, struct nameidata *ndp, int uflags,
+ 		fp_free(p, indx, fp);
+ 		return error;
+ 	}
++	#if defined(SWEET)
++	if (proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: OPEN1_VN_AUTH_DONE\n");
++	}
++	#endif
+ 
+ 	if (authvp != NULLVP) {
+ 		vnode_put(authvp);
+@@ -5044,7 +5064,17 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+ 	int cmode;
+ 	int error;
+ 
++	#if defined(SWEET)
++	if (proc_pid(vfs_context_proc(ctx)) == 1) {
++		kprintf("A733 PID1 V15: OPENAT_ALLOC_ENTER flags=%d\n", flags);
++	}
++	#endif
+ 	__open_data = kalloc_type(typeof(*__open_data), Z_WAITOK);
++	#if defined(SWEET)
++	if (proc_pid(vfs_context_proc(ctx)) == 1) {
++		kprintf("A733 PID1 V15: OPENAT_ALLOC_DONE\n");
++	}
++	#endif
+ 	vap = &__open_data->va;
+ 	ndp = &__open_data->nd;
+ 
+@@ -5056,7 +5086,17 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+ 	NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1,
+ 	    segflg, path, ctx);
+ 
++	#if defined(SWEET)
++	if (proc_pid(vfs_context_proc(ctx)) == 1) {
++		kprintf("A733 PID1 V15: OPENAT_OPEN1_ENTER\n");
++	}
++	#endif
+ 	error = open1at(ctx, ndp, flags, vap, NULL, NULL, retval, fd, AUTH_OPEN_NOAUTHFD);
++	#if defined(SWEET)
++	if (proc_pid(vfs_context_proc(ctx)) == 1) {
++		kprintf("A733 PID1 V15: OPENAT_OPEN1_DONE errno=%d\n", error);
++	}
++	#endif
+ 
+ 	kfree_type(typeof(*__open_data), __open_data);
+ 
+@@ -5066,7 +5106,17 @@ openat_internal(vfs_context_t ctx, user_addr_t path, int flags, int mode,
+ int
+ open(proc_t p, struct open_args *uap, int32_t *retval)
+ {
++	#if defined(SWEET)
++	if (proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: OPEN_ENTER\n");
++	}
++	#endif
+ 	__pthread_testcancel(1);
++	#if defined(SWEET)
++	if (proc_pid(p) == 1) {
++		kprintf("A733 PID1 V15: OPEN_CANCEL_DONE\n");
++	}
++	#endif
+ 	return open_nocancel(p, (struct open_nocancel_args *)uap, retval);
+ }
+ 
+diff --git a/bsd/vfs/vfs_vnops.c b/bsd/vfs/vfs_vnops.c
+index 5b51e9c..730d235 100644
+--- a/bsd/vfs/vfs_vnops.c
++++ b/bsd/vfs/vfs_vnops.c
+@@ -563,9 +563,19 @@ continue_create_lookup:
+ 
+ 		/* Do a lookup, possibly going directly to filesystem for compound operation */
+ 		do {
++			#if defined(SWEET)
++			if (proc_pid(vfs_context_proc(ctx)) == 1) {
++				kprintf("A733 PID1 V15: VN_AUTH_NAMEI_ENTER\n");
++			}
++			#endif
+ 			if ((error = namei(ndp))) {
+ 				goto out;
+ 			}
++			#if defined(SWEET)
++			if (proc_pid(vfs_context_proc(ctx)) == 1) {
++				kprintf("A733 PID1 V15: VN_AUTH_NAMEI_DONE\n");
++			}
++			#endif
+ 			vp = ndp->ni_vp;
+ 			dvp = ndp->ni_dvp;
+ 
+@@ -654,7 +664,17 @@ continue_create_lookup:
+ 			}
+ 		}
+ 
++		#if defined(SWEET)
++		if (proc_pid(vfs_context_proc(ctx)) == 1) {
++			kprintf("A733 PID1 V15: VN_AUTH_VNOP_OPEN_ENTER\n");
++		}
++		#endif
+ 		error = VNOP_OPEN(vp, fmode, ctx);
++		#if defined(SWEET)
++		if (proc_pid(vfs_context_proc(ctx)) == 1) {
++			kprintf("A733 PID1 V15: VN_AUTH_VNOP_OPEN_DONE errno=%d\n", error);
++		}
++		#endif
+ 		if (error) {
+ 			/*
+ 			 * Some file systems fail in vnop_open call with absense of both
+@@ -686,7 +706,17 @@ continue_create_lookup:
+ 	/*
+ 	 * Grab reference, etc.
+ 	 */
++	#if defined(SWEET)
++	if (proc_pid(vfs_context_proc(ctx)) == 1) {
++		kprintf("A733 PID1 V15: VN_AUTH_FINISH_ENTER\n");
++	}
++	#endif
+ 	error = vn_open_auth_finish(vp, fmode, ctx);
++	#if defined(SWEET)
++	if (proc_pid(vfs_context_proc(ctx)) == 1) {
++		kprintf("A733 PID1 V15: VN_AUTH_FINISH_DONE errno=%d\n", error);
++	}
++	#endif
+ 	if (error) {
+ 		ref_failed = TRUE;
+ 		goto bad;

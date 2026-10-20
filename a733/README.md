@@ -1,5 +1,12 @@
 # ios-a733
 
+> **Latest status (2026-10-20):** XNU boots on the physical Orange Pi 4 Pro,
+> mounts an HFSX RAM disk and runs a test PID 1. v14 demonstrated a successful
+> `getpid()` syscall return (PID 1); the next `open()` call stalls. The v15
+> source adds diagnostics to isolate that stall. **The historical v4 notes
+> below are retained for reference**, not the current boot status. The
+> experimental userspace binary is not a full iOS installation.
+
 Experimental native XNU/iOS 16 bring-up for Orange Pi 4 Pro (Allwinner A733).
 
 **Status:** the v3 stage0 screen diagnostic has booted on the physical board

@@ -13,6 +13,7 @@
 #define SYS_open	5
 #define SYS_getpid	20
 #define SYS_select	93
+#define O_RDONLY	0
 #define O_RDWR		2
 
 	.text
@@ -29,13 +30,16 @@ _start:
 	and	x9, x9, #~15
 	mov	sp, x9
 
-	/*
-	 * A733 v13: first enter the kernel via a harmless getpid syscall
-	 * BEFORE trying /dev/console. With kernel-side PID1 syscall tracing
-	 * this independently proves that arm64 userspace instructions ran.
-	 */
+	/* v15: prove an ordinary HFS+ file open before testing devfs console. */
 	mov	x16, #SYS_getpid
 	svc	#0x80
+
+	adr	x0, self_path
+	mov	x1, #O_RDONLY
+	mov	x2, #0
+	mov	x16, #SYS_open
+	svc	#0x80
+	/* Continue even if the regular-file open returns an errno. */
 
 	adr	x0, path
 	mov	x1, #O_RDWR
@@ -95,6 +99,8 @@ hang:
 five_sec:
 	.quad	5			/* tv_sec */
 	.quad	0			/* tv_usec (int32 + padding) */
+self_path:
+	.asciz	"/sbin/launchd"
 path:
 	.asciz	"/dev/console"
 hello:

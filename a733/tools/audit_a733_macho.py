@@ -89,7 +89,10 @@ def audit(buf: bytes) -> tuple[int, list[str]]:
                    b"A733 ARM64 ASYNC SError:",
                    b"A733 TRACE 03: interrupts enabled",
                    b"A733 TRACE 10: searching for root device",
-                   b"A733 ROOT: IOFindBSDRoot entered"):
+                   b"A733 ROOT: IOFindBSDRoot entered",
+                   b"A733 PID1: execve returned errno=",
+                   b"A733 PID1: syscall enter",
+                   b"A733 PID1: syscall exit"):
         if marker not in buf:
             errors.append("missing compiled A733 kernel identity: " + marker.decode())
     return start, errors

@@ -1,7 +1,7 @@
 diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
 --- a/osfmk/arm64/machine_routines_asm.s
 +++ b/osfmk/arm64/machine_routines_asm.s
-@@ -663,12 +663,20 @@
+@@ -663,11 +663,20 @@
  	PUSH_FRAME
  	COPYIO_RECOVER_RANGE Lcopyinstr_done
  	mov		x4, #0						// x4 - total bytes copied
@@ -24,7 +24,7 @@ diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_a
 diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
 --- a/osfmk/arm64/copyio.c
 +++ b/osfmk/arm64/copyio.c
-@@ -339,7 +339,7 @@
+@@ -339,6 +339,6 @@
  	user_access_enable();
  #if defined(SWEET)
 -	kprintf("A733 PID1 V16: COPYINSTR_ASM_ENTER\n");

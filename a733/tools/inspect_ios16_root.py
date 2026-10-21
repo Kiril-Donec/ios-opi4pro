@@ -38,7 +38,7 @@ REQUIRED = {
     "launchd_plist": "System/Library/xpc/launchd.plist",
 }
 CACHE_DIR = "System/Library/Caches/com.apple.dyld"
-CACHE_RE = re.compile(r"dyld_shared_cache_arm64(?:[.]\\d+)?$")
+CACHE_RE = re.compile(r"dyld_shared_cache_arm64(?:[.]\d+)?$")
 ARM64 = 0x0100000C
 MH_MAGIC_64 = 0xFEEDFACF
 LC_LOAD_DYLINKER = 0x0E

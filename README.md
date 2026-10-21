@@ -63,13 +63,13 @@ The successful v17 single-core XNU kernel and Stage0 are intentionally **unchang
 
 [Hardware test procedure and hashes](a733/V19-TEST-RU.md) · [v19 user program source](a733/src/a733-init-v19.S)
 
-## Experimental A733 real iOS graphics (21 October 2026; source candidate)
+## Experimental A733 real iOS graphics (21 October 2026; compiled + offline IMG validated)
 
 The next experimental branch of work targets **actual Apple iOS userland frames**, not a mock home screen. A new [A733-specific XNU graphic overlay](a733/xnu-a733-ios-framebuffer.patch) changes the existing `AppleCLCD`/`IOMobileFramebuffer` driver to copy **real IOSurface surfaces** to the proven U-Boot/HDMI `0xBBF11000` framebuffer, CPU-scale an iPhone X canvas (1125×2436) to portrait 600×1024 and rotate it into physical 1024×600 pixels. The patch also keeps Qualcomm MDP accesses disabled on A733 and adds an eight-line kernel-log overlay over any real frame (`a733fb_logs=1`, default, or `=0` to hide).
 
 The [A733 Apple Device Tree generator](a733/tools/mkadt_a733.py) has a fail-closed, opt-in `--ios-display` mode that advertises `/arm-io/disp0` with the `sweet,display` matching interface required by `AppleCLCD`. The original v19 device tree remains the default. CI now builds the driver overlay and packages a **separate experimental display-enabled payload**. The included 8-MiB root still has only our custom test PID 1 and **no real Apple launchd, dyld shared cache, backboardd or SpringBoard**. Thus neither a successful compile nor a successful hardware boot with this test root would show genuine iOS frames.
 
-**Status: proposed implementation awaiting CI validation and real-board display tests.** The physically tested v19 image remains the rollback baseline, unchanged. This is not yet a flash-ready or successfully booted iOS GUI image. See [the complete real-iOS graphics bring-up notes](a733/IOS-GRAPHICS-RU.md).
+**Status: kernel built with the actual graphics overlay and all CI jobs passed** on [GitHub Actions #39577962831](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39577962831). Crucially, a new audit verifies the unique `A733 FB: AppleCLCD IOSurface HDMI CPU path READY` string **inside the compiled XNU Mach-O**: previous green builds had silently skipped a malformed optional patch. A full 64-MiB AutoBoot v20 display-probe IMG has now been prepared with the XNU graphics payload; its SHA-256 is `97dfacf81fbedbbd1cbbaf713051e4126cb204f4e9a39bd110fcc824f76a008e`. The verified v19 RAM-root and first 32 MiB U-Boot/Stage0 were preserved. The compiled payload and ADT passed offline readback and ext4 checksums, but **this v20 kernel has NOT yet been executed on the physical board**, and it contains no actual iOS userland. See [image hashes and the exact hardware test](a733/IOS-GRAPHICS-RU.md).
 
 ## Current limitations
 

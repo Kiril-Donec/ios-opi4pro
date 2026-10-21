@@ -10,9 +10,16 @@
 
 IPSW — источник оригинальных Apple файлов, это НЕ прошивка для Orange Pi. В нашем форке присутствуют оригинальные upstream tools/mkiosroot.sh и tools/sweet-root-tweaks.py. Сборку полного root из OS.dmg, SystemOS.dmg и AppOS.dmg см. https://github.com/MakrSas/ios-topaz#2-build-the-ios-root-image.
 
+Новый автономный скрипт ищет ровно три DMG по **Apple BuildManifest.plist / D22AP / Erase identity** и не угадывает имена файлов (работает в Windows, macOS или Linux с обычным Python 3):
+
+    python3 a733/tools/extract_iphone_x_ipsw.py iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw --json ipsw-components.json
+    python3 a733/tools/extract_iphone_x_ipsw.py iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw --extract extracted
+
+Первая команда только анализирует архив. Вторая извлекает оригинальные extracted/OS.dmg, extracted/SystemOS.dmg и extracted/AppOS.dmg в **новую** папку; потребуется место на диске. Пользователь может отправить нам только небольшие JSON-отчёты — не нужно загружать в GitHub оригинальные Apple DMG.
+
 После извлечения трёх DMG (для D22AP Erase identity), на ПК с Linux, apfs-fuse, hfsprogs и rsync:
 
-    sudo bash tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
+    sudo bash tools/mkiosroot.sh extracted/OS.dmg extracted/SystemOS.dmg extracted/AppOS.dmg ios16-root.img 16G
     sudo mkdir -p /mnt/iosroot
     sudo mount -t hfsplus -o loop,ro ios16-root.img /mnt/iosroot
     python3 a733/tools/inspect_ios16_root.py /mnt/iosroot --json a733-ios16-preflight.json

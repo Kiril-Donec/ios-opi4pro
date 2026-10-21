@@ -61,7 +61,9 @@ class Node:
         return bytes(out)
 
 
-def build() -> Node:
+def build(*, ios_display: bool = False) -> Node:
+    # Opt-in ONLY: never expose an iOS display nub to the legacy Qualcomm
+    # AppleCLCD driver unless the A733 CPU scanout overlay is installed.
     chosen = Node("chosen", [
         ("dram-base", u64(XNU_RAM_BASE)),
         ("dram-size", u64(XNU_RAM_SIZE)),
@@ -106,19 +108,29 @@ def build() -> Node:
         ("reg", u64(GIC_DISTRIBUTOR - SOC_BASE, 0x10000,
                     GIC_REDISTRIBUTORS - SOC_BASE, 0x100000)),
     ])
+    display_children = [gic]
+    if ios_display:
+        # IOSurface/IOMobileFramebuffer APIs remain Apple's real userland ABI.
+        # 'sweet,display' matches AppleCLCD's built-in IOKit personality.
+        # Actual pixels are presented via A733's existing HDMI framebuffer,
+        # never Qualcomm MDP/DSI register space.
+        display_children.append(Node("disp0", [
+            ("device_type", cstr("display-subsystem")),
+            ("compatible", cstr("sweet,display")),
+            ("canvas-width", u32(1125)),
+            ("canvas-height", u32(2436)),
+        ]))
     arm_io = Node("arm-io", [
         ("device_type", cstr("sweet-io")),
         ("compatible", cstr("sweet-io") + cstr("arm-io")),
         ("#address-cells", u32(2)),
         ("#size-cells", u32(2)),
         ("ranges", u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
-    ], [gic])
+    ], display_children)
 
-    # Keep the A733 DT intentionally smaller than topaz's: the upstream
-    # AppleCLCD matches "sweet,display" and expects Qualcomm MDP/DSI
-    # registers. Advertising that device on Allwinner would load a driver
-    # against unrelated SoC MMIO. The direct early-fb console below remains
-    # usable for first kernel entry/panic diagnostics, without a display kext.
+    # With ios_display=False the v19 device tree remains unchanged.
+    # With ios_display=True the new A733 display adapter must be built into
+    # XNU, otherwise the upstream AppleCLCD would access Qualcomm MMIO.
 
     return Node("device-tree", [
         ("compatible", cstr("D22AP") + cstr("iPhone10,3") +
@@ -150,11 +162,14 @@ def build() -> Node:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
+    parser.add_argument("--ios-display", action="store_true",
+                        help="opt in to experimental AppleCLCD A733 HDMI path")
     args = parser.parse_args()
-    data = build().serialize()
+    data = build(ios_display=args.ios_display).serialize()
     args.output.write_bytes(data)
     print(f"A733 early ADT: {len(data)} bytes -> {args.output}")
     print("MPIDR 0x600 / GICD 0x03400000 / GICR 0x03460000 / vtimer 27")
+    print("iOS AppleCLCD display nub:", "ENABLED (A733 overlay required)" if args.ios_display else "OFF (v19 safe)")
     print("EXPERIMENTAL: A76 PSCI verified; A733 XNU source rebuild still required")
 
 

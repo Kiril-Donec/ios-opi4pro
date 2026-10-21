@@ -1,6 +1,6 @@
 # Orange Pi 4 Pro / Allwinner A733 — real iOS graphics, first bring-up
 
-**Status 2026-10-21: kernel compiled and packaged successfully in GitHub Actions [#39577962831](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39577962831); offline-complete AutoBoot IMG prepared and integrity-checked. REAL A733 HARDWARE TEST STILL PENDING.**
+**Status 2026-10-21: REAL A733 HARDWARE GRAPHICS INITIALIZATION CONFIRMED.** GitHub Actions [#39577962831](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39577962831) compiled and packaged the kernel; the user subsequently photographed the AutoBoot v20 running on Orange Pi 4 Pro, including the exact AppleCLCD 'READY' message and v19 test PID1 successful heartbeat. **No actual SpringBoard or CoreAnimation IOSurface frame has yet been shown.**
 Do not mistake this work for an already booting iOS SpringBoard.
 
 ## What this attempts
@@ -36,7 +36,7 @@ The image `ios-a733-xnu-autoboot-v20-ios-display-probe-20261021.img` was built u
 - **Embedded IMG payload SHA-256:** `3a540c351045aaee4751a835c2d96019f6ca5759104286ec92edb439198efa24`.
 - RAM-root SHA-256 preserved exactly from v19: `157afca7b8fabac58acd4fb7e408e66843387fe0bb47da6427b6a7c80cb6ef3f`.
 - Offline verification: actual graphics marker found in compiled kernel, display ADT entry present, full ext4 file readback exact, ext4 inode checksum and all group descriptor checksums valid, other ext4 boot files unchanged, first 32 MiB equal v19. No full `e2fsck` assertion.
-- **Real hardware status: UNTESTED.** Source-level compilation and image-integrity checks do not prove that AppleCLCD registers, that XNU stays stable with the driver enabled, or that pixels can be presented.
+- **Real hardware status: AppleCLCD initialization and basic XNU/PID1 regression tested, PASSED (photos 2026-10-21).** The photos do not test the real IOSurface present/copy/compositor path because the image contains no Apple userland producing frames.
 
 ### First hardware test
 
@@ -59,10 +59,34 @@ The iOS display service may initialize earlier or later relative to the PID 1 me
 
 ---
 
+## Real board v20 — 7 photographed HDMI states (21 October 2026)
+
+**Confirmed on Orange Pi 4 Pro, not inferred from CI:**
+
+- U-Boot loads Stage0, DTB and A733 XNU PID1 payload, then `bootm` hands off to Cortex-A76.
+- Stage0 displays the existing portrait 600×1024 HDMI diagnostic and proceeds to install XNU.
+- XNU reaches IOKit/BSD startup, reports `SWEET CPU: 1/1 CPUs initialized, SGI1 verified` and `SWEET SURF: IOCoreSurfaceRoot registered`.
+- At the bottom of the kernel-init photographs the display service announces the **exact** line:
+
+```text
+A733 FB: AppleCLCD IOSurface HDMI CPU path READY 1125x2436 -> 1024x600
+```
+
+  In the [A733 graphics patch](xnu-a733-ios-framebuffer.patch), `AppleCLCD::start()` prints this only **after** `registerService()` for the A733 framebuffer. This supports the stronger finding that the `AppleCLCD` service started and registered on the real board, not just that its string exists inside the kernel.
+
+- Later photographs clearly show `A733 V19 PASS: mmap RW + mprotect RO + munmap` and repeated `A733 init: still alive`, proving the original test PID 1 was reached and ran after graphics initialization. No fatal abort is shown.
+- The earlier U-Boot/Linux handoff includes `[mmc]: MMC Device 2 not found`; since XNU and PID1 subsequently ran, that message is **not a boot blocker in this test**. The screen's cyclic framebuffer text console means a last printed line such as `NAMEI_COPY_ENTER` does not alone establish a hang.
+
+**Not yet demonstrated:** any `AppleCLCD::present()` call with nonempty real `IOSurface` layers, correct compositing or scaling, logs over a real iOS frame, genuine Apple launchd/dyld, backboardd, SpringBoard, or iOS Lock Screen. Do not extrapolate the word READY into a working GUI.
+
+Result: **v20 graphics service and v19 test-userspace regression PASSED on real hardware; actual iOS pixel presentation NOT TESTED.** This is an important independent milestone with v19 as preserved rollback.
+
+---
+
 ## Next actual milestones
 
-1. ~~Compile XNU with `xnu-a733-ios-framebuffer.patch` and package both ADT configurations.~~ **DONE in GitHub Actions run #39577962831** after fixing the build script's silent skipping of malformed patches. CI additionally checks the exact marker `A733 FB: AppleCLCD IOSurface HDMI CPU path READY` in the compiled XNU Mach-O. Next: inspect that line on real A733 HDMI.
-2. Confirm `AppleCLCD` registers on the A733 display node without accessing Qualcomm MDP/MMIO. Preserve working v19 as a rollback.
+1. ~~Compile XNU with `xnu-a733-ios-framebuffer.patch`, package both ADT configurations, and confirm the `AppleCLCD` READY message on the Orange Pi 4 Pro.~~ **DONE**, CI run #39577962831 and seven physical-HDMI photos dated 21 October 2026.
+2. **First actual iOS frame**: feed real Apple CoreAnimation/IOSurface userspace content into the registered A733 AppleCLCD and verify its CPU portrait copy, bounds, cache coherence, and diagnostic overlay. The source guard bypasses Qualcomm MMIO on A733; further real-device testing remains important. Preserve v19 as rollback.
 3. Prepare a **real, lawfully obtained iPhone X iOS 16 root/shared cache** as upstream topaz does, in suitable storage (8-MiB md0 is not enough).
 4. Debug real `dyld`, Apple `launchd` and required daemons, then `backboardd`/CoreAnimation and SpringBoard. Address actual missing syscalls, Mach IPC, security requirements and IOKit services as errors arise.
 5. Show and validate the first *genuine Apple-created frame* with kernel overlay and portrait transform. Improve performance, layer rectangles, memory coherency, and later actual touch/USB input.

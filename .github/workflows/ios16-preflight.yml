@@ -5,6 +5,7 @@ on:
     branches: [topaz]
     paths:
       - "a733/tools/inspect_ios16_root.py"
+      - "a733/tools/make_apple_launchd_probe_ramdisk.sh"
       - "a733/tools/extract_iphone_x_ipsw.py"
       - "a733/tests/test_ios16_root_preflight.py"
       - "a733/tests/test_extract_iphone_x_ipsw.py"
@@ -20,6 +21,10 @@ jobs:
         run: python3 -m unittest discover -s a733/tests -p 'test_ios16_root_preflight.py' -v
       - name: Validate D22AP Erase manifest and safe DMG extraction
         run: python3 -m unittest discover -s a733/tests -p 'test_extract_iphone_x_ipsw.py' -v
+      - name: Audit real-launchd 16MiB HFSX packaging script (syntax only, no Apple files)
+        run: |
+          bash -n a733/tools/make_apple_launchd_probe_ramdisk.sh
+          bash a733/tools/make_apple_launchd_probe_ramdisk.sh --help
       - name: Verify CLI help (no Apple files in repository)
         run: |
           python3 a733/tools/inspect_ios16_root.py --help

@@ -3,7 +3,7 @@ name: A733 PID1 HFSX root (macOS standalone)
 on:
   workflow_dispatch:
   push:
-    branches: [orangepi-4-pro]
+    branches: [opi4pro]
     paths:
       - ".github/workflows/a733-pid1-root.yml"
       - "a733/tools/make_pid1_ramdisk_macos.sh"

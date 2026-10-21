@@ -16,7 +16,7 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [orangepi-4-pro]
+    branches: [opi4pro]
     paths:
       - "xnu/patches/**"
       - "a733/xnu-a733-firstboot.patch"

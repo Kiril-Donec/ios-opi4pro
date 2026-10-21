@@ -66,7 +66,7 @@ IPSW — источник оригинальных Apple файлов, это Н
 
 ```bash
 cd /root/ios-root-work
-git clone --depth 1 --branch orangepi-4-pro https://github.com/Kiril-Donec/ios-opi4pro.git a733-repo
+git clone --depth 1 --branch opi4pro https://github.com/Kiril-Donec/ios-opi4pro.git a733-repo
 mkdir -p iosroot-mnt
 mount -t hfsplus -o loop,ro,force ios16-root.img iosroot-mnt
 bash a733-repo/a733/tools/make_apple_launchd_probe_ramdisk.sh iosroot-mnt a733-apple-launchd-probe.hfs

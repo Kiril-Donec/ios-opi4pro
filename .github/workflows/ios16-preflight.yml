@@ -2,7 +2,7 @@ name: A733 real iOS userland preflight
 
 on:
   push:
-    branches: [orangepi-4-pro]
+    branches: [opi4pro]
     paths:
       - "a733/tools/inspect_ios16_root.py"
       - "a733/tools/make_apple_launchd_probe_ramdisk.sh"

@@ -3,7 +3,7 @@ name: A733 Stage0
 on:
   workflow_dispatch:
   push:
-    branches: [topaz]
+    branches: [orangepi-4-pro]
     paths:
       - "a733/**"
       - ".github/workflows/a733-stage0.yml"

@@ -92,3 +92,17 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - Logs show `syscall enter 20`, `AFTER_SY_CALL syscall=20 errno=0`, `AFTER_AUDIT_EXIT syscall=20`, `syscall exit 20 errno=0 result=1`, then `syscall enter 5`. This **proves a getpid userspace → kernel → userspace round-trip** on the board.
 - `open` syscall 5 prints `BEFORE_AUDIT_ENTER` and `BEFORE_SY_CALL` but not `AFTER_SY_CALL`. The stall is in the handler path; `__pthread_testcancel`, allocation, vnode lookup and devfs are not yet distinguished. One A76 core remains enabled. SMP is deferred.
 - v15 source adds PID1-only tracepoints through `open`, `openat_internal`, `open1`, `vn_open_auth`, and `namei`, plus a read-only test open of the HFS+ `/sbin/launchd` before `/dev/console`. [CI run 39464210361](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39464210361) passed the complete kernel/userspace/payload pipeline. An offline-verified 64-MiB SD IMG was assembled by replacing only the payload in a copy of v14 (SHA-256 `975ad79943b246ddbcbeeee9f574fa33c4cf8a9e433a772eac104353666ecdd5`); **v15 still needs a real-board test**. Preserve the known-working v14 ZIP and the existing SD/U-Boot layout.
+
+## microSD root driver source (2026-10-22, NOT board-tested)
+
+- `a733/xnu-a733-sdmmc.patch` (CI `9999m`): `bsd/dev/a733_sdmmc.c`, read-only polled PIO for SMHC0
+  `0x04020000` ("allwinner,sunxi-mmc-v5p3x" per the Orange Pi vendor DT), CCU `0x02002000` read only
+  (SMHC0 clock `+0xd00`, BGR `+0xd0c`). Re-identifies the card, CMD17/CMD18, MBR/GPT partition 2 with an
+  HFS+ header check, `rd=sdroot0`. Details, expected HDMI lines and the planned card layout:
+  [SDMMC-ROOT-RU.md](SDMMC-ROOT-RU.md).
+- `mkadt_a733.py --sdmmc` adds `/a733-sdmmc`; `package_xnu_a733.py --sdroot` adds
+  `rd=sdroot0 unentitled_ios_sim_launch=1` and refuses RAM disk, `rootrw=1`, missing `cpus=1`, or a
+  cmdline that mkpayload would truncate.
+- Host checks only: helper/unit tests (gcc + clang), kernel-part `-fsyntax-only -Werror` against
+  XNU-signature stubs, `git apply --check` on the exact CI tree. The macOS workflow refuses a kernel
+  without the `A733 SD: sdroot0 ready, read-only PIO` marker. v22 (`rd=md0`) is unchanged for rollback.

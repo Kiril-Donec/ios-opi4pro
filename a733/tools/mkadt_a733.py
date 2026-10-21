@@ -2,8 +2,10 @@
 """Create an early-boot Apple Device Tree for the Allwinner A733.
 
 This is a *bring-up hypothesis*, not a working iOS ADT. It intentionally
-includes only the boot CPU (Cortex-A76 MPIDR 0x600) and no SD/MMC driver.
-The shim must hand off to that core with PSCI before this tree is usable.
+includes only the boot CPU (Cortex-A76 MPIDR 0x600). The microSD controller
+node used by bsd/dev/a733_sdmmc.c (a733/xnu-a733-sdmmc.patch, rd=sdroot0) is
+opt-in with --sdmmc. The shim must hand off to that core with PSCI before
+this tree is usable.
 """
 import argparse
 import hashlib
@@ -26,6 +28,16 @@ XNU_RAM_BASE = 0x100000000
 XNU_RAM_SIZE = 0x40000000
 FRAMEBUFFER = 0xBBF11000
 FRAMEBUFFER_SIZE = 1024 * 600 * 4
+
+# Orange Pi vendor DT (sun60iw2p1.dtsi): sdc0 = sdmmc@4020000,
+# "allwinner,sunxi-mmc-v5p3x", GIC SPI 161; ccu@2002000 (ccu-sun60iw2.c:
+# SMHC0 clock at +0xd00, bus gate/reset at +0xd0c). The XNU driver only
+# reads the CCU.
+SMHC0_BASE = 0x04020000
+SMHC0_SIZE = 0x1000
+SMHC0_SPI = 161
+CCU_BASE = 0x02002000
+CCU_SIZE = 0x2000
 
 
 def u32(*values: int) -> bytes:
@@ -61,7 +73,7 @@ class Node:
         return bytes(out)
 
 
-def build(*, ios_display: bool = False) -> Node:
+def build(*, ios_display: bool = False, sdmmc: bool = False) -> Node:
     # Opt-in ONLY: never expose an iOS display nub to the legacy Qualcomm
     # AppleCLCD driver unless the A733 CPU scanout overlay is installed.
     chosen = Node("chosen", [
@@ -132,6 +144,18 @@ def build(*, ios_display: bool = False) -> Node:
     # With ios_display=True the new A733 display adapter must be built into
     # XNU, otherwise the upstream AppleCLCD would access Qualcomm MMIO.
 
+    extra = []
+    if sdmmc:
+        # Absolute physical addresses, like /sweet-ufs: the driver maps
+        # "reg" and "ccu-reg" itself with ml_io_map().
+        extra.append(Node("a733-sdmmc", [
+            ("compatible", cstr("allwinner,sunxi-mmc-v5p3x")),
+            ("reg", u64(SMHC0_BASE, SMHC0_SIZE)),
+            ("ccu-reg", u64(CCU_BASE, CCU_SIZE)),
+            ("interrupts", u32(SMHC0_SPI)),
+            ("bus-width", u32(4)),
+        ]))
+
     return Node("device-tree", [
         ("compatible", cstr("D22AP") + cstr("iPhone10,3") +
          cstr("allwinner,a733") + cstr("AppleARM")),
@@ -156,6 +180,7 @@ def build(*, ios_display: bool = False) -> Node:
             ("home-button-type", u32(2)),
             ("opposed-power-vol-buttons", u32(1)),
         ]),
+        *extra,
     ])
 
 
@@ -164,12 +189,15 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--ios-display", action="store_true",
                         help="opt in to experimental AppleCLCD A733 HDMI path")
+    parser.add_argument("--sdmmc", action="store_true",
+                        help="add /a733-sdmmc for the SMHC0 microSD root driver (rd=sdroot0)")
     args = parser.parse_args()
-    data = build(ios_display=args.ios_display).serialize()
+    data = build(ios_display=args.ios_display, sdmmc=args.sdmmc).serialize()
     args.output.write_bytes(data)
     print(f"A733 early ADT: {len(data)} bytes -> {args.output}")
     print("MPIDR 0x600 / GICD 0x03400000 / GICR 0x03460000 / vtimer 27")
     print("iOS AppleCLCD display nub:", "ENABLED (A733 overlay required)" if args.ios_display else "OFF (v19 safe)")
+    print("microSD SMHC0 node:", "ENABLED (/a733-sdmmc, rd=sdroot0)" if args.sdmmc else "OFF")
     print("EXPERIMENTAL: A76 PSCI verified; A733 XNU source rebuild still required")
 
 

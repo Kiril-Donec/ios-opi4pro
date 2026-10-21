@@ -59,6 +59,16 @@ def main() -> None:
     assert b"sweet,display" not in blob
     chosen = next(n for n in root.children if n.name == "chosen")
     assert int.from_bytes(chosen.prop("dram-base"), "little") == 0x100000000
+    assert not any(n.name == "a733-sdmmc" for n in root.children)
+
+    sd_root, end = parse(hw.build(sdmmc=True).serialize())
+    sd = next(n for n in sd_root.children if n.name == "a733-sdmmc")
+    reg = struct.unpack("<2Q", sd.prop("reg"))
+    ccu = struct.unpack("<2Q", sd.prop("ccu-reg"))
+    assert reg == (0x04020000, 0x1000), reg
+    assert ccu == (0x02002000, 0x2000), ccu
+    assert int.from_bytes(sd.prop("interrupts"), "little") == 161
+    assert sd.prop("compatible").rstrip(b"\0") == b"allwinner,sunxi-mmc-v5p3x"
     print("A733 ADT round-trip: PASS")
 
 

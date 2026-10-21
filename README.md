@@ -73,12 +73,16 @@ The [A733 Apple Device Tree generator](a733/tools/mkadt_a733.py) has a fail-clos
 
 **Status: kernel built with the actual graphics overlay and all CI jobs passed** on [GitHub Actions #39577962831](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39577962831). Crucially, a new audit verifies the unique `A733 FB: AppleCLCD IOSurface HDMI CPU path READY` string **inside the compiled XNU Mach-O**: previous green builds had silently skipped a malformed optional patch. A full 64-MiB AutoBoot v20 display-probe IMG has now been prepared with the XNU graphics payload; its SHA-256 is `97dfacf81fbedbbd1cbbaf713051e4126cb204f4e9a39bd110fcc824f76a008e`. The verified v19 RAM-root and first 32 MiB U-Boot/Stage0 were preserved. The compiled payload and ADT passed offline readback and ext4 checksums, but **this v20 kernel has NOT yet been executed on the physical board**, and it contains no actual iOS userland. See [image hashes and the exact hardware test](a733/IOS-GRAPHICS-RU.md).
 
+## In progress: microSD root driver (source only, NOT board-tested)
+
+[`a733/xnu-a733-sdmmc.patch`](a733/xnu-a733-sdmmc.patch) adds a read-only, polled-PIO XNU driver for the A733 SMHC0 microSD controller (`bsd/dev/a733_sdmmc.c`, root with `rd=sdroot0`). It reuses U-Boot's clock/pin/voltage setup, re-identifies the card, reads 512-byte sectors with CMD17/CMD18 and exposes MBR/GPT partition 2 (HFS+ checked) to the BSD layer, so the full 16-GiB iOS 16.7.16 volume can live on the card while kernel updates only replace the small payload. Host tests and `git apply` against the exact CI tree pass; **no XNU build with it has run on hardware yet**. See [SDMMC-ROOT-RU.md](a733/SDMMC-ROOT-RU.md).
+
 ## Current limitations
 
 **Historical v15 hardware result (stalled in user pathname copying; FIXED IN v17 for the test PID 1):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Use a spare microSD or an adequate backup before testing the offline-audited IMG.
 
 - **Only one CPU is enabled** (`cpus=1`); SMP and the six A55 cores are deferred.
-- **No permanent XNU SD/eMMC storage driver.** U-Boot reads the test image from microSD; XNU's current root is an **8 MiB RAM-backed HFS+ volume** (`rd=md0`).
+- **No board-verified XNU SD/eMMC storage driver.** U-Boot reads the test image from microSD; XNU's verified root is still a RAM-backed HFS+ volume (`rd=md0`). The experimental read-only microSD driver (`rd=sdroot0`) is untested on hardware.
 - **v17 passed the earlier `open()` stall.** The custom PID 1 now returns from both file and `/dev/console` opens and loops with repeated successful `write()` calls. More functional validation and the *real* iOS userspace are future work.
 - No complete iOS rootfs, Apple userspace services, touch stack or functional graphics acceleration. Display output is an early framebuffer console.
 - The imported Xiaomi/Qualcomm sources still contain device-specific paths. Boot flags `modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0` keep the known incompatible ones disabled.
@@ -91,6 +95,7 @@ The [A733 Apple Device Tree generator](a733/tools/mkadt_a733.py) has a fail-clos
 - [`a733/tools/make_pid1_ramdisk.sh`](a733/tools/make_pid1_ramdisk.sh) — builds the minimal test `/sbin/launchd` root with `/dev`.
 - [`a733/xnu-a733-boot-trace.patch`](a733/xnu-a733-boot-trace.patch) — visible BSD/rootfs milestones.
 - [`a733/xnu-a733-pid1-trace.patch`](a733/xnu-a733-pid1-trace.patch) — **experimental** PID 1 exec/syscall tracing (requires a new kernel build and hardware verification).
+- [`a733/xnu-a733-sdmmc.patch`](a733/xnu-a733-sdmmc.patch) — experimental read-only PIO microSD (SMHC0) root device `sdroot0`; tests in `a733/tests/test_sdmmc_patch.py`.
 - [`a733/xnu-a733-pid1-v15-open.patch`](a733/xnu-a733-pid1-v15-open.patch) — PID1-only `open`/VFS tracepoints; board-tested, stopped at `copyinstr`.
 - [`a733/src/a733-init-v18.S`](a733/src/a733-init-v18.S) — v18 userspace probe for `read`/`close`/`ENOENT`, board-tested 21 Oct 2026.
 - [`a733/V18-TEST-RU.md`](a733/V18-TEST-RU.md) — v18 image hashes, test expectations and hardware-test precautions.

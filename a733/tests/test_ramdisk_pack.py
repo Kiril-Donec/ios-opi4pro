@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 import adt  # noqa: E402
 import mkpayload  # noqa: E402
-from package_xnu_a733 import _validate_ramdisk_args  # noqa: E402
+from package_xnu_a733 import _validate_ramdisk_args, _validate_sdroot_args  # noqa: E402
 from mkadt_a733 import build as build_adt  # noqa: E402
 
 BASE = "debug=0xc modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0"
@@ -71,6 +71,33 @@ class RamdiskPackTests(unittest.TestCase):
         mmap = next(x for x in chosen.children if x.name == "memory-map")
         self.assertEqual(mmap.prop("RAMDisk"), struct.pack("<2Q", pa, size))
         self.assertEqual(struct.unpack("<Q", chosen.prop("dram-base"))[0], 0x100000000)
+
+
+class SdrootArgsTests(unittest.TestCase):
+    SD = BASE + " cpus=1 rd=sdroot0 unentitled_ios_sim_launch=1"
+
+    def setUp(self) -> None:
+        self.sd_adt = build_adt(sdmmc=True).serialize()
+
+    def test_valid_sdroot(self) -> None:
+        _validate_sdroot_args(self.SD, None, self.sd_adt)
+
+    def test_other_roots_untouched(self) -> None:
+        _validate_sdroot_args(BASE + " rd=md0", None, build_adt().serialize())
+
+    def test_requires_sdmmc_adt_node(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--sdmmc"):
+            _validate_sdroot_args(self.SD, None, build_adt().serialize())
+
+    def test_refuses_ramdisk_second_root_rw_and_smp(self) -> None:
+        with self.assertRaisesRegex(ValueError, "RAM disk"):
+            _validate_sdroot_args(self.SD, Path("x.img"), self.sd_adt)
+        with self.assertRaisesRegex(ValueError, "exactly rd=sdroot0"):
+            _validate_sdroot_args(self.SD + " rd=md0", None, self.sd_adt)
+        with self.assertRaisesRegex(ValueError, "read-only"):
+            _validate_sdroot_args(self.SD + " rootrw=1", None, self.sd_adt)
+        with self.assertRaisesRegex(ValueError, "cpus=1"):
+            _validate_sdroot_args(self.SD.replace("cpus=1", "cpus=2"), None, self.sd_adt)
 
 
 if __name__ == "__main__":

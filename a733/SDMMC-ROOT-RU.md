@@ -1,0 +1,125 @@
+# microSD-root для XNU на Orange Pi 4 Pro (Allwinner A733, SMHC0)
+
+**Статус (2026-10-22): исходный код написан, на плате НЕ проверялся.**
+Пройдены только хостовые проверки (см. ниже). Ни один IMG с этим драйвером ещё не
+собирался и не загружался. Успешная сборка CI не будет означать, что драйвер
+читает карту, — это покажут только фотографии HDMI.
+
+## Зачем
+
+v22 доказал, что настоящий Apple `dyld` исполняется, но остановился на
+`Library not loaded: /usr/lib/libSystem.B.dylib`: 16-MiB RAM-диск не вмещает
+dyld shared cache (≈2.55 GiB). Полный 16-GiB HFS+ том `ios16-gui-first.img`
+должен лежать на отдельном разделе microSD, а XNU — читать его своим драйвером.
+Ядро по-прежнему обновляется через маленький загрузочный раздел (payload без
+RAM-диска), 16-GiB раздел при этом не перезаписывается.
+
+## Что реализовано
+
+Файл `bsd/dev/a733_sdmmc.c` внутри [xnu-a733-sdmmc.patch](xnu-a733-sdmmc.patch),
+применяется в CI последним (`9999m`, после `9999l` графики).
+
+| Часть | Реализация |
+| --- | --- |
+| Адреса | `/a733-sdmmc` в ADT (`mkadt_a733.py --sdmmc`): SMHC0 `0x04020000`/`0x1000`, CCU `0x02002000`/`0x2000`, SPI 161. Источник: вендорский DT Orange Pi `sun60iw2p1.dtsi` (`sdmmc@4020000`, `allwinner,sunxi-mmc-v5p3x`). |
+| Такты, reset, pinmux, напряжение | **Не изменяются**: их оставляет U-Boot, который только что прочитал с этой карты payload. CCU только читается: `SMHC0_CLK` (+`0xd00`: M[4:0], N[12:8] — линейные делители, mux[26:24] = 24M / peri0-400M / peri0-300M / peri1-400M / peri1-300M, gate[31]) и `SMHC0_BGR` (+`0xd0c`: gate бит 0, reset бит 16). Если шина выключена или в reset — драйвер отказывается, а не включает её. |
+| Контроллер | Soft/FIFO/DMA reset, IDMAC выключен, прерывания выключены (опрос), FIFO через CPU (`GCTRL` бит 31), FIFO по адресу `+0x200` (v5p3x), `TMOUT=0xffffffff`, `FTRGL=0x20070008`, read threshold 512 (`+0x100`). |
+| Частота | 2x timing mode (`NTSR` бит 31) и фазы ≤26 MHz из BSP v5p3x (cmd drive 180°, data drive 90°, sample phase 0). Делитель `CLKCR[7:0]` выбирается по консервативной верхней оценке `mod/(2·div)`: идентификация ≤400 kHz, передача ≤25 MHz (Default Speed). Реальная частота в 2x mode вдвое ниже оценки. Смена частоты — с маской DATA0 и командой `UPCLK_ONLY`, как в `sunxi-mmc-v5p3x.c`. |
+| Карта | Полная повторная идентификация: CMD0 → CMD8 → ACMD41 (HCS, без S18R) → CMD2 (CID) → CMD3 (RCA) → CMD9 (CSD, ёмкость v1/v2) → CMD7 → ACMD6 (4 бита, при ошибке остаётся 1 бит) → CMD16 для SDSC → CMD13 (проверка `tran`). |
+| Чтение | CMD17 / CMD18 + auto CMD12, до 256 секторов за команду, PIO по уровню FIFO (как U-Boot). Таймауты на команду/данные/busy, 3 попытки, после ошибки — reset контроллера (как U-Boot), CMD13 и CMD12 только если карта осталась в `data`/`rcv`. |
+| Разделы | MBR (основные 1–4) и GPT (по индексу, имя выводится). По умолчанию раздел **2**; раздел 1 (загрузочный) корнем по умолчанию не станет. Границы проверяются по CSD. |
+| Проверка тома | Заголовок HFS+/HFSX на байте 1024 раздела, размер тома ≤ раздела, флаги clean/journaled. Без заголовка — отказ (`sdforce=1` для принудительного режима). |
+| XNU | `bdevsw`/`cdevsw` `sdroot0` / `rsdroot0`, `DKIOC*` как у проверенного upstream UFS-драйвера, `rd=sdroot0` в `IOFindBSDRoot`. Только чтение: открытие на запись → `EROFS`, запись → `EROFS`. |
+| Диагностика | Все шаги печатаются на HDMI-консоль с префиксом `A733 SD:`, каждые 64 MiB — счётчик прочитанного. |
+
+### Что НЕ реализовано
+
+- Запись (CMD24/25). Корень монтируется только для чтения; iOS-демоны, пишущие в
+  `/private/var`, будут получать ошибки. Следующий шаг после успешного чтения.
+- DMA (IDMAC). Память XNU начинается с `0x1_0000_0000`; IDMAC и 64-битные
+  адреса нужно проверить отдельно.
+- High Speed 50 MHz (CMD6) и UHS. Сейчас Default Speed ≤25 MHz (по оценке ≤12.5 MHz).
+- Прерывания (SPI 161), card detect PF6, горячее извлечение.
+- Выключение/включение питания карты. Если U-Boot перевёл карту на 1.8 V,
+  CMD0 этого не отменяет; драйвер сохраняет напряжение площадок как есть и
+  работает в Default Speed. Такой случай на плате не проверен.
+
+## Хостовые проверки (пройдены 2026-10-22)
+
+- `python3 -m unittest discover -s a733/tests -p test_sdmmc_patch.py` — gcc и
+  clang: извлечение драйвера из патча, `test_sdmmc_logic.c` (CCU-делители,
+  выбор делителя на диапазоне 1–408 MHz, CSD v1/v2 — включая точный размер
+  карты владельца 61 891 149 824 байт, CID, MBR/GPT, HFS+/HFSX), проверка
+  ядерной части `-fsyntax-only -Wall -Wextra -Werror -Wshorten-64-to-32` с
+  заглушками, повторяющими сигнатуры xnu-8796.141.3, и проверки безопасности
+  (нет команд записи, CCU не пишется, IDMAC выключен).
+- Патч проверен `git apply --check` на точном дереве CI: xnu-8796.141.3 + все
+  `xnu/patches` + оверлеи `9999`–`9999l` + патчи dxb (140 применяются, как в CI).
+- `test_adt.py`, `test_ramdisk_pack.py` (новые проверки `rd=sdroot0`).
+
+Настоящая компиляция XNU — только в macOS workflow; он теперь отказывается
+упаковывать ядро без строки `A733 SD: sdroot0 ready, read-only PIO` в Mach-O
+(dxb молча пропускает неприменившиеся патчи).
+
+## Сборка payload
+
+CI создаёт артефакт `a733-SDROOT-EXPERIMENTAL-readonly-PIO`. Вручную:
+
+```sh
+python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc
+python3 a733/tools/package_xnu_a733.py kernel.development.sweet \
+  a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot
+```
+
+`--sdroot` добавляет `rd=sdroot0 unentitled_ios_sim_launch=1` (как в v22).
+Упаковщик отказывает, если: в ADT нет `/a733-sdmmc`, задан RAM-диск или второй
+`rd=`, `rootrw=1`, нет `cpus=1`, или командная строка длиннее 607 байт
+(`mkpayload` молча обрезал бы `rd=`).
+
+Boot-args: `sdpart=N` (раздел, по умолчанию 2), `sdforce=1`, `sdclkdiv=N`
+(ручной делитель передачи), `sd4bit=0` (1-битная шина).
+
+## Разметка карты (этап 4, ещё не выполнялся)
+
+Сейчас: MBR, раздел 1 — 64 MiB с 32 MiB (сектора 65536–196607), U-Boot/Stage0 в
+первых 32 MiB. План:
+
+- раздел 2: начало сектор **196608** (96 MiB), длина **не меньше 33554432
+  секторов** (16 GiB = размер `ios16-gui-first.img`), тип MBR `0xAF` (тип драйвер
+  не проверяет);
+- `ios16-gui-first.img` (сырой HFS+ том, без таблицы разделов внутри)
+  записывается с первого байта раздела 2;
+- первые 96 MiB (U-Boot + раздел 1) не трогаются; перед изменением MBR —
+  резервная копия первых 64 MiB, как и раньше.
+
+Карта на Windows — **Disk 1** (USB, 61 891 149 824 байт). **Disk 0 — системный
+NVMe, его не трогать.** Готового скрипта записи в репозитории пока нет; запись
+16 GiB — разовая операция, после неё обновляется только payload на разделе 1.
+
+## Что ожидать на HDMI при первом тесте
+
+```
+A733 ROOT: rd=sdroot0, starting the SMHC0 microSD PIO driver
+A733 SD: mapping SMHC0 0x4020000 and CCU 0x2002000
+A733 SD: CCU SMHC0_CLK 0x........ BGR 0x........
+A733 SD: SMHC version 0x..., GCTRL ... CLKCR ... NTSR ... STAS ...
+A733 SD: module clock N Hz; identification div D (<= ... Hz), transfer div D (<= ... Hz)
+A733 SD: OCR 0x........, SDHC/SDXC
+A733 SD: CID manufacturer 0x.. product "....." rev x.y
+A733 SD: card RCA 0x...., 59024 MiB, 4-bit bus
+A733 SD: partition 2: MBR start sector 196608, 16384 MiB
+A733 SD: HFS+ volume v4, ... x 4096 bytes, cleanly unmounted, journaled
+A733 SD: sdroot0 ready, read-only PIO
+BSD root: sdroot0, major .., minor 0
+```
+
+Если зависание после `mapping SMHC0` — доступ к регистрам SMHC0/CCU (шина);
+`SMHC0 bus clock gated or in reset` — U-Boot выключил контроллер перед `bootm`;
+ошибки `CMD8`/`ACMD41`/`CMD2` с `rint` — идентификация карты (сфотографируйте
+значения `rint`, `CLKCR`, `NTSR`); `no HFS+/HFSX volume header` — раздел 2 не
+содержит образ. Любая ошибка завершается panic `A733 microSD root sdroot0
+unavailable` с кодом errno. Сфотографировать весь экран.
+
+**Откат:** v22 (`rd=md0` + RAM-диск) не изменён; payload v22 можно вернуть на
+раздел 1 в любой момент. Драйвер активируется только при `rd=sdroot0`.
+Одно ядро Cortex-A76 (`cpus=1`), другие ядра не включаются.

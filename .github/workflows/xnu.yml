@@ -32,6 +32,10 @@ on:
       - "a733/xnu-a733-pid1-v16-copyinstr.patch"
       - "a733/xnu-a733-pid1-v17-usercopy.patch"
       - "a733/xnu-a733-ios-framebuffer.patch"
+      - "a733/xnu-a733-sdmmc.patch"
+      - "a733/tests/test_sdmmc_patch.py"
+      - "a733/tests/test_sdmmc_logic.c"
+      - "a733/tests/sdmmc_kernel_stubs.h"
       - "a733/tests/test_ios_display.py"
       - "a733/tools/adapt_xnu_a733.py"
       - "a733/tests/test_adapt_xnu.py"
@@ -101,6 +105,8 @@ jobs:
           cp a733/xnu-a733-pid1-v17-usercopy.patch dxb/patches/9999k-a733-pid1-v17-usercopy.patch
           # CPU scanout for real iOS IOSurface frames, no Qualcomm MDP accesses on A733.
           cp a733/xnu-a733-ios-framebuffer.patch dxb/patches/9999l-a733-ios-framebuffer.patch
+          # Read-only PIO microSD (SMHC0) root device, rd=sdroot0.
+          cp a733/xnu-a733-sdmmc.patch dxb/patches/9999m-a733-sdmmc.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -245,6 +251,10 @@ jobs:
           if marker not in kernel:
               raise SystemExit("FAIL: A733 AppleCLCD overlay was SKIPPED; refusing to package graphics kernel")
           print("PASS: A733 AppleCLCD CPU-scanout marker found in compiled XNU Mach-O")
+          sd = b"A733 SD: sdroot0 ready, read-only PIO"
+          if sd not in kernel:
+              raise SystemExit("FAIL: A733 microSD overlay was SKIPPED; refusing to package rd=sdroot0 kernel")
+          print("PASS: A733 SMHC0 microSD driver marker found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)
@@ -402,6 +412,46 @@ jobs:
           assert struct.unpack('<I', disp.prop('canvas-height')) == (2436,)
           print('PASS opt-in REAL AppleCLCD display node: iPhone X 1125x2436')
           PY
+
+      # Root on the microSD card (read-only PIO driver): no RAM disk, so the
+      # payload stays small and kernel updates never rewrite the iOS partition.
+      - name: Build experimental microSD-root (rd=sdroot0) payload
+        run: |
+          python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc
+          python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
+            a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot
+          a733/build/test_real_xnu_payload a733/build/a733-xnu-sdroot.payload
+          python3 - <<'PY'
+          import sys, struct
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          import adt
+          p = Path('a733/build/a733-xnu-sdroot.payload').read_bytes()
+          assert p[:8] == b'A733XNU1'
+          off, size = struct.unpack_from('<2Q', p, 0x20)
+          tree, _ = adt.parse(p[off:off + size])
+          sd = next(n for n in tree.children if n.name == 'a733-sdmmc')
+          assert struct.unpack('<2Q', sd.prop('reg')) == (0x04020000, 0x1000)
+          assert struct.unpack('<2Q', sd.prop('ccu-reg')) == (0x02002000, 0x2000)
+          chosen = next(n for n in tree.children if n.name == 'chosen')
+          mmap = next(n for n in chosen.children if n.name == 'memory-map')
+          assert mmap.prop('RAMDisk') is None, 'sdroot payload must not carry a RAM disk'
+          assert b'rd=sdroot0' in p and b'cpus=1' in p
+          print(f'PASS microSD-root payload: {len(p)} bytes, /a733-sdmmc node, no RAM disk')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a733-SDROOT-EXPERIMENTAL-readonly-PIO
+          path: |
+            a733/build/a733-sdroot.adt
+            a733/build/a733-xnu-sdroot.payload
+            a733/build/a733-xnu-sdroot.payload.sha256
+            a733/build/stage0.uimg
+            a733/SDMMC-ROOT-RU.md
+          if-no-files-found: error
+          retention-days: 14
 
       - uses: actions/upload-artifact@v4
         if: success()

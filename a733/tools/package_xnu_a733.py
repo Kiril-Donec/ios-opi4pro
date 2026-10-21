@@ -31,6 +31,28 @@ RAMDISK_TEST_BYTES = 8 * 1024 * 1024
 # serial=1 routes those logs to the A733 framebuffer-backed serial device.
 # sweetfb_console=1 prevents a later graphics present from hiding diagnostics.
 DEFAULT_CMDLINE = "debug=0xc cpus=1 keepsyms=1 -v modem=0 wifi=0 sweetbattery=0 sweetcpufreq=0 -enable_kprintf_spam serial=1 sweetfb_console=1"
+# Root on the microSD card through bsd/dev/a733_sdmmc.c (read-only PIO).
+# v22 showed that real Apple launchd needs unentitled_ios_sim_launch=1.
+SDROOT_ARGS = "rd=sdroot0 unentitled_ios_sim_launch=1"
+SDMMC_ADT_NODE = b"a733-sdmmc"
+
+
+def _validate_sdroot_args(cmdline: str, ramdisk: Path | None, adt_bytes: bytes) -> None:
+    """rd=sdroot0 needs the /a733-sdmmc ADT node, no RAM disk, a read-only root."""
+    tokens = cmdline.split()
+    rds = [t for t in tokens if t.startswith(("rd=", "rootdev="))]
+    if "rd=sdroot0" not in rds:
+        return
+    if rds != ["rd=sdroot0"]:
+        raise ValueError("microSD root requires exactly rd=sdroot0 and no other root device")
+    if ramdisk is not None:
+        raise ValueError("rd=sdroot0 boots from the card; do not add a RAM disk")
+    if SDMMC_ADT_NODE not in adt_bytes:
+        raise ValueError("rd=sdroot0 requires an ADT built with mkadt_a733.py --sdmmc")
+    if any(t.startswith("rootrw=") and t != "rootrw=0" for t in tokens):
+        raise ValueError("the A733 microSD driver is read-only; rootrw must stay off")
+    if "cpus=1" not in tokens:
+        raise ValueError("A733 bring-up stays on one Cortex-A76: cpus=1 is required")
 
 
 def _validate_ramdisk_args(cmdline: str, ramdisk: Path | None) -> None:
@@ -74,7 +96,11 @@ def pack(kernel: Path, adt: Path, cmdline: str, ramdisk: Path | None = None) -> 
         for key in ("modem", "wifi", "sweetbattery", "sweetcpufreq")
     ):
         raise ValueError("A733 first boot requires Qualcomm modem, Wi-Fi, battery I2C and cpufreq disabled")
+    # mkpayload silently truncates cmdline[608]; a lost rd= would boot the wrong root.
+    if len(cmdline.encode()) >= mkpayload.BOOT_LINE_LENGTH:
+        raise ValueError(f"cmdline too long for the payload header ({len(cmdline.encode())} bytes)")
     _validate_ramdisk_args(cmdline, ramdisk)
+    _validate_sdroot_args(cmdline, ramdisk, adt.read_bytes())
     data, meta = mkpayload.build(str(kernel), str(adt), cmdline,
                                  str(ramdisk) if ramdisk else None)
     if not data.startswith(LEGACY):
@@ -97,8 +123,14 @@ def main() -> None:
     ap.add_argument("output", type=Path)
     ap.add_argument("--cmdline", default=DEFAULT_CMDLINE)
     ap.add_argument("--ramdisk", type=Path, help="4..16 MiB HFS+ test image; sets rd=md0 if no --cmdline")
+    ap.add_argument("--sdroot", action="store_true",
+                    help=f"root on the microSD card partition (adds '{SDROOT_ARGS}')")
     args = ap.parse_args()
     cmdline = args.cmdline
+    if args.sdroot:
+        if args.ramdisk is not None:
+            ap.exit(1, "REFUSED: --sdroot and --ramdisk are exclusive\n")
+        cmdline += " " + SDROOT_ARGS
     if args.ramdisk is not None and not any(
         t.startswith(("rd=", "rootdev=")) for t in cmdline.split()
     ):
@@ -115,8 +147,13 @@ def main() -> None:
     print("A733-only audited payload:", args.output, len(result), "bytes")
     print("SHA256:", digest)
     print("Kernel start offset:", meta["a733_audited_start_offset"])
-    print("Root:", "HFS+ RAM disk /dev/md0 (NO launchd/userland included)"
-          if args.ramdisk else "no root volume supplied")
+    if args.ramdisk:
+        root = "HFS+ RAM disk /dev/md0 (NO launchd/userland included)"
+    elif "rd=sdroot0" in cmdline.split():
+        root = "microSD partition via SMHC0 PIO driver, rd=sdroot0 (read-only; card NOT verified)"
+    else:
+        root = "no root volume supplied"
+    print("Root:", root)
     print("Still NOT hardware-boot-verified. Do not flash automatically.")
 
 

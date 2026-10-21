@@ -1,0 +1,1283 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 21cdb5c..b67565c 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/a733_sdmmc.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a733_sdmmc.c b/bsd/dev/a733_sdmmc.c
+new file mode 100644
+index 0000000..f84d2dd
+--- /dev/null
++++ b/bsd/dev/a733_sdmmc.c
+@@ -0,0 +1,1233 @@
++/*
++ * Allwinner A733 microSD root device (SMHC0), polled PIO, read-only.
++ *
++ * U-Boot loads our payload from this card, so the SMHC0 bus clock, reset,
++ * module clock, PF0-PF5 pin functions and pad voltage are already set up.
++ * This driver never writes the CCU or the pin controller: it only reads the
++ * SMHC0 clock register to know the module clock, soft-resets the controller,
++ * re-identifies the card (CMD0 .. ACMD6) and then reads 512-byte sectors
++ * through the FIFO with CMD17/CMD18, one command at a time, no IDMAC and no
++ * interrupts. A partition of the card (MBR or GPT, boot-arg sdpart=, default
++ * 2) is exposed as the BSD disk sdroot0 (rsdroot0); root on it with
++ * rd=sdroot0. Writes are refused.
++ *
++ * Register layout and clock rules follow the Orange Pi A733 vendor kernel
++ * (bsp/drivers/mmc/sunxi-mmc*.c, "allwinner,sunxi-mmc-v5p3x"), mainline
++ * Linux drivers/mmc/host/sunxi-mmc.c and U-Boot drivers/mmc/sunxi_mmc.c,
++ * whose PIO path this mirrors. CCU layout: ccu-sun60iw2.c (SMHC0 clock at
++ * CCU + 0xd00, bus gate / reset at CCU + 0xd0c).
++ *
++ * Boot-args: sdpart=N (1-based MBR/GPT index, default 2), sdforce=1 (accept
++ * a partition without an HFS+ volume header), sdclkdiv=N (override the
++ * transfer clock divider), sd4bit=0 (stay on a 1-bit bus).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_SD_HOST_TEST)
++
++#ifndef A733_SD_HOST_TEST
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++#else
++#include <errno.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#ifndef EFTYPE
++#define EFTYPE 79
++#endif
++#endif /* !A733_SD_HOST_TEST */
++
++/* SMHC registers */
++#define SMHC_GCTRL      0x000
++#define SMHC_CLKCR      0x004
++#define SMHC_TMOUT      0x008
++#define SMHC_WIDTH      0x00c
++#define SMHC_BLKSZ      0x010
++#define SMHC_BCNTR      0x014
++#define SMHC_CMDR       0x018
++#define SMHC_CARG       0x01c
++#define SMHC_RESP0      0x020
++#define SMHC_IMASK      0x030
++#define SMHC_RINTR      0x038
++#define SMHC_STAS       0x03c
++#define SMHC_FTRGL      0x040
++#define SMHC_FUNS       0x044
++#define SMHC_DBGC       0x050
++#define SMHC_NTSR       0x05c
++#define SMHC_DMAC       0x080
++#define SMHC_IDIE       0x08c
++#define SMHC_THLD       0x100
++#define SMHC_DRV_DL     0x140
++#define SMHC_FIFO       0x200
++#define SMHC_VERS       0x300
++#define SMHC_MAP_SIZE   0x1000
++
++#define GCTRL_SOFT_RESET        (1u << 0)
++#define GCTRL_FIFO_RESET        (1u << 1)
++#define GCTRL_DMA_RESET         (1u << 2)
++#define GCTRL_HW_RESET          (GCTRL_SOFT_RESET | GCTRL_FIFO_RESET | GCTRL_DMA_RESET)
++#define GCTRL_INT_ENABLE        (1u << 4)
++#define GCTRL_DMA_ENABLE        (1u << 5)
++#define GCTRL_DDR_MODE          (1u << 10)
++#define GCTRL_DTIME_UNIT        (1u << 11)
++#define GCTRL_ACCESS_DONE_DIRECT (1u << 30)
++#define GCTRL_ACCESS_BY_AHB     (1u << 31)
++
++#define CLKCR_DIV_MASK          0xffu
++#define CLKCR_CARD_CLOCK_ON     (1u << 16)
++#define CLKCR_LOW_POWER_ON      (1u << 17)
++#define CLKCR_MASK_DATA0        (1u << 31)
++
++#define CMD_RESP_EXPIRE         (1u << 6)
++#define CMD_LONG_RESPONSE       (1u << 7)
++#define CMD_CHECK_RESPONSE_CRC  (1u << 8)
++#define CMD_DATA_EXPIRE         (1u << 9)
++#define CMD_SEND_AUTO_STOP      (1u << 12)
++#define CMD_WAIT_PRE_OVER       (1u << 13)
++#define CMD_STOP_ABORT          (1u << 14)
++#define CMD_SEND_INIT_SEQ       (1u << 15)
++#define CMD_UPCLK_ONLY          (1u << 21)
++#define CMD_START               (1u << 31)
++
++#define RINT_RESP_ERROR         (1u << 1)
++#define RINT_COMMAND_DONE       (1u << 2)
++#define RINT_DATA_OVER          (1u << 3)
++#define RINT_RESP_CRC_ERROR     (1u << 6)
++#define RINT_DATA_CRC_ERROR     (1u << 7)
++#define RINT_RESP_TIMEOUT       (1u << 8)
++#define RINT_DATA_TIMEOUT       (1u << 9)
++#define RINT_FIFO_RUN_ERROR     (1u << 11)
++#define RINT_HARDWARE_LOCKED    (1u << 12)
++#define RINT_START_BIT_ERROR    (1u << 13)
++#define RINT_AUTO_CMD_DONE      (1u << 14)
++#define RINT_END_BIT_ERROR      (1u << 15)
++#define RINT_SDIO_INTERRUPT     (1u << 16)
++#define RINT_ERRORS             (RINT_RESP_ERROR | RINT_RESP_CRC_ERROR | RINT_DATA_CRC_ERROR | \
++	                         RINT_RESP_TIMEOUT | RINT_DATA_TIMEOUT | RINT_FIFO_RUN_ERROR | \
++	                         RINT_HARDWARE_LOCKED | RINT_START_BIT_ERROR | RINT_END_BIT_ERROR)
++
++#define STAS_FIFO_EMPTY         (1u << 2)
++#define STAS_FIFO_FULL          (1u << 3)
++#define STAS_CARD_PRESENT       (1u << 8)
++#define STAS_CARD_DATA_BUSY     (1u << 9)
++#define STAS_FIFO_LEVEL(s)      (((s) >> 17) & 0x3fffu)
++
++#define NTSR_2X_TIMING_MODE     (1u << 31)
++#define NTSR_SAMPLE_PHASE_MASK  0x330u          /* cmd [5:4], data [9:8] */
++#define DRV_DL_CMD_DRV_PH_SEL   (1u << 16)      /* 180 degrees */
++#define DRV_DL_DAT_DRV_PH_SEL   (1u << 17)
++#define THLD_READ_EN            (1u << 0)
++#define THLD_WRITE_EN           (1u << 2)
++#define THLD_READ_THLD(x)       (((x) & 0xfffu) << 16)
++
++/* CCU (sun60iw2) */
++#define CCU_SMHC0_CLK           0xd00
++#define CCU_SMHC0_BGR           0xd0c
++#define CCU_MAP_SIZE            0x2000
++#define CCU_SMHC0_BGR_GATE      (1u << 0)
++#define CCU_SMHC0_BGR_RESET     (1u << 16)      /* 1 = deasserted */
++
++/* Response types */
++#define RT_PRESENT      0x1u
++#define RT_LONG         0x2u
++#define RT_CRC          0x4u
++#define RT_BUSY         0x8u
++#define RT_R1           (RT_PRESENT | RT_CRC)
++#define RT_R1B          (RT_R1 | RT_BUSY)
++#define RT_R2           (RT_PRESENT | RT_LONG | RT_CRC)
++#define RT_R3           RT_PRESENT
++
++/* R1 card status error bits (CARD_IS_LOCKED, bit 25, is a state, not an error). */
++#define R1_ERRORS               0xfdf80000u
++/*
++ * Errors that belong to a read command itself: OUT_OF_RANGE, ADDRESS_ERROR,
++ * BLOCK_LEN_ERROR, CARD_ECC_FAILED, CC_ERROR, ERROR. COM_CRC_ERROR and
++ * ILLEGAL_COMMAND describe the previous command.
++ */
++#define R1_READ_ERRORS          0xe0380000u
++#define R1_OUT_OF_RANGE         (1u << 31)
++#define R1_STATE(r)             (((r) >> 9) & 0xfu)
++#define R1_STATE_TRAN           4u
++#define R1_STATE_DATA           5u
++#define R1_STATE_RCV            6u
++
++#define SD_SECTOR               512u
++#define SD_MAX_BLOCKS           256u            /* per CMD18: 128 KiB */
++#define SD_IDENT_HZ             400000ull
++#define SD_DS_HZ                25000000ull
++#define SD_MOD_MAX_HZ           408000000ull    /* identification still <= 400 kHz */
++
++#define HFS_SIG_PLUS            0x482bu         /* 'H+' */
++#define HFS_SIG_X               0x4858u         /* 'HX' */
++#define HFS_SIG_WRAPPER         0x4244u         /* 'BD' */
++#define HFS_ATTR_UNMOUNTED      (1u << 8)
++#define HFS_ATTR_JOURNALED      (1u << 13)
++
++/*
++ * Pure helpers (no MMIO, no kernel state): built into the host unit test
++ * a733/tests/test_sdmmc_logic.c as well.
++ */
++static inline uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static inline uint64_t
++le64(const uint8_t *p)
++{
++	return (uint64_t)le32(p) | (uint64_t)le32(p + 4) << 32;
++}
++
++static inline uint32_t
++be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | (uint32_t)p[3];
++}
++
++static inline uint16_t
++be16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] << 8 | p[1]);
++}
++
++/*
++ * SMHC0 module clock from the CCU register: parent / (M + 1) / (N + 1), with
++ * M [4:0], N [12:8] (linear, CCU_FEATURE_MP_NO_INDEX_MODE), mux [26:24],
++ * gate [31]. Returns 0 for a gated clock or an unknown parent.
++ */
++static uint64_t
++a733sd_ccu_mod_hz(uint32_t reg)
++{
++	static const uint64_t parents[] = {
++		24000000ull,    /* sys24M */
++		400000000ull,   /* pll-peri0-400m */
++		300000000ull,   /* pll-peri0-300m */
++		400000000ull,   /* pll-peri1-400m */
++		300000000ull,   /* pll-peri1-300m */
++	};
++	uint32_t mux = (reg >> 24) & 0x7u;
++
++	if (!(reg & (1u << 31)) || mux >= sizeof(parents) / sizeof(parents[0])) {
++		return 0;
++	}
++	return parents[mux] / ((reg & 0x1fu) + 1) / (((reg >> 8) & 0x1fu) + 1);
++}
++
++/*
++ * Card clock upper bound for internal divider d: mod / (2 d), or mod for
++ * d == 0. In the 2x timing mode the vendor driver uses, the real card clock
++ * is half of this; the bound stays safe whichever way the divider and the 2x
++ * mode combine.
++ */
++static uint64_t
++a733sd_card_hz_max(uint64_t mod_hz, uint32_t div)
++{
++	return div ? mod_hz / (2ull * div) : mod_hz;
++}
++
++/* Smallest divider whose upper bound is <= limit_hz, or 256 if none fits. */
++static uint32_t
++a733sd_pick_div(uint64_t mod_hz, uint64_t limit_hz)
++{
++	if (mod_hz <= limit_hz) {
++		return 0;
++	}
++	uint64_t div = (mod_hz + 2 * limit_hz - 1) / (2 * limit_hz);
++	return div > CLKCR_DIV_MASK ? CLKCR_DIV_MASK + 1 : (uint32_t)div;
++}
++
++/* Bits [lsb + width - 1 : lsb] of a 128-bit R2 response, r[0] = bits 31:0. */
++static uint32_t
++a733sd_rbits(const uint32_t r[4], unsigned lsb, unsigned width)
++{
++	unsigned w = lsb / 32, s = lsb % 32;
++	uint64_t v = r[w] >> s;
++
++	if (s + width > 32 && w < 3) {
++		v |= (uint64_t)r[w + 1] << (32 - s);
++	}
++	return (uint32_t)(v & ((1ull << width) - 1));
++}
++
++/* Card capacity in 512-byte sectors from the CSD, 0 if unsupported. */
++static uint64_t
++a733sd_csd_sectors(const uint32_t csd[4])
++{
++	switch (a733sd_rbits(csd, 126, 2)) {
++	case 0: {       /* CSD 1.0, SDSC */
++		uint64_t c_size = a733sd_rbits(csd, 62, 12);
++		unsigned mult = a733sd_rbits(csd, 47, 3);
++		unsigned bl_len = a733sd_rbits(csd, 80, 4);
++		if (bl_len < 9 || bl_len > 11) {
++			return 0;
++		}
++		return ((c_size + 1) << (mult + 2 + bl_len)) / SD_SECTOR;
++	}
++	case 1:         /* CSD 2.0, SDHC / SDXC: 512 KiB units */
++		return ((uint64_t)a733sd_rbits(csd, 48, 22) + 1) * 1024;
++	default:
++		return 0;
++	}
++}
++
++struct a733sd_part {
++	uint64_t start;         /* card sector */
++	uint64_t count;         /* sectors */
++	uint8_t mbr_type;       /* 0 for GPT */
++	char name[37];          /* GPT name, ASCII subset */
++};
++
++/*
++ * Partition idx (1-based) from MBR sector 0. Returns 0, ENOENT for an empty
++ * slot, EINVAL without an MBR signature, or EFTYPE when the disk is GPT
++ * (protective entry 0xee): the caller then reads the GPT.
++ */
++static int
++a733sd_mbr_part(const uint8_t *mbr, unsigned idx, struct a733sd_part *out)
++{
++	if (mbr[510] != 0x55 || mbr[511] != 0xaa) {
++		return EINVAL;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (mbr[446 + 16 * i + 4] == 0xee) {
++			return EFTYPE;
++		}
++	}
++	if (idx < 1 || idx > 4) {
++		return ENOENT;
++	}
++	const uint8_t *e = mbr + 446 + 16 * (idx - 1);
++	if (e[4] == 0 || le32(e + 12) == 0 || le32(e + 8) == 0) {
++		return ENOENT;
++	}
++	if (e[4] == 0x05 || e[4] == 0x0f || e[4] == 0x85) {
++		return ENOENT;          /* extended partitions are not supported */
++	}
++	out->start = le32(e + 8);
++	out->count = le32(e + 12);
++	out->mbr_type = e[4];
++	out->name[0] = 0;
++	return 0;
++}
++
++/* GPT header (sector 1): entry array location for partition idx. */
++static int
++a733sd_gpt_locate(const uint8_t *hdr, unsigned idx, uint64_t *sector, uint32_t *offset)
++{
++	if (memcmp(hdr, "EFI PART", 8) != 0) {
++		return EINVAL;
++	}
++	uint64_t entry_lba = le64(hdr + 72);
++	uint32_t nent = le32(hdr + 80), esz = le32(hdr + 84);
++	if (esz < 128 || esz > SD_SECTOR || (SD_SECTOR % esz) || entry_lba < 2) {
++		return EINVAL;
++	}
++	if (idx < 1 || idx > nent) {
++		return ENOENT;
++	}
++	uint64_t byte = (uint64_t)(idx - 1) * esz;
++	*sector = entry_lba + byte / SD_SECTOR;
++	*offset = (uint32_t)(byte % SD_SECTOR);
++	return 0;
++}
++
++static int
++a733sd_gpt_entry(const uint8_t *e, struct a733sd_part *out)
++{
++	static const uint8_t unused[16];
++	if (memcmp(e, unused, 16) == 0) {
++		return ENOENT;
++	}
++	uint64_t first = le64(e + 32), last = le64(e + 40);
++	if (first == 0 || last < first) {
++		return EINVAL;
++	}
++	unsigned c;
++	for (c = 0; c < 36; c++) {
++		uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++		if (ch == 0 || ch > 0x7e || ch < 0x20) {
++			break;
++		}
++		out->name[c] = (char)ch;
++	}
++	out->name[c] = 0;
++	out->start = first;
++	out->count = last - first + 1;
++	out->mbr_type = 0;
++	return 0;
++}
++
++struct a733sd_hfs {
++	uint16_t signature;
++	uint16_t version;
++	uint32_t attributes;
++	uint32_t block_size;
++	uint32_t total_blocks;
++};
++
++/*
++ * HFS+/HFSX volume header (partition byte 1024 = partition sector 2).
++ * Returns 0, EFTYPE without a usable signature, or EFBIG when the volume is
++ * larger than the partition.
++ */
++static int
++a733sd_hfs_check(const uint8_t *sec, uint64_t part_sectors, struct a733sd_hfs *out)
++{
++	out->signature = be16(sec);
++	out->version = be16(sec + 2);
++	out->attributes = be32(sec + 4);
++	out->block_size = be32(sec + 40);
++	out->total_blocks = be32(sec + 44);
++	if (out->signature != HFS_SIG_PLUS && out->signature != HFS_SIG_X) {
++		return EFTYPE;
++	}
++	if (out->block_size < SD_SECTOR || (out->block_size & (out->block_size - 1))) {
++		return EFTYPE;
++	}
++	if ((uint64_t)out->block_size * out->total_blocks > part_sectors * SD_SECTOR) {
++		return EFBIG;
++	}
++	return 0;
++}
++
++#ifndef A733_SD_HOST_TEST
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t ccu;
++	uint64_t mod_hz;
++	uint32_t ident_div, xfer_div;
++	uint32_t rca;
++	bool high_capacity;
++	bool wide;
++	uint64_t card_sectors;
++	struct a733sd_part part;
++	uint32_t secsize;               /* logical sector size for the BSD layer */
++	uint32_t last_rint;
++	uint64_t bytes_read;
++	uint64_t next_report;
++	uint32_t errors;
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} sd;
++
++static uint32_t sd_bounce[SD_SECTOR / 4] __attribute__((aligned(64)));
++
++static LCK_GRP_DECLARE(a733_sd_grp, "a733_sdmmc");
++static LCK_MTX_DECLARE(a733_sd_lock, &a733_sd_grp);
++
++static inline uint32_t
++smhc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sd.regs + off);
++}
++
++static inline void
++smhc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(sd.regs + off) = v;
++}
++
++static inline uint32_t
++ccu_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(sd.ccu + off);
++}
++
++static uint64_t
++deadline_ms(uint32_t ms)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &abs);
++	return mach_absolute_time() + abs;
++}
++
++/* Wait until (reg & mask) == 0. */
++static int
++smhc_wait_clear(uint32_t reg, uint32_t mask, uint32_t ms)
++{
++	uint64_t deadline = deadline_ms(ms);
++	while (smhc_rd(reg) & mask) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	return 0;
++}
++
++/* Polled operation, CPU (AHB) FIFO access, no IDMAC. */
++static void
++smhc_gctrl_pio(void)
++{
++	uint32_t v = smhc_rd(SMHC_GCTRL);
++	v &= ~(GCTRL_INT_ENABLE | GCTRL_DMA_ENABLE | GCTRL_DDR_MODE | GCTRL_DTIME_UNIT |
++	    GCTRL_ACCESS_DONE_DIRECT);
++	v |= GCTRL_ACCESS_BY_AHB;
++	smhc_wr(SMHC_GCTRL, v);
++}
++
++/*
++ * Soft, FIFO and DMA reset, then the polled PIO setup. CLKCR / NTSR survive
++ * (U-Boot only re-latches the clock after this reset).
++ */
++static int
++smhc_reset(void)
++{
++	smhc_wr(SMHC_GCTRL, smhc_rd(SMHC_GCTRL) | GCTRL_HW_RESET);
++	int error = smhc_wait_clear(SMHC_GCTRL, GCTRL_HW_RESET, 250);
++	smhc_gctrl_pio();
++	smhc_wr(SMHC_DMAC, 0);                          /* IDMAC off */
++	smhc_wr(SMHC_IDIE, 0);
++	smhc_wr(SMHC_IMASK, 0);                         /* polled */
++	smhc_wr(SMHC_RINTR, 0xffffffffu);
++	smhc_wr(SMHC_TMOUT, 0xffffffffu);               /* maximum response / data timeouts */
++	smhc_wr(SMHC_FTRGL, 0x20070008u);               /* burst 8, RX 7, TX 8 (Linux) */
++	smhc_wr(SMHC_DBGC, 0xdeb);
++	smhc_wr(SMHC_FUNS, 0xceaa0000u);
++	smhc_wr(SMHC_THLD, THLD_READ_THLD(SD_SECTOR) | THLD_WRITE_EN | THLD_READ_EN);
++	return error;
++}
++
++/* Latch CLKCR into the card clock domain (no command is sent to the card). */
++static int
++smhc_update_clk(void)
++{
++	smhc_wr(SMHC_CMDR, CMD_START | CMD_UPCLK_ONLY | CMD_WAIT_PRE_OVER);
++	int error = smhc_wait_clear(SMHC_CMDR, CMD_START, 250);
++	smhc_wr(SMHC_RINTR, smhc_rd(SMHC_RINTR) & ~RINT_SDIO_INTERRUPT);
++	return error;
++}
++
++/*
++ * Card clock off, new divider, 2x timing mode with the vendor's <= 26 MHz
++ * phases (cmd drive 180, data drive 90, sample phase 0), clock on. DATA0 is
++ * masked only while the clock is being updated, as the v5p3x driver does.
++ */
++static int
++smhc_set_clock(uint32_t div)
++{
++	uint32_t v = smhc_rd(SMHC_CLKCR);
++	v &= ~(CLKCR_CARD_CLOCK_ON | CLKCR_LOW_POWER_ON | CLKCR_MASK_DATA0);
++	smhc_wr(SMHC_CLKCR, v | CLKCR_MASK_DATA0);
++	int error = smhc_update_clk();
++	if (error) {
++		return error;
++	}
++	v = (v & ~CLKCR_DIV_MASK) | (div & CLKCR_DIV_MASK);
++	smhc_wr(SMHC_CLKCR, v | CLKCR_MASK_DATA0);
++
++	uint32_t n = smhc_rd(SMHC_NTSR);
++	smhc_wr(SMHC_NTSR, (n & ~NTSR_SAMPLE_PHASE_MASK) | NTSR_2X_TIMING_MODE);
++	uint32_t d = smhc_rd(SMHC_DRV_DL);
++	smhc_wr(SMHC_DRV_DL, (d | DRV_DL_CMD_DRV_PH_SEL) & ~DRV_DL_DAT_DRV_PH_SEL);
++
++	smhc_wr(SMHC_CLKCR, v | CLKCR_CARD_CLOCK_ON | CLKCR_MASK_DATA0);
++	error = smhc_update_clk();
++	smhc_wr(SMHC_CLKCR, smhc_rd(SMHC_CLKCR) & ~CLKCR_MASK_DATA0);
++	return error;
++}
++
++/* Wait for done in RINTR; any error bit ends the wait. */
++static int
++smhc_wait_rint(uint32_t done, uint32_t ms)
++{
++	uint64_t deadline = deadline_ms(ms);
++	for (;;) {
++		uint32_t r = smhc_rd(SMHC_RINTR);
++		if (r & RINT_ERRORS) {
++			sd.last_rint = r;
++			return (r & (RINT_RESP_TIMEOUT | RINT_DATA_TIMEOUT)) ? ETIMEDOUT : EIO;
++		}
++		if (r & done) {
++			return 0;
++		}
++		if (mach_absolute_time() > deadline) {
++			sd.last_rint = r;
++			return ETIMEDOUT;
++		}
++	}
++}
++
++/*
++ * Drain words 32-bit words of read data from the FIFO. The status register
++ * holds the fill level, so read that many words without re-polling.
++ */
++static int
++smhc_pio_read(uint32_t *dst, uint32_t words, uint64_t deadline)
++{
++	uint32_t i = 0;
++	while (i < words) {
++		uint32_t s = smhc_rd(SMHC_STAS);
++		if (s & STAS_FIFO_EMPTY) {
++			uint32_t r = smhc_rd(SMHC_RINTR);
++			if (r & RINT_ERRORS) {
++				sd.last_rint = r;
++				return (r & (RINT_RESP_TIMEOUT | RINT_DATA_TIMEOUT)) ? ETIMEDOUT : EIO;
++			}
++			if (mach_absolute_time() > deadline) {
++				sd.last_rint = r;
++				return ETIMEDOUT;
++			}
++			continue;
++		}
++		uint32_t n = STAS_FIFO_LEVEL(s);
++		if (n == 0) {
++			n = (s & STAS_FIFO_FULL) ? 32 : 1;
++		}
++		n = MIN(n, words - i);
++		while (n--) {
++			dst[i++] = smhc_rd(SMHC_FIFO);
++		}
++	}
++	return 0;
++}
++
++/*
++ * One command; with dst, read nblk sectors (auto CMD12 when nblk > 1).
++ * resp[0..3] = RESP0..RESP3 (R2: bits 31:0 .. 127:96).
++ */
++static int
++smhc_cmd(uint32_t idx, uint32_t arg, uint32_t rt, uint32_t *resp, uint32_t *dst, uint32_t nblk)
++{
++	uint32_t cmd = CMD_START | idx;
++	int error;
++
++	if (smhc_wait_clear(SMHC_CMDR, CMD_START, 100)) {
++		printf("A733 SD: controller still busy with a previous command\n");
++		smhc_reset();
++		(void)smhc_update_clk();
++	}
++	if (idx == 0) {
++		cmd |= CMD_SEND_INIT_SEQ;
++	}
++	if (idx == 12) {
++		cmd |= CMD_STOP_ABORT;
++	}
++	if (rt & RT_PRESENT) {
++		cmd |= CMD_RESP_EXPIRE;
++	}
++	if (rt & RT_LONG) {
++		cmd |= CMD_LONG_RESPONSE;
++	}
++	if (rt & RT_CRC) {
++		cmd |= CMD_CHECK_RESPONSE_CRC;
++	}
++	sd.last_rint = 0;
++	smhc_wr(SMHC_RINTR, 0xffffffffu);
++	if (dst) {
++		cmd |= CMD_DATA_EXPIRE | CMD_WAIT_PRE_OVER;
++		if (nblk > 1) {
++			cmd |= CMD_SEND_AUTO_STOP;
++		}
++		smhc_wr(SMHC_GCTRL, smhc_rd(SMHC_GCTRL) | GCTRL_FIFO_RESET);
++		(void)smhc_wait_clear(SMHC_GCTRL, GCTRL_FIFO_RESET, 10);
++		smhc_wr(SMHC_BLKSZ, SD_SECTOR);
++		smhc_wr(SMHC_BCNTR, nblk * SD_SECTOR);
++	}
++	smhc_wr(SMHC_CARG, arg);
++	smhc_wr(SMHC_CMDR, cmd);
++
++	error = dst ? smhc_pio_read(dst, nblk * (SD_SECTOR / 4), deadline_ms(1000 + 2 * nblk)) : 0;
++	if (!error) {
++		error = smhc_wait_rint(RINT_COMMAND_DONE, 1000);
++	}
++	if (!error && dst) {
++		error = smhc_wait_rint(nblk > 1 ? RINT_AUTO_CMD_DONE : RINT_DATA_OVER, 500);
++	}
++	if (!error && (rt & RT_BUSY)) {
++		error = smhc_wait_clear(SMHC_STAS, STAS_CARD_DATA_BUSY, 3000);
++	}
++	if (!error && resp) {
++		resp[0] = smhc_rd(SMHC_RESP0);
++		if (rt & RT_LONG) {
++			for (unsigned i = 1; i < 4; i++) {
++				resp[i] = smhc_rd(SMHC_RESP0 + 4 * i);
++			}
++		}
++	}
++	if (error) {
++		if (!sd.last_rint) {
++			sd.last_rint = smhc_rd(SMHC_RINTR);
++		}
++		/* Same recovery as U-Boot: controller reset, re-latch the clock. */
++		smhc_reset();
++		(void)smhc_update_clk();
++	}
++	smhc_wr(SMHC_RINTR, 0xffffffffu);
++	return error;
++}
++
++static int
++sd_acmd(uint32_t idx, uint32_t arg, uint32_t rt, uint32_t *resp)
++{
++	uint32_t r55[4];
++	int error = smhc_cmd(55, sd.rca << 16, RT_R1, r55, NULL, 0);
++	if (error) {
++		return error;
++	}
++	if (!(r55[0] & (1u << 5))) {    /* APP_CMD not accepted */
++		return EIO;
++	}
++	return smhc_cmd(idx, arg, rt, resp, NULL, 0);
++}
++
++static int
++sd_identify(void)
++{
++	uint32_t r[4];
++	int error;
++	bool v2;
++
++	sd.rca = 0;
++	smhc_wr(SMHC_WIDTH, 0);
++	error = smhc_set_clock(sd.ident_div);
++	if (error) {
++		printf("A733 SD: identification clock update timed out\n");
++		return error;
++	}
++	delay(1000);
++
++	(void)smhc_cmd(0, 0, 0, NULL, NULL, 0);         /* GO_IDLE_STATE + 74 clocks */
++	delay(2000);
++
++	error = smhc_cmd(8, 0x1aa, RT_R1, r, NULL, 0);  /* SEND_IF_COND, 2.7-3.6 V */
++	if (!error && (r[0] & 0xfffu) != 0x1aa) {
++		printf("A733 SD: CMD8 echo 0x%x, expected 0x1aa\n", r[0]);
++		return EIO;
++	}
++	v2 = (error == 0);
++	if (!v2) {
++		printf("A733 SD: CMD8 no response (rint 0x%x): SD 1.x card\n", sd.last_rint);
++		(void)smhc_cmd(0, 0, 0, NULL, NULL, 0);
++		delay(2000);
++	}
++
++	uint64_t deadline = deadline_ms(2000);
++	for (;;) {
++		/* HCS when CMD8 answered; no S18R: the pad voltage stays as U-Boot set it. */
++		error = sd_acmd(41, (v2 ? (1u << 30) : 0) | 0x00ff8000u, RT_R3, r);
++		if (error) {
++			printf("A733 SD: ACMD41 failed %d (rint 0x%x)\n", error, sd.last_rint);
++			return error;
++		}
++		if (r[0] & (1u << 31)) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			printf("A733 SD: card stayed busy in ACMD41 (OCR 0x%08x)\n", r[0]);
++			return ETIMEDOUT;
++		}
++		delay(10000);
++	}
++	sd.high_capacity = v2 && (r[0] & (1u << 30));
++	printf("A733 SD: OCR 0x%08x, %s\n", r[0], sd.high_capacity ? "SDHC/SDXC" : "SDSC");
++
++	error = smhc_cmd(2, 0, RT_R2, r, NULL, 0);      /* ALL_SEND_CID */
++	if (error) {
++		printf("A733 SD: CMD2 failed %d (rint 0x%x)\n", error, sd.last_rint);
++		return error;
++	}
++	char pnm[6];
++	for (unsigned i = 0; i < 5; i++) {
++		char c = (char)a733sd_rbits(r, 96 - 8 * i, 8);
++		pnm[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
++	}
++	pnm[5] = 0;
++	printf("A733 SD: CID manufacturer 0x%02x product \"%s\" rev %u.%u\n",
++	    a733sd_rbits(r, 120, 8), pnm, a733sd_rbits(r, 60, 4), a733sd_rbits(r, 56, 4));
++
++	error = smhc_cmd(3, 0, RT_R1, r, NULL, 0);      /* SEND_RELATIVE_ADDR (R6) */
++	if (error) {
++		printf("A733 SD: CMD3 failed %d (rint 0x%x)\n", error, sd.last_rint);
++		return error;
++	}
++	sd.rca = r[0] >> 16;
++
++	error = smhc_cmd(9, sd.rca << 16, RT_R2, r, NULL, 0);   /* SEND_CSD */
++	if (error) {
++		printf("A733 SD: CMD9 failed %d (rint 0x%x)\n", error, sd.last_rint);
++		return error;
++	}
++	sd.card_sectors = a733sd_csd_sectors(r);
++	if (!sd.card_sectors) {
++		printf("A733 SD: unsupported CSD %08x %08x %08x %08x\n", r[3], r[2], r[1], r[0]);
++		return ENXIO;
++	}
++
++	error = smhc_cmd(7, sd.rca << 16, RT_R1B, r, NULL, 0);  /* SELECT_CARD */
++	if (error) {
++		printf("A733 SD: CMD7 failed %d (rint 0x%x)\n", error, sd.last_rint);
++		return error;
++	}
++
++	uint32_t wide = 1;
++	PE_parse_boot_argn("sd4bit", &wide, sizeof(wide));
++	sd.wide = false;
++	if (wide) {
++		error = sd_acmd(6, 2, RT_R1, r);        /* SET_BUS_WIDTH 4 */
++		if (!error) {
++			smhc_wr(SMHC_WIDTH, 1);
++			sd.wide = true;
++		} else {
++			printf("A733 SD: ACMD6 failed %d, staying on a 1-bit bus\n", error);
++		}
++	}
++	if (!sd.high_capacity) {
++		error = smhc_cmd(16, SD_SECTOR, RT_R1, r, NULL, 0);
++		if (error) {
++			printf("A733 SD: CMD16 failed %d\n", error);
++			return error;
++		}
++	}
++
++	error = smhc_set_clock(sd.xfer_div);
++	if (error) {
++		printf("A733 SD: transfer clock update timed out\n");
++		return error;
++	}
++	error = smhc_cmd(13, sd.rca << 16, RT_R1, r, NULL, 0);  /* SEND_STATUS */
++	if (error || R1_STATE(r[0]) != R1_STATE_TRAN || (r[0] & R1_ERRORS)) {
++		printf("A733 SD: card not in transfer state: error %d status 0x%08x\n", error, r[0]);
++		return error ? error : EIO;
++	}
++	return 0;
++}
++
++/* Read nblk card sectors at card sector lba into a word-aligned buffer. */
++static int
++sd_read(uint64_t lba, uint32_t nblk, uint32_t *dst)
++{
++	uint32_t r[4];
++	int error = EIO;
++
++	if (nblk == 0 || nblk > SD_MAX_BLOCKS || lba + nblk > sd.card_sectors) {
++		return EINVAL;
++	}
++	uint32_t arg = sd.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_SECTOR);
++	/*
++	 * An auto CMD12 that ends a read of the card's last sectors may report
++	 * OUT_OF_RANGE; the bounds were checked above.
++	 */
++	uint32_t r1_mask = nblk > 1 ? (R1_READ_ERRORS & ~R1_OUT_OF_RANGE) : R1_READ_ERRORS;
++	for (int attempt = 0; attempt < 3; attempt++) {
++		r[0] = 0;
++		error = smhc_cmd(nblk > 1 ? 18 : 17, arg, RT_R1, r, dst, nblk);
++		if (!error && (r[0] & r1_mask)) {
++			error = EIO;
++			sd.last_rint = 0;
++		}
++		if (!error) {
++			return 0;
++		}
++		sd.errors++;
++		printf("A733 SD: CMD%u sector %llu x%u failed %d (rint 0x%x, R1 0x%08x), attempt %d\n",
++		    nblk > 1 ? 18 : 17, lba, nblk, error, sd.last_rint, r[0], attempt + 1);
++		/*
++		 * After an aborted read the card may still be sending data: stop it,
++		 * but only then (CMD12 in the transfer state is an illegal command).
++		 */
++		uint32_t st[4] = { 0 };
++		int serr = smhc_cmd(13, sd.rca << 16, RT_R1, st, NULL, 0);
++		if (serr || R1_STATE(st[0]) == R1_STATE_DATA || R1_STATE(st[0]) == R1_STATE_RCV) {
++			(void)smhc_cmd(12, 0, RT_R1B, st, NULL, 0);
++		}
++		delay(1000);
++	}
++	return error;
++}
++
++static int
++sd_find_partition(unsigned idx)
++{
++	const uint8_t *b = (const uint8_t *)sd_bounce;
++	int error = sd_read(0, 1, sd_bounce);
++	if (error) {
++		return error;
++	}
++	error = a733sd_mbr_part(b, idx, &sd.part);
++	if (error == EFTYPE) {
++		uint64_t sector;
++		uint32_t offset;
++		error = sd_read(1, 1, sd_bounce);
++		if (!error) {
++			error = a733sd_gpt_locate(b, idx, &sector, &offset);
++		}
++		if (!error) {
++			error = sd_read(sector, 1, sd_bounce);
++		}
++		if (!error) {
++			error = a733sd_gpt_entry(b + offset, &sd.part);
++		}
++		if (error) {
++			printf("A733 SD: GPT partition %u unusable: %d\n", idx, error);
++			return error ? error : ENXIO;
++		}
++	} else if (error) {
++		printf("A733 SD: %s partition %u\n",
++		    error == EINVAL ? "no MBR signature, cannot locate" : "MBR has no usable", idx);
++		return ENOENT;
++	}
++	if (sd.part.start + sd.part.count > sd.card_sectors || sd.part.start < 1) {
++		printf("A733 SD: partition %u (sector %llu + %llu) exceeds the card (%llu sectors)\n",
++		    idx, sd.part.start, sd.part.count, sd.card_sectors);
++		return EINVAL;
++	}
++	return 0;
++}
++
++static int
++a733_sd_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!sd.ready) {
++		return ENXIO;
++	}
++	return (flags & FWRITE) ? EROFS : 0;
++}
++
++static int
++a733_sd_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++a733_sd_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * sd.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = sd.part.count * SD_SECTOR;
++
++	buf_setresid(bp, count);
++	if (!(buf_flags(bp) & B_READ)) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&a733_sd_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = sd.part.start + pos / SD_SECTOR;
++		uint32_t skip = (uint32_t)(pos % SD_SECTOR);
++		uint32_t left = count - done;
++		char *p = vaddr + done;
++		uint32_t step;
++
++		if (skip == 0 && left >= SD_SECTOR && ((uintptr_t)p & 3) == 0) {
++			uint32_t n = MIN(left / SD_SECTOR, SD_MAX_BLOCKS);
++			error = sd_read(lba, n, (uint32_t *)(void *)p);
++			step = n * SD_SECTOR;
++		} else {
++			error = sd_read(lba, 1, sd_bounce);
++			step = MIN(SD_SECTOR - skip, left);
++			if (!error) {
++				memcpy(p, (const char *)sd_bounce + skip, step);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += step;
++		buf_setresid(bp, count - done);
++		sd.bytes_read += step;
++	}
++	if (sd.bytes_read >= sd.next_report) {
++		printf("A733 SD: %llu MiB read from the card, %u retried errors\n",
++		    sd.bytes_read >> 20, sd.errors);
++		sd.next_report = sd.bytes_read + (64ull << 20);
++	}
++	lck_mtx_unlock(&a733_sd_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		printf("A733 SD: I/O error %d at partition byte %llu (+%u)\n", error, off, count);
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++a733_sd_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = sd.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		sd.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = SD_SECTOR;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = sd.part.count * SD_SECTOR / sd.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 0;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = SD_MAX_BLOCKS * SD_SECTOR / sd.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++a733_sd_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return a733_sd_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++a733_sd_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return a733_sd_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++a733_sd_psize(__unused dev_t dev)
++{
++	return sd.ready ? (int)MIN(sd.part.count * SD_SECTOR / sd.secsize, INT_MAX) : -1;
++}
++
++static int
++a733_sd_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(a733_sd_strategy, NULL, dev, B_READ, minphys, uio, (int)sd.secsize);
++}
++
++static int
++a733_sd_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw a733_sd_bdevsw = {
++	.d_open     = a733_sd_open,
++	.d_close    = a733_sd_close,
++	.d_strategy = a733_sd_strategy,
++	.d_ioctl    = a733_sd_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = a733_sd_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw a733_sd_cdevsw = {
++	.d_open       = a733_sd_open,
++	.d_close      = a733_sd_close,
++	.d_read       = a733_sd_read,
++	.d_write      = a733_sd_write,
++	.d_ioctl      = a733_sd_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++a733_sd_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL, *ccu = NULL;
++	unsigned int size = 0, ccu_size = 0;
++	uint32_t idx = 2, force = 0, div_override = 0xffffffffu;
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/a733-sdmmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t) ||
++	    SecureDTGetProperty(node, "ccu-reg", (void const **)&ccu, &ccu_size) != kSuccess ||
++	    ccu_size < 2 * sizeof(uintptr_t)) {
++		printf("A733 SD: no /a733-sdmmc node in the device tree (mkadt_a733.py --sdmmc)\n");
++		return ENXIO;
++	}
++	if (reg[1] < SMHC_MAP_SIZE || ccu[1] < CCU_MAP_SIZE) {
++		printf("A733 SD: device tree register windows too small\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("sdpart", &idx, sizeof(idx));
++	PE_parse_boot_argn("sdforce", &force, sizeof(force));
++	PE_parse_boot_argn("sdclkdiv", &div_override, sizeof(div_override));
++
++	printf("A733 SD: mapping SMHC0 0x%lx and CCU 0x%lx\n", (unsigned long)reg[0], (unsigned long)ccu[0]);
++	sd.regs = ml_io_map(reg[0], SMHC_MAP_SIZE);
++	sd.ccu = ml_io_map(ccu[0], CCU_MAP_SIZE);
++	if (!sd.regs || !sd.ccu) {
++		return ENOMEM;
++	}
++
++	uint32_t clk = ccu_rd(CCU_SMHC0_CLK), bgr = ccu_rd(CCU_SMHC0_BGR);
++	printf("A733 SD: CCU SMHC0_CLK 0x%08x BGR 0x%08x\n", clk, bgr);
++	if ((bgr & (CCU_SMHC0_BGR_GATE | CCU_SMHC0_BGR_RESET)) != (CCU_SMHC0_BGR_GATE | CCU_SMHC0_BGR_RESET)) {
++		printf("A733 SD: SMHC0 bus clock gated or in reset; U-Boot did not leave it running\n");
++		return ENXIO;
++	}
++	sd.mod_hz = a733sd_ccu_mod_hz(clk);
++	if (sd.mod_hz == 0 || sd.mod_hz > SD_MOD_MAX_HZ) {
++		printf("A733 SD: unusable SMHC0 module clock (%llu Hz)\n", sd.mod_hz);
++		return ENXIO;
++	}
++	sd.ident_div = a733sd_pick_div(sd.mod_hz, SD_IDENT_HZ);
++	if (sd.ident_div > CLKCR_DIV_MASK) {
++		sd.ident_div = CLKCR_DIV_MASK;  /* 2x mode keeps it <= 400 kHz up to SD_MOD_MAX_HZ */
++	}
++	sd.xfer_div = a733sd_pick_div(sd.mod_hz, SD_DS_HZ);
++	if (div_override <= CLKCR_DIV_MASK) {
++		sd.xfer_div = div_override;
++	}
++	if (sd.xfer_div > CLKCR_DIV_MASK) {
++		sd.xfer_div = CLKCR_DIV_MASK;
++	}
++
++	printf("A733 SD: SMHC version 0x%x, GCTRL 0x%08x CLKCR 0x%08x NTSR 0x%08x STAS 0x%08x\n",
++	    smhc_rd(SMHC_VERS), smhc_rd(SMHC_GCTRL), smhc_rd(SMHC_CLKCR), smhc_rd(SMHC_NTSR),
++	    smhc_rd(SMHC_STAS));
++	printf("A733 SD: module clock %llu Hz; identification div %u (<= %llu Hz), transfer div %u (<= %llu Hz)\n",
++	    sd.mod_hz, sd.ident_div, a733sd_card_hz_max(sd.mod_hz, sd.ident_div),
++	    sd.xfer_div, a733sd_card_hz_max(sd.mod_hz, sd.xfer_div));
++
++	lck_mtx_lock(&a733_sd_lock);
++	error = smhc_reset();
++	if (error) {
++		printf("A733 SD: controller reset timed out (GCTRL 0x%08x)\n", smhc_rd(SMHC_GCTRL));
++		lck_mtx_unlock(&a733_sd_lock);
++		return error;
++	}
++
++	for (int attempt = 0; attempt < 2; attempt++) {
++		error = sd_identify();
++		if (!error) {
++			break;
++		}
++		printf("A733 SD: card initialisation attempt %d failed: %d\n", attempt + 1, error);
++		smhc_reset();
++	}
++	if (!error) {
++		printf("A733 SD: card RCA 0x%04x, %llu MiB, %s bus\n", sd.rca,
++		    sd.card_sectors >> 11, sd.wide ? "4-bit" : "1-bit");
++		error = sd_find_partition(idx);
++	}
++	struct a733sd_hfs hfs = { 0 };
++	int hfs_error = ENXIO;
++	if (!error) {
++		error = sd_read(sd.part.start + 2, 1, sd_bounce);
++		if (!error) {
++			hfs_error = a733sd_hfs_check((const uint8_t *)sd_bounce, sd.part.count, &hfs);
++		}
++	}
++	lck_mtx_unlock(&a733_sd_lock);
++	if (error) {
++		return error;
++	}
++
++	printf("A733 SD: partition %u: %s%s%s start sector %llu, %llu MiB\n", idx,
++	    sd.part.mbr_type ? "MBR" : "GPT", sd.part.name[0] ? " " : "", sd.part.name,
++	    sd.part.start, sd.part.count >> 11);
++	if (hfs_error == 0) {
++		printf("A733 SD: %s volume v%u, %u x %u bytes, %s%s\n",
++		    hfs.signature == HFS_SIG_X ? "HFSX" : "HFS+", hfs.version, hfs.total_blocks,
++		    hfs.block_size, (hfs.attributes & HFS_ATTR_UNMOUNTED) ? "cleanly unmounted" : "NOT cleanly unmounted",
++		    (hfs.attributes & HFS_ATTR_JOURNALED) ? ", journaled" : "");
++	} else {
++		printf("A733 SD: partition %u: %s (signature 0x%04x)\n", idx,
++		    hfs.signature == HFS_SIG_WRAPPER ? "HFS wrapper volume, unsupported" :
++		    hfs_error == EFBIG ? "HFS+ volume larger than the partition" : "no HFS+/HFSX volume header",
++		    hfs.signature);
++		if (!force) {
++			return EFTYPE;
++		}
++		printf("A733 SD: sdforce=1, exposing the partition anyway\n");
++	}
++
++	sd.secsize = DEV_BSIZE;
++	sd.bmajor = bdevsw_add(-1, &a733_sd_bdevsw);
++	if (sd.bmajor < 0) {
++		return ENXIO;
++	}
++	sd.cmajor = cdevsw_add_with_bdev(-1, &a733_sd_cdevsw, sd.bmajor);
++	if (sd.cmajor < 0) {
++		return ENXIO;
++	}
++	sd.bdev = makedev(sd.bmajor, 0);
++	devfs_make_node(sd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "sdroot0");
++	devfs_make_node(makedev(sd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rsdroot0");
++	sd.next_report = 64ull << 20;
++	sd.ready = true;
++	printf("A733 SD: sdroot0 ready, read-only PIO\n");
++	return 0;
++}
++
++/* Root device for rd=sdroot0 (IOFindBSDRoot). */
++int a733_sd_rootdev(dev_t *dev);
++
++int
++a733_sd_rootdev(dev_t *dev)
++{
++	if (!sd.ready) {
++		int error = a733_sd_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = sd.bdev;
++	return 0;
++}
++#endif /* !A733_SD_HOST_TEST */
++#endif /* ARM64_BOARD_CONFIG_SWEET || A733_SD_HOST_TEST */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 252ca45..6daaa6e 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -769,6 +769,27 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++//
++//	A733: root on a partition of the microSD card in SMHC0 (bsd/dev/a733_sdmmc.c)
++//
++	if (strcmp(rdBootVar, "sdroot0") == 0) {
++		extern int a733_sd_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		IOLog("A733 ROOT: rd=sdroot0, starting the SMHC0 microSD PIO driver
++");
++		int sd_error = a733_sd_rootdev(root);
++		if (sd_error) {
++			panic("IOFindBSDRoot: A733 microSD root %s unavailable: %d", rdBootVar, sd_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d
++", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)

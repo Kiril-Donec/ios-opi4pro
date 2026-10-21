@@ -45,6 +45,14 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 
 **v17 build result (20 October 2026):** [GitHub Actions run #39488689426](https://github.com/Kiril-Donec/ios-opi4pro/actions/runs/39488689426) passed XNU compilation for `-mcpu=cortex-a76`, the new PAN-related Mach-O checks, static PID 1 build, macOS HFSX RAM-root creation, and Ubuntu payload packaging. An offline 64-MiB AutoBoot test IMG was prepared from the v16 boot layout; its first 32 MiB match v16 byte-for-byte, and the new shorter payload (`25,471,456` bytes) was read back from ext4 and compared with CI. SHA-256 of the IMG is `9b0021366947a6054810caa40cfa4d8524dd7d8414f6b138533f124f51b01986`. The original v16 base is unchanged. The full `e2fsck` executable was unavailable for this offline repack; the readback check does not substitute for a complete filesystem check. **21 Oct update:** subsequent real-board HDMI photos confirm that v17 runs past the usercopy/open stall. The SHA-256 above identifies the earlier offline v17 IMG variant, not necessarily the exact image used in the photographed test.
 
+## Experimental v18 follow-up (21 October 2026; hardware test pending)
+
+The successful v17 single-core XNU kernel and Stage0 are intentionally **unchanged**. The only image change is the 16,635-byte **test PID 1 Mach-O** `/sbin/launchd` inside the HFSX RAM root, built from [`a733/src/a733-init-v18.S`](a733/src/a733-init-v18.S). The v18 userspace now tests `open`, `read` of its own Mach-O header into user stack memory, validates magic `0xfeedfacf`, tests `close`, and expects `ENOENT` on a nonexistent path before reopening the console and resuming the heartbeat. This extends v17 without touching additional CPUs, XNU code or device drivers.
+
+**Locally prepared full 64-MiB AutoBoot IMG** (based on the physically working v17 IMG) SHA-256: `0923c1e9eab7bf9fea87520ceed57acf9f166b18cfa0eb9ec165431797b500a7`. The original v17 IMG SHA-256 is `1fbf1b44a4efc0cb9bb4274f4d4c97f419eadf4a9b44af44afd8254afaedeab9`; only byte range `59534880..59551514` (16,635 bytes) changed. Mach-O ad-hoc signature code-page hashes and exact outside-region byte equality were verified offline. Our local Mach-O packager reproduced the old v17 test binary **byte-for-byte**, validating packaging compatibility. **No v18 physical boot, full ext4 fsck or completed CI run has yet been verified.** See [v18 hardware test notes](a733/V18-TEST-RU.md).
+
+Expected visible result after testing: `A733 V18 PASS: read(4B Mach-O) + close + ENOENT`, followed by `A733 init: still alive`. Otherwise look for `A733 V18 FAIL: ...` or the last kernel syscall trace.
+
 ## Current limitations
 
 **Historical v15 hardware result (stalled in user pathname copying; FIXED IN v17 for the test PID 1):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Use a spare microSD or an adequate backup before testing the offline-audited IMG.
@@ -64,6 +72,8 @@ The evidence below comes from photographed HDMI/serial-framebuffer output on an 
 - [`a733/xnu-a733-boot-trace.patch`](a733/xnu-a733-boot-trace.patch) — visible BSD/rootfs milestones.
 - [`a733/xnu-a733-pid1-trace.patch`](a733/xnu-a733-pid1-trace.patch) — **experimental** PID 1 exec/syscall tracing (requires a new kernel build and hardware verification).
 - [`a733/xnu-a733-pid1-v15-open.patch`](a733/xnu-a733-pid1-v15-open.patch) — PID1-only `open`/VFS tracepoints; board-tested, stopped at `copyinstr`.
+- [`a733/src/a733-init-v18.S`](a733/src/a733-init-v18.S) — v18 userspace probe for `read`/`close`/`ENOENT`, not yet board-tested.
+- [`a733/V18-TEST-RU.md`](a733/V18-TEST-RU.md) — v18 image hashes, test expectations and hardware-test precautions.
 - [`.github/workflows/xnu.yml`](.github/workflows/xnu.yml) — builds patched XNU on macOS, audits the Mach-O, compiles Stage0, creates and validates HFS+ RAM-root payloads.
 - [`.github/workflows/a733-stage0.yml`](.github/workflows/a733-stage0.yml) — Linux Stage0 tests.
 - [`xnu/patches/`](xnu/patches/) — upstream-derived XNU patch series.

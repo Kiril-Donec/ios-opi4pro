@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,6 +28,7 @@ KERNEL_HEADERS = (
     "sys/errno.h", "sys/proc.h", "sys/uio.h", "miscfs/devfs/devfs.h",
     "kern/locks.h", "kern/clock.h", "machine/machine_routines.h",
     "pexpert/pexpert.h", "pexpert/device_tree.h", "libkern/libkern.h",
+    "kern/sched_prim.h", "kdp/kdp_callout.h",
 )
 
 
@@ -96,7 +98,8 @@ class SdmmcPatch(unittest.TestCase):
 
     def test_patch_touches_only_expected_files(self) -> None:
         self.assertEqual(set(self.sections), {
-            "bsd/conf/files", "bsd/dev/a733_sdmmc.c", "iokit/bsddev/IOKitBSDInit.cpp"})
+            "bsd/conf/files", "bsd/dev/a733_sdmmc.c", "iokit/bsddev/IOKitBSDInit.cpp",
+            "osfmk/kern/debug.c"})
         for section in self.sections.values():
             check_hunk_counts(section)
         self.assertNotIn("\r", self.text)
@@ -110,6 +113,10 @@ class SdmmcPatch(unittest.TestCase):
         self.assertIn("+\t\tint sd_error = a733_sd_rootdev(root);", hook)
         self.assertIn("+\t\tgoto iofrootx;", hook)
         self.assertIn('+\t\tIOLog("A733 ROOT: rd=sdroot0, starting the SMHC0 microSD PIO driver\\n");', hook)
+        self.assertIn('PE_parse_boot_argn("a733sdlog", &sdlog, sizeof(sdlog)) && sdlog', hook)
+        panic = "\n".join(self.sections["osfmk/kern/debug.c"])
+        self.assertIn("+\t\ta733_sd_log_panic_flush();", panic)
+        self.assertIn(" \t\tPEHaltRestart(kPEPanicDiagnosticsDone);", panic)
 
     def test_no_string_literal_split_across_lines(self) -> None:
         # CI run 39673536036 failed on IOLog("...\n") whose \n had become a real newline.
@@ -124,11 +131,25 @@ class SdmmcPatch(unittest.TestCase):
         src = self.source
         self.assertTrue(src.startswith("/*"))
         self.assertIn("#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_SD_HOST_TEST)", src)
-        # Read-only: no write commands, every write entry point refuses.
-        for write_cmd in (r"smhc_cmd\(24\b", r"smhc_cmd\(25\b", r"smhc_cmd\(38\b", "CMD_WRITE"):
-            self.assertIsNone(re.search(write_cmd, src), write_cmd)
+        # The root disk stays read-only: every BSD write entry point refuses.
         self.assertIn("return (flags & FWRITE) ? EROFS : 0;", src)
         self.assertIn("error = EROFS;", src)
+        self.assertIsNone(re.search(r"\b(?:smhc_cmd|smhc_xfer)\((?:38|32|33|6, 0x8)", src))
+        # The one write command site is inside sd_write_log(), whose first
+        # statement after the declarations bounds the sectors to the log file.
+        writes = [m.start() for m in re.finditer(r"smhc_xfer\([^;]*\btrue\)", src)]
+        self.assertEqual(len(writes), 1)
+        func = src.rindex("\nsd_write_log(", 0, writes[0])
+        self.assertNotIn("\n}\n", src[func:writes[0]])
+        self.assertIn("lba < sdlog.first ||\n\t    lba + nblk > sdlog.first + sdlog.sectors", src[func:writes[0]])
+        self.assertIn("return EPERM;", src[func:writes[0]])
+        callers = re.findall(r"(\w+)\(sdlog\.first[^;]*sdlog_buf\)", src)
+        self.assertEqual(callers, ["sd_write_log", "sd_write_log"])
+        code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+        self.assertEqual(len(re.findall(r"\bsd_write_log\(", code)), 3)  # definition + 2 calls
+        # The log file must be contiguous and must not overlap the root.
+        self.assertIn("is fragmented at cluster", src)
+        self.assertIn("overlaps the log file", src)
         # The CCU and pin controller are only read.
         self.assertNotIn("ccu_wr", src)
         self.assertIsNone(re.search(r"\*\(volatile uint32_t \*\)\(sd\.ccu[^;]*\) =", src))
@@ -140,18 +161,74 @@ class SdmmcPatch(unittest.TestCase):
         # Boot partition is never the default root.
         self.assertIn("uint32_t idx = 2,", src)
 
+    def build_logic(self, tmp: str) -> Path:
+        src = Path(tmp, "a733_sdmmc.c")
+        src.write_text(self.source)
+        exe = Path(tmp, "test_sdmmc_logic")
+        subprocess.run([CC, "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-function", "-DA733_SD_HOST_TEST",
+                        "-include", str(src), str(TESTS / "test_sdmmc_logic.c"),
+                        "-o", str(exe)], check=True)
+        return exe
+
     @unittest.skipUnless(CC, "no host C compiler")
     def test_helpers_host(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp, "a733_sdmmc.c")
-            src.write_text(self.source)
-            exe = Path(tmp, "test_sdmmc_logic")
-            subprocess.run([CC, "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
-                            "-Wno-unused-function", "-DA733_SD_HOST_TEST",
-                            "-include", str(src), str(TESTS / "test_sdmmc_logic.c"),
-                            "-o", str(exe)], check=True)
-            out = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
+            out = subprocess.run([str(self.build_logic(tmp))], check=True, capture_output=True, text=True)
             self.assertIn("PASS", out.stdout)
+
+    @unittest.skipUnless(CC and shutil.which("mkfs.fat") and shutil.which("mcopy") and shutil.which("mdel") and shutil.which("mdir"),
+                         "needs a C compiler, mkfs.fat (dosfstools) and mtools")
+    def test_log_finder_on_real_fat32_image(self) -> None:
+        """The driver's own a733sd_fat_find_log() on images made by mkfs.fat + mtools."""
+        sys.path.insert(0, str(A733 / "tools"))
+        import a733_sdlog
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = self.build_logic(tmp)
+            log = Path(tmp, "A733LOG.TXT")
+            a733_sdlog.prepare(log, 1, False)
+            small = Path(tmp, "SMALL.TXT")
+            small.write_bytes(b"x" * 4096)
+
+            def image(name: str) -> Path:
+                img = Path(tmp, name)
+                subprocess.run(["mkfs.fat", "-F", "32", "-s", "1", "-n", "A733LOG", "-C", str(img), "40000"],
+                               check=True, capture_output=True)
+                return img
+
+            def mcopy(img: Path, src: Path, dst: str) -> None:
+                subprocess.run(["mcopy", "-i", str(img), str(src), "::" + dst], check=True)
+
+            # Contiguous file after another file: found, at the right sector.
+            img = image("ok.img")
+            mcopy(img, small, "README.TXT")
+            mcopy(img, log, "A733LOG.TXT")
+            out = subprocess.run([str(exe), str(img)], capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stdout)
+            m = re.search(r"FOUND sector (\d+) size (\d+)", out.stdout)
+            self.assertIsNotNone(m, out.stdout)
+            sector, size = int(m.group(1)), int(m.group(2))
+            self.assertEqual(size, 1 << 20)
+            with img.open("rb") as f:
+                f.seek(sector * 512)
+                self.assertEqual(f.read(1 << 20), log.read_bytes())
+
+            # Free space = a 64 KiB hole left by a deleted file + a tail smaller
+            # than the log, so the log must be split: it has to be refused.
+            img = image("frag.img")
+            hole = Path(tmp, "HOLE.BIN")
+            hole.write_bytes(b"h" * (64 << 10))
+            mcopy(img, hole, "A.BIN")
+            mdir = subprocess.run(["mdir", "-i", str(img), "::"], check=True, capture_output=True, text=True)
+            free = int(re.search(r"([\d ]+) bytes free", mdir.stdout).group(1).replace(" ", ""))
+            filler = Path(tmp, "FILL.BIN")
+            filler.write_bytes(b"f" * ((free - (1 << 20) + (32 << 10)) // 512 * 512))
+            mcopy(img, filler, "B.BIN")
+            subprocess.run(["mdel", "-i", str(img), "::A.BIN"], check=True)
+            mcopy(img, log, "A733LOG.TXT")
+            out = subprocess.run([str(exe), str(img)], capture_output=True, text=True)
+            self.assertNotEqual(out.returncode, 0, out.stdout)
+            self.assertRegex(out.stdout, r"ERROR 22 bad_cluster [1-9]")
 
     @unittest.skipUnless(CC, "no host C compiler")
     def test_kernel_part_syntax(self) -> None:

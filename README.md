@@ -75,7 +75,7 @@ The [A733 Apple Device Tree generator](a733/tools/mkadt_a733.py) has a fail-clos
 
 ## In progress: microSD root driver (source only, NOT board-tested)
 
-[`a733/xnu-a733-sdmmc.patch`](a733/xnu-a733-sdmmc.patch) adds a read-only, polled-PIO XNU driver for the A733 SMHC0 microSD controller (`bsd/dev/a733_sdmmc.c`, root with `rd=sdroot0`). It reuses U-Boot's clock/pin/voltage setup, re-identifies the card, reads 512-byte sectors with CMD17/CMD18 and exposes MBR/GPT partition 2 (HFS+ checked) to the BSD layer, so the full 16-GiB iOS 16.7.16 volume can live on the card while kernel updates only replace the small payload. Host tests and `git apply` against the exact CI tree pass; **no XNU build with it has run on hardware yet**. See [SDMMC-ROOT-RU.md](a733/SDMMC-ROOT-RU.md).
+[`a733/xnu-a733-sdmmc.patch`](a733/xnu-a733-sdmmc.patch) adds a read-only, polled-PIO XNU driver for the A733 SMHC0 microSD controller (`bsd/dev/a733_sdmmc.c`, root with `rd=sdroot0`). It reuses U-Boot's clock/pin/voltage setup, re-identifies the card, reads 512-byte sectors with CMD17/CMD18 and exposes MBR/GPT partition 2 (HFS+ checked) to the BSD layer, so the full 16-GiB iOS 16.7.16 volume can live on the card while kernel updates only replace the small payload. Host tests and `git apply` against the exact CI tree pass, and the real XNU build with it succeeds in CI; **it has not run on hardware yet**. It can also save the whole console to `A733LOG.TXT` on a FAT32 partition of the card (every 5 s and on panic), so test results no longer need HDMI photos. See [SDMMC-ROOT-RU.md](a733/SDMMC-ROOT-RU.md).
 
 ## Current limitations
 

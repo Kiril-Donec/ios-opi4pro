@@ -106,3 +106,9 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - Host checks only: helper/unit tests (gcc + clang), kernel-part `-fsyntax-only -Werror` against
   XNU-signature stubs, `git apply --check` on the exact CI tree. The macOS workflow refuses a kernel
   without the `A733 SD: sdroot0 ready, read-only PIO` marker. v22 (`rd=md0`) is unchanged for rollback.
+- Real XNU build with the driver: CI run 39674728308 SUCCESS (commit dfb6b21; the first run 39673536036
+  failed on broken `\n` escapes in the IOFindBSDRoot hook, fixed). Branch renamed `topaz` -> `opi4pro`.
+- Console log to the card: all console output (ring from boot) is written to a contiguous `A733LOG.TXT`
+  on a FAT32 partition every 5 s and twice during a panic; the only write path is bounded to that file.
+  PC tool `a733/tools/a733_sdlog.py` (prepare/show/clear). `a733sdlog=1` enables it with `rd=md0` too.
+  FAT lookup verified on real mkfs.fat/mtools images; card writes NOT verified on the board.

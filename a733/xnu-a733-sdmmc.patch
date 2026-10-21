@@ -12,12 +12,12 @@ index 21cdb5c..b67565c 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a733_sdmmc.c b/bsd/dev/a733_sdmmc.c
 new file mode 100644
-index 0000000..f84d2dd
+index 0000000..ca41219
 --- /dev/null
 +++ b/bsd/dev/a733_sdmmc.c
-@@ -0,0 +1,1233 @@
+@@ -0,0 +1,1798 @@
 +/*
-+ * Allwinner A733 microSD root device (SMHC0), polled PIO, read-only.
++ * Allwinner A733 microSD root device (SMHC0), polled PIO, read-only root.
 + *
 + * U-Boot loads our payload from this card, so the SMHC0 bus clock, reset,
 + * module clock, PF0-PF5 pin functions and pad voltage are already set up.
@@ -27,7 +27,14 @@ index 0000000..f84d2dd
 + * through the FIFO with CMD17/CMD18, one command at a time, no IDMAC and no
 + * interrupts. A partition of the card (MBR or GPT, boot-arg sdpart=, default
 + * 2) is exposed as the BSD disk sdroot0 (rsdroot0); root on it with
-+ * rd=sdroot0. Writes are refused.
++ * rd=sdroot0. Writes to it are refused.
++ *
++ * Console log: if a FAT32 partition holds a contiguous A733LOG.TXT (made on
++ * the PC by a733/tools/a733_sdlog.py), all console output since the start of
++ * boot is written into that file every a733logsecs seconds (default 5) and
++ * once more during a panic. sd_write_log() is the only write path and only
++ * accepts sectors inside that file. a733log=0 disables it; a733sdlog=1 also
++ * starts it when the root is not on the card (e.g. rd=md0).
 + *
 + * Register layout and clock rules follow the Orange Pi A733 vendor kernel
 + * (bsp/drivers/mmc/sunxi-mmc*.c, "allwinner,sunxi-mmc-v5p3x"), mainline
@@ -37,7 +44,8 @@ index 0000000..f84d2dd
 + *
 + * Boot-args: sdpart=N (1-based MBR/GPT index, default 2), sdforce=1 (accept
 + * a partition without an HFS+ volume header), sdclkdiv=N (override the
-+ * transfer clock divider), sd4bit=0 (stay on a 1-bit bus).
++ * transfer clock divider), sd4bit=0 (stay on a 1-bit bus), a733log=0,
++ * a733logsecs=N, a733sdlog=1.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_SD_HOST_TEST)
 +
@@ -58,8 +66,17 @@ index 0000000..f84d2dd
 +#include <pexpert/device_tree.h>
 +#include <libkern/libkern.h>
 +
++#include <kern/sched_prim.h>
++#include <kdp/kdp_callout.h>
++
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++/* Console ring, bsd/dev/sweet_ufs.c (filled by _cnputs from the start of boot) */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
++extern uint64_t sweet_log_position(void);
 +#else
 +#include <errno.h>
 +#include <stdbool.h>
@@ -115,6 +132,7 @@ index 0000000..f84d2dd
 +#define CMD_LONG_RESPONSE       (1u << 7)
 +#define CMD_CHECK_RESPONSE_CRC  (1u << 8)
 +#define CMD_DATA_EXPIRE         (1u << 9)
++#define CMD_WRITE               (1u << 10)
 +#define CMD_SEND_AUTO_STOP      (1u << 12)
 +#define CMD_WAIT_PRE_OVER       (1u << 13)
 +#define CMD_STOP_ABORT          (1u << 14)
@@ -424,6 +442,177 @@ index 0000000..f84d2dd
 +	return 0;
 +}
 +
++/*
++ * Console log file: A733LOG.TXT in the root directory of a FAT32 partition
++ * (a733/tools/a733_sdlog.py creates it on the PC). Only the file's own data
++ * sectors are ever written, never FAT metadata, so Windows can open it.
++ */
++#define FAT_LOG_NAME            "A733LOG TXT"   /* 8.3 directory entry name */
++#define FAT_EOC                 0x0ffffff8u
++#define FAT_ATTR_VOLUME         0x08u
++#define FAT_ATTR_DIR            0x10u
++#define FAT_ATTR_LFN            0x0fu
++
++struct a733sd_fat {
++	uint32_t sectors_per_cluster;
++	uint32_t fat_start;             /* partition sector of FAT #1 */
++	uint32_t data_start;            /* partition sector of cluster 2 */
++	uint32_t root_cluster;
++	uint32_t clusters;              /* data clusters */
++};
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | p[1] << 8);
++}
++
++/* FAT32 boot sector (partition sector 0). Returns 0 or EFTYPE. */
++static int
++a733sd_fat32_parse(const uint8_t *bs, uint64_t part_sectors, struct a733sd_fat *f)
++{
++	uint32_t spc = bs[13], reserved = le16(bs + 14), nfats = bs[16];
++	uint32_t total = le16(bs + 19) ? le16(bs + 19) : le32(bs + 32);
++	uint32_t fatsz = le32(bs + 36);
++
++	if (bs[510] != 0x55 || bs[511] != 0xaa || le16(bs + 11) != SD_SECTOR ||
++	    spc == 0 || (spc & (spc - 1)) || spc > 128 || reserved == 0 || nfats == 0 || nfats > 2 ||
++	    le16(bs + 17) != 0 || le16(bs + 22) != 0 || fatsz == 0 || total == 0 || total > part_sectors) {
++		return EFTYPE;
++	}
++	uint64_t data_start = (uint64_t)reserved + (uint64_t)nfats * fatsz;
++	if (data_start >= total) {
++		return EFTYPE;
++	}
++	f->sectors_per_cluster = spc;
++	f->fat_start = reserved;
++	f->data_start = (uint32_t)data_start;
++	f->clusters = (uint32_t)((total - data_start) / spc);
++	f->root_cluster = le32(bs + 44) & 0x0fffffffu;
++	if (f->clusters < 65525 || f->root_cluster < 2 || f->root_cluster >= f->clusters + 2 ||
++	    (uint64_t)fatsz * (SD_SECTOR / 4) < (uint64_t)f->clusters + 2) {
++		return EFTYPE;
++	}
++	return 0;
++}
++
++static uint64_t
++a733sd_fat_cluster_sector(const struct a733sd_fat *f, uint32_t cluster)
++{
++	return f->data_start + (uint64_t)(cluster - 2) * f->sectors_per_cluster;
++}
++
++/* Entry for cluster in the FAT sector that holds it. */
++static uint32_t
++a733sd_fat_entry(const uint8_t *fat_sector, uint32_t cluster)
++{
++	return le32(fat_sector + (cluster % (SD_SECTOR / 4)) * 4) & 0x0fffffffu;
++}
++
++/*
++ * Look for the log file in one directory sector. Returns 0 (found), ENOENT
++ * (end of directory reached) or EAGAIN (not in this sector).
++ */
++static int
++a733sd_fat_dir_find(const uint8_t *sec, uint32_t *cluster, uint32_t *size)
++{
++	for (unsigned i = 0; i < SD_SECTOR / 32; i++) {
++		const uint8_t *e = sec + 32 * i;
++		if (e[0] == 0x00) {
++			return ENOENT;
++		}
++		if (e[0] == 0xe5 || (e[11] & FAT_ATTR_LFN) == FAT_ATTR_LFN ||
++		    (e[11] & (FAT_ATTR_VOLUME | FAT_ATTR_DIR))) {
++			continue;
++		}
++		if (memcmp(e, FAT_LOG_NAME, 11) == 0) {
++			*cluster = ((uint32_t)le16(e + 20) << 16 | le16(e + 26)) & 0x0fffffffu;
++			*size = le32(e + 28);
++			return 0;
++		}
++	}
++	return EAGAIN;
++}
++
++typedef int (*a733sd_read_fn)(void *ctx, uint64_t sector, uint8_t *buf);
++
++#define LOG_MIN_BYTES           (256u << 10)
++
++/*
++ * Locate A733LOG.TXT on the FAT32 volume at partition sector 0 using rd for
++ * 512-byte sector reads (relative to the partition). On success *first is
++ * the partition sector of the file's first byte and *size its length.
++ * Returns 0, ENODEV (not FAT32), ENOENT (no file), EIO, or EINVAL (too
++ * small, out of range, or fragmented: then *bad_cluster != 0). The file
++ * must be one contiguous cluster run so that writes never need the FAT.
++ */
++static int
++a733sd_fat_find_log(a733sd_read_fn rd, void *ctx, uint64_t part_sectors, uint8_t *sec,
++    uint64_t *first, uint32_t *size, uint32_t *bad_cluster)
++{
++	struct a733sd_fat fat;
++	uint32_t cluster, start = 0;
++	uint64_t fat_cached = UINT64_MAX;
++	int error;
++
++	*bad_cluster = 0;
++	if (rd(ctx, 0, sec) || a733sd_fat32_parse(sec, part_sectors, &fat)) {
++		return ENODEV;
++	}
++	/* Root directory: walk its cluster chain (bounded). */
++	cluster = fat.root_cluster;
++	error = EAGAIN;
++	for (unsigned hops = 0; hops < 64 && error == EAGAIN; hops++) {
++		for (uint32_t s = 0; s < fat.sectors_per_cluster && error == EAGAIN; s++) {
++			if (rd(ctx, a733sd_fat_cluster_sector(&fat, cluster) + s, sec)) {
++				return EIO;
++			}
++			error = a733sd_fat_dir_find(sec, &start, size);
++		}
++		if (error != EAGAIN) {
++			break;
++		}
++		if (rd(ctx, fat.fat_start + cluster / (SD_SECTOR / 4), sec)) {
++			return EIO;
++		}
++		cluster = a733sd_fat_entry(sec, cluster);
++		if (cluster < 2 || cluster >= FAT_EOC) {
++			error = ENOENT;
++		}
++	}
++	if (error) {
++		return ENOENT;
++	}
++	uint32_t cbytes = fat.sectors_per_cluster * SD_SECTOR;
++	uint32_t nclusters = (uint32_t)(((uint64_t)*size + cbytes - 1) / cbytes);
++	if (*size < LOG_MIN_BYTES || start < 2 || start >= fat.clusters + 2) {
++		return EINVAL;
++	}
++	for (uint32_t c = start; c < start + nclusters; c++) {
++		if (c >= fat.clusters + 2) {
++			*bad_cluster = c;       /* a contiguous run would pass the volume end */
++			return EINVAL;
++		}
++		uint64_t fs = fat.fat_start + c / (SD_SECTOR / 4);
++		if (fs != fat_cached) {
++			if (rd(ctx, fs, sec)) {
++				return EIO;
++			}
++			fat_cached = fs;
++		}
++		uint32_t next = a733sd_fat_entry(sec, c);
++		if (c + 1 < start + nclusters ? next != c + 1 : next < FAT_EOC) {
++			*bad_cluster = c;
++			return EINVAL;
++		}
++	}
++	*first = a733sd_fat_cluster_sector(&fat, start);
++	if (*first + *size / SD_SECTOR > part_sectors) {
++		return EINVAL;
++	}
++	return 0;
++}
++
 +#ifndef A733_SD_HOST_TEST
 +
 +static struct {
@@ -619,12 +808,42 @@ index 0000000..f84d2dd
 +}
 +
 +/*
-+ * One command; with dst, read nblk sectors (auto CMD12 when nblk > 1).
-+ * resp[0..3] = RESP0..RESP3 (R2: bits 31:0 .. 127:96).
++ * Feed words 32-bit words of write data into the FIFO, checking FIFO_FULL
++ * before each word (U-Boot does the same: the FIFO depth is not needed).
 + */
 +static int
-+smhc_cmd(uint32_t idx, uint32_t arg, uint32_t rt, uint32_t *resp, uint32_t *dst, uint32_t nblk)
++smhc_pio_write(const uint32_t *src, uint32_t words, uint64_t deadline)
 +{
++	uint32_t i = 0;
++	while (i < words) {
++		if (smhc_rd(SMHC_STAS) & STAS_FIFO_FULL) {
++			uint32_t r = smhc_rd(SMHC_RINTR);
++			if (r & RINT_ERRORS) {
++				sd.last_rint = r;
++				return (r & (RINT_RESP_TIMEOUT | RINT_DATA_TIMEOUT)) ? ETIMEDOUT : EIO;
++			}
++			if (mach_absolute_time() > deadline) {
++				sd.last_rint = r;
++				return ETIMEDOUT;
++			}
++			continue;
++		}
++		smhc_wr(SMHC_FIFO, src[i++]);
++	}
++	return 0;
++}
++
++/*
++ * One command; with buf, transfer nblk sectors (auto CMD12 when nblk > 1),
++ * from the card when !write, to it when write. Writes wait for the card to
++ * release DATA0 (programming busy). resp[0..3] = RESP0..RESP3 (R2: bits
++ * 31:0 .. 127:96).
++ */
++static int
++smhc_xfer(uint32_t idx, uint32_t arg, uint32_t rt, uint32_t *resp, uint32_t *buf, uint32_t nblk,
++    bool write)
++{
++	uint32_t *dst = buf;
 +	uint32_t cmd = CMD_START | idx;
 +	int error;
 +
@@ -655,6 +874,10 @@ index 0000000..f84d2dd
 +		if (nblk > 1) {
 +			cmd |= CMD_SEND_AUTO_STOP;
 +		}
++		if (write) {
++			cmd |= CMD_WRITE;
++			rt |= RT_BUSY;
++		}
 +		smhc_wr(SMHC_GCTRL, smhc_rd(SMHC_GCTRL) | GCTRL_FIFO_RESET);
 +		(void)smhc_wait_clear(SMHC_GCTRL, GCTRL_FIFO_RESET, 10);
 +		smhc_wr(SMHC_BLKSZ, SD_SECTOR);
@@ -663,12 +886,17 @@ index 0000000..f84d2dd
 +	smhc_wr(SMHC_CARG, arg);
 +	smhc_wr(SMHC_CMDR, cmd);
 +
-+	error = dst ? smhc_pio_read(dst, nblk * (SD_SECTOR / 4), deadline_ms(1000 + 2 * nblk)) : 0;
++	error = 0;
++	if (dst && write) {
++		error = smhc_pio_write(dst, nblk * (SD_SECTOR / 4), deadline_ms(1000 + 5 * nblk));
++	} else if (dst) {
++		error = smhc_pio_read(dst, nblk * (SD_SECTOR / 4), deadline_ms(1000 + 2 * nblk));
++	}
 +	if (!error) {
 +		error = smhc_wait_rint(RINT_COMMAND_DONE, 1000);
 +	}
 +	if (!error && dst) {
-+		error = smhc_wait_rint(nblk > 1 ? RINT_AUTO_CMD_DONE : RINT_DATA_OVER, 500);
++		error = smhc_wait_rint(nblk > 1 ? RINT_AUTO_CMD_DONE : RINT_DATA_OVER, write ? 3000 : 500);
 +	}
 +	if (!error && (rt & RT_BUSY)) {
 +		error = smhc_wait_clear(SMHC_STAS, STAS_CARD_DATA_BUSY, 3000);
@@ -691,6 +919,13 @@ index 0000000..f84d2dd
 +	}
 +	smhc_wr(SMHC_RINTR, 0xffffffffu);
 +	return error;
++}
++
++/* Command without data, or a read of nblk sectors into dst. */
++static int
++smhc_cmd(uint32_t idx, uint32_t arg, uint32_t rt, uint32_t *resp, uint32_t *dst, uint32_t nblk)
++{
++	return smhc_xfer(idx, arg, rt, resp, dst, nblk, false);
 +}
 +
 +static int
@@ -872,15 +1107,16 @@ index 0000000..f84d2dd
 +	return error;
 +}
 +
++/* Partition idx (1-based, MBR or GPT) into out; quiet for the log search. */
 +static int
-+sd_find_partition(unsigned idx)
++sd_get_partition(unsigned idx, struct a733sd_part *out, bool quiet)
 +{
 +	const uint8_t *b = (const uint8_t *)sd_bounce;
 +	int error = sd_read(0, 1, sd_bounce);
 +	if (error) {
 +		return error;
 +	}
-+	error = a733sd_mbr_part(b, idx, &sd.part);
++	error = a733sd_mbr_part(b, idx, out);
 +	if (error == EFTYPE) {
 +		uint64_t sector;
 +		uint32_t offset;
@@ -892,23 +1128,308 @@ index 0000000..f84d2dd
 +			error = sd_read(sector, 1, sd_bounce);
 +		}
 +		if (!error) {
-+			error = a733sd_gpt_entry(b + offset, &sd.part);
++			error = a733sd_gpt_entry(b + offset, out);
 +		}
 +		if (error) {
-+			printf("A733 SD: GPT partition %u unusable: %d\n", idx, error);
-+			return error ? error : ENXIO;
++			if (!quiet) {
++				printf("A733 SD: GPT partition %u unusable: %d\n", idx, error);
++			}
++			return error;
 +		}
 +	} else if (error) {
-+		printf("A733 SD: %s partition %u\n",
-+		    error == EINVAL ? "no MBR signature, cannot locate" : "MBR has no usable", idx);
++		if (!quiet) {
++			printf("A733 SD: %s partition %u\n",
++			    error == EINVAL ? "no MBR signature, cannot locate" : "MBR has no usable", idx);
++		}
 +		return ENOENT;
 +	}
-+	if (sd.part.start + sd.part.count > sd.card_sectors || sd.part.start < 1) {
++	if (out->start + out->count > sd.card_sectors || out->start < 1) {
 +		printf("A733 SD: partition %u (sector %llu + %llu) exceeds the card (%llu sectors)\n",
-+		    idx, sd.part.start, sd.part.count, sd.card_sectors);
++		    idx, out->start, out->count, sd.card_sectors);
 +		return EINVAL;
 +	}
 +	return 0;
++}
++
++static int
++sd_find_partition(unsigned idx)
++{
++	return sd_get_partition(idx, &sd.part, false);
++}
++
++/*
++ * Console log to A733LOG.TXT. The file holds a one-sector text header and
++ * then the console text: log byte n goes to data offset n % data_bytes
++ * (the file wraps when full). The newest text is followed by LOG_END_MARK.
++ * The console bytes come from the ring that _cnputs() fills from the first
++ * line of boot (sweet_log_append in bsd/dev/sweet_ufs.c).
++ */
++#define LOG_RING_BYTES          (4u << 20)      /* SWEET_LOG_SIZE */
++#define LOG_BUF_SECTORS         128u            /* 64 KiB per write command */
++#define LOG_SECS                5u
++#define LOG_END_MARK            "\n<<<<< A733 LOG END: newest line is above >>>>>\n"
++static struct {
++	bool ready;
++	bool failed;
++	bool written;                   /* header written at least once this boot */
++	uint64_t first;                 /* card sector of the file's first byte */
++	uint64_t sectors;               /* whole sectors of the file */
++	uint64_t data_bytes;            /* (sectors - 1) * 512 */
++	uint64_t flushed;               /* console bytes already on the card */
++	uint32_t lost;                  /* times the ring outran the flushes */
++	unsigned part;
++	uint32_t secs;
++} sdlog;
++
++static uint32_t sdlog_buf[LOG_BUF_SECTORS * SD_SECTOR / 4] __attribute__((aligned(64)));
++static int sdlog_chan;
++
++/*
++ * The only write path of this driver: nblk sectors at card sector lba,
++ * which must lie entirely inside the log file.
++ */
++static int
++sd_write_log(uint64_t lba, uint32_t nblk, const uint32_t *src)
++{
++	uint32_t r[4];
++	int error = EIO;
++
++	if (!sdlog.ready || nblk == 0 || nblk > SD_MAX_BLOCKS || lba < sdlog.first ||
++	    lba + nblk > sdlog.first + sdlog.sectors || lba + nblk > sd.card_sectors) {
++		return EPERM;
++	}
++	uint32_t arg = sd.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_SECTOR);
++	uint32_t r1_mask = R1_READ_ERRORS & ~(nblk > 1 ? R1_OUT_OF_RANGE : 0u);
++	for (int attempt = 0; attempt < 2; attempt++) {
++		r[0] = 0;
++		error = smhc_xfer(nblk > 1 ? 25 : 24, arg, RT_R1, r, (uint32_t *)(uintptr_t)src, nblk, true);
++		if (!error && (r[0] & r1_mask)) {
++			error = EIO;
++		}
++		/* Programming must end with the card back in the transfer state. */
++		uint64_t deadline = deadline_ms(1000);
++		uint32_t st[4] = { 0 };
++		int serr;
++		while (!(serr = smhc_cmd(13, sd.rca << 16, RT_R1, st, NULL, 0)) &&
++		    R1_STATE(st[0]) != R1_STATE_TRAN && mach_absolute_time() < deadline) {
++			if (R1_STATE(st[0]) == R1_STATE_RCV || R1_STATE(st[0]) == R1_STATE_DATA) {
++				(void)smhc_cmd(12, 0, RT_R1B, st, NULL, 0);
++			}
++			delay(100);
++		}
++		if (!error && (serr || R1_STATE(st[0]) != R1_STATE_TRAN || (st[0] & R1_READ_ERRORS))) {
++			error = EIO;
++		}
++		if (!error) {
++			return 0;
++		}
++	}
++	return error;
++}
++
++/* Write the console bytes not yet on the card, then the header sector. */
++static int
++sdlog_flush(void)
++{
++	uint8_t *buf = (uint8_t *)sdlog_buf;
++	uint64_t total = sweet_log_position();
++	uint64_t start = sdlog.flushed - sdlog.flushed % SD_SECTOR;
++	int error = 0;
++
++	if (!sdlog.ready || sdlog.failed) {
++		return 0;
++	}
++	if (sdlog.written && total == sdlog.flushed) {
++		return 0;               /* nothing new: spare the card */
++	}
++	if (total - start > LOG_RING_BYTES - SD_SECTOR) {
++		/* More output than the ring holds since the last flush: skip ahead. */
++		start = total - (LOG_RING_BYTES - SD_SECTOR);
++		start += (SD_SECTOR - start % SD_SECTOR) % SD_SECTOR;
++		sdlog.lost++;
++	}
++	do {
++		uint64_t off = start % sdlog.data_bytes;
++		uint32_t room = (uint32_t)MIN((uint64_t)sizeof(sdlog_buf), sdlog.data_bytes - off);
++		uint32_t n = (uint32_t)MIN(total - start, (uint64_t)room);
++		uint64_t pos = start;
++		uint32_t got = sweet_log_copy(&pos, (char *)buf, n);
++		if (got != n || pos != start + n) {
++			return EAGAIN;  /* the ring moved under us; retried next flush */
++		}
++		uint32_t len = n;
++		if (start + n == total) {
++			/* Newest text: end marker, then spaces to the sector end. */
++			uint32_t mark = (uint32_t)strlen(LOG_END_MARK);
++			uint32_t fit = MIN(mark, room - len);
++			memcpy(buf + len, LOG_END_MARK, fit);
++			len += fit;
++		}
++		uint32_t padded = (len + SD_SECTOR - 1) / SD_SECTOR * SD_SECTOR;
++		if (padded == 0) {
++			padded = SD_SECTOR;
++		}
++		memset(buf + len, ' ', padded - len);
++		error = sd_write_log(sdlog.first + 1 + off / SD_SECTOR, padded / SD_SECTOR, sdlog_buf);
++		if (error) {
++			return error;
++		}
++		start += n;
++	} while (start < total);
++
++	memset(buf, ' ', SD_SECTOR);
++	int h = snprintf((char *)buf, SD_SECTOR,
++	    "A733 XNU console log, Orange Pi 4 Pro. %llu bytes logged since boot%s%s.\n"
++	    "Find the line \"A733 LOG END\": the newest text is just above it.%s\n",
++	    total, total > sdlog.data_bytes ? ", file WRAPPED (older text continues after the END line)" : "",
++	    sdlog.lost ? ", some output was LOST (too much between flushes)" : "",
++	    total > sdlog.data_bytes ? " Use a733_sdlog.py show to read it in order." : "");
++	if (h > 0 && h < (int)SD_SECTOR) {
++		buf[h] = ' ';
++	}
++	buf[SD_SECTOR - 1] = '\n';
++	error = sd_write_log(sdlog.first, 1, sdlog_buf);
++	if (!error) {
++		sdlog.flushed = total;
++		sdlog.written = true;
++	}
++	return error;
++}
++
++struct sdlog_part_ctx {
++	uint64_t start;
++};
++
++/* buf is sd_bounce (word aligned), as passed to a733sd_fat_find_log() below. */
++static int
++sdlog_read_part(void *ctx, uint64_t sector, uint8_t *buf)
++{
++	return sd_read(((struct sdlog_part_ctx *)ctx)->start + sector, 1, (uint32_t *)(void *)buf);
++}
++
++/* Find A733LOG.TXT on FAT32 partition idx; 0 when usable. Lock held. */
++static int
++sdlog_find_on(unsigned idx)
++{
++	struct a733sd_part part;
++	uint64_t first = 0;
++	uint32_t size = 0, bad = 0;
++
++	if (sd_get_partition(idx, &part, true)) {
++		return ENOENT;
++	}
++	struct sdlog_part_ctx ctx = { .start = part.start };
++	int error = a733sd_fat_find_log(sdlog_read_part, &ctx, part.count, (uint8_t *)sd_bounce,
++	    &first, &size, &bad);
++	switch (error) {
++	case 0:
++		break;
++	case ENODEV:
++		return ENOENT;          /* not FAT32: ext4 boot partition, HFS+ root, ... */
++	case ENOENT:
++		printf("A733 LOG: FAT32 partition %u has no A733LOG.TXT\n", idx);
++		return ENOENT;
++	default:
++		if (bad) {
++			printf("A733 LOG: A733LOG.TXT is fragmented at cluster %u; recreate it with a733_sdlog.py\n", bad);
++		} else {
++			printf("A733 LOG: A733LOG.TXT on partition %u unusable (%d, %u bytes)\n", idx, error, size);
++		}
++		return EINVAL;
++	}
++	sdlog.first = part.start + first;
++	sdlog.sectors = size / SD_SECTOR;
++	sdlog.data_bytes = (sdlog.sectors - 1) * SD_SECTOR;
++	sdlog.part = idx;
++	return 0;
++}
++
++static void
++sdlog_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		(void)tsleep(&sdlog_chan, PZERO, "a733log", hz * (int)sdlog.secs);
++		lck_mtx_lock(&a733_sd_lock);
++		int error = sdlog_flush();
++		lck_mtx_unlock(&a733_sd_lock);
++		if (error && error != EAGAIN) {
++			sdlog.failed = true;
++			printf("A733 LOG: write to the card failed (%d), file logging stopped\n", error);
++			return;
++		}
++	}
++}
++
++/*
++ * Panic: no locks, no threads. Bring the controller back to a known state
++ * (it may have been interrupted mid-command) and write the log once more.
++ */
++void a733_sd_log_panic_flush(void);
++
++void
++a733_sd_log_panic_flush(void)
++{
++	if (!sdlog.ready || sdlog.failed) {
++		return;
++	}
++	uint32_t st[4] = { 0 };
++	smhc_reset();
++	(void)smhc_update_clk();
++	if (smhc_cmd(13, sd.rca << 16, RT_R1, st, NULL, 0) ||
++	    R1_STATE(st[0]) == R1_STATE_DATA || R1_STATE(st[0]) == R1_STATE_RCV) {
++		(void)smhc_cmd(12, 0, RT_R1B, st, NULL, 0);
++	}
++	int error = sdlog_flush();
++	if (error && error != EAGAIN) {
++		sdlog.failed = true;
++	}
++}
++
++static void
++sdlog_kdp_callout(__unused void *arg, kdp_event_t event)
++{
++	/* Early copy with the panic message; the backtrace follows later. */
++	if (event == KDP_EVENT_PANICLOG) {
++		a733_sd_log_panic_flush();
++	}
++}
++
++/* Search MBR/GPT partitions 1..8 for the log file and start logging. Lock held. */
++static void
++sdlog_setup(void)
++{
++	uint32_t on = 1;
++	PE_parse_boot_argn("a733log", &on, sizeof(on));
++	if (!on || sdlog.ready) {
++		return;
++	}
++	sdlog.secs = LOG_SECS;
++	PE_parse_boot_argn("a733logsecs", &sdlog.secs, sizeof(sdlog.secs));
++	if (sdlog.secs == 0 || sdlog.secs > 60) {
++		sdlog.secs = LOG_SECS;
++	}
++	for (unsigned idx = 1; idx <= 8 && !sdlog.ready; idx++) {
++		if (sdlog_find_on(idx) == 0) {
++			sdlog.ready = true;
++		}
++	}
++	if (!sdlog.ready) {
++		printf("A733 LOG: no FAT32 partition with A733LOG.TXT; console is NOT saved to the card\n");
++		return;
++	}
++	printf("A733 LOG: console saved to A733LOG.TXT on partition %u (%llu KiB, every %u s and on panic)\n",
++	    sdlog.part, sdlog.sectors / 2, sdlog.secs);
++	int error = sdlog_flush();
++	if (error && error != EAGAIN) {
++		sdlog.failed = true;
++		printf("A733 LOG: first write failed (%d), file logging disabled\n", error);
++		return;
++	}
++	kdp_register_callout(sdlog_kdp_callout, NULL);
++	thread_t thread;
++	if (kernel_thread_start(sdlog_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
 +}
 +
 +static int
@@ -1099,15 +1620,25 @@ index 0000000..f84d2dd
 +	.d_type       = D_DISK,
 +};
 +
++static bool sd_card_up;
++
++/*
++ * Map the controller, check what U-Boot left, identify the card and start
++ * the console log file if the card has one. Shared by rd=sdroot0 and the
++ * log-only mode (a733sdlog=1 with another root).
++ */
 +static int
-+a733_sd_init(void)
++a733_sd_card_init(void)
 +{
 +	DTEntry node;
 +	uintptr_t const *reg = NULL, *ccu = NULL;
 +	unsigned int size = 0, ccu_size = 0;
-+	uint32_t idx = 2, force = 0, div_override = 0xffffffffu;
++	uint32_t div_override = 0xffffffffu;
 +	int error;
 +
++	if (sd_card_up) {
++		return 0;
++	}
 +	if (SecureDTLookupEntry(NULL, "/a733-sdmmc", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
 +	    size < 2 * sizeof(uintptr_t) ||
@@ -1120,8 +1651,6 @@ index 0000000..f84d2dd
 +		printf("A733 SD: device tree register windows too small\n");
 +		return ENXIO;
 +	}
-+	PE_parse_boot_argn("sdpart", &idx, sizeof(idx));
-+	PE_parse_boot_argn("sdforce", &force, sizeof(force));
 +	PE_parse_boot_argn("sdclkdiv", &div_override, sizeof(div_override));
 +
 +	printf("A733 SD: mapping SMHC0 0x%lx and CCU 0x%lx\n", (unsigned long)reg[0], (unsigned long)ccu[0]);
@@ -1168,7 +1697,6 @@ index 0000000..f84d2dd
 +		lck_mtx_unlock(&a733_sd_lock);
 +		return error;
 +	}
-+
 +	for (int attempt = 0; attempt < 2; attempt++) {
 +		error = sd_identify();
 +		if (!error) {
@@ -1178,10 +1706,29 @@ index 0000000..f84d2dd
 +		smhc_reset();
 +	}
 +	if (!error) {
++		sd_card_up = true;
 +		printf("A733 SD: card RCA 0x%04x, %llu MiB, %s bus\n", sd.rca,
 +		    sd.card_sectors >> 11, sd.wide ? "4-bit" : "1-bit");
-+		error = sd_find_partition(idx);
++		/* Before the root checks: a root failure panics, the log keeps it. */
++		sdlog_setup();
 +	}
++	lck_mtx_unlock(&a733_sd_lock);
++	return error;
++}
++
++static int
++a733_sd_init(void)
++{
++	uint32_t idx = 2, force = 0;
++	int error = a733_sd_card_init();
++	if (error) {
++		return error;
++	}
++	PE_parse_boot_argn("sdpart", &idx, sizeof(idx));
++	PE_parse_boot_argn("sdforce", &force, sizeof(force));
++
++	lck_mtx_lock(&a733_sd_lock);
++	error = sd_find_partition(idx);
 +	struct a733sd_hfs hfs = { 0 };
 +	int hfs_error = ENXIO;
 +	if (!error) {
@@ -1193,6 +1740,11 @@ index 0000000..f84d2dd
 +	lck_mtx_unlock(&a733_sd_lock);
 +	if (error) {
 +		return error;
++	}
++	if (sdlog.ready && sd.part.start < sdlog.first + sdlog.sectors &&
++	    sdlog.first < sd.part.start + sd.part.count) {
++		printf("A733 SD: root partition %u overlaps the log file\n", idx);
++		return EINVAL;
 +	}
 +
 +	printf("A733 SD: partition %u: %s%s%s start sector %llu, %llu MiB\n", idx,
@@ -1247,13 +1799,26 @@ index 0000000..f84d2dd
 +	*dev = sd.bdev;
 +	return 0;
 +}
++
++/* a733sdlog=1 with any other root (e.g. v22 rd=md0): only the log file. */
++int a733_sd_log_only(void);
++
++int
++a733_sd_log_only(void)
++{
++	int error = a733_sd_card_init();
++	if (error) {
++		printf("A733 LOG: microSD not available (%d); console is NOT saved\n", error);
++	}
++	return error;
++}
 +#endif /* !A733_SD_HOST_TEST */
 +#endif /* ARM64_BOARD_CONFIG_SWEET || A733_SD_HOST_TEST */
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 252ca45..f65ade8 100644
+index 252ca45..95a12da 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -769,6 +769,25 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -769,6 +769,34 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  		}
  	}
  
@@ -1261,6 +1826,15 @@ index 252ca45..f65ade8 100644
 +//
 +//	A733: root on a partition of the microSD card in SMHC0 (bsd/dev/a733_sdmmc.c)
 +//
++	{
++		uint32_t sdlog = 0;
++		if (strcmp(rdBootVar, "sdroot0") != 0 &&
++		    PE_parse_boot_argn("a733sdlog", &sdlog, sizeof(sdlog)) && sdlog) {
++			extern int a733_sd_log_only(void);
++			IOLog("A733 ROOT: a733sdlog=1, saving the console to the microSD log file\n");
++			(void)a733_sd_log_only();
++		}
++	}
 +	if (strcmp(rdBootVar, "sdroot0") == 0) {
 +		extern int a733_sd_rootdev(dev_t *dev);
 +		OSSafeReleaseNULL(matching);
@@ -1279,3 +1853,19 @@ index 252ca45..f65ade8 100644
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  //
  //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..da99fde 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1402,6 +1402,11 @@ debugger_collect_diagnostics(unsigned int exception, unsigned int code, unsigned
+ 
+ 	if (debugger_current_op == DBOP_PANIC ||
+ 	    ((debugger_current_op == DBOP_DEBUGGER) && debugger_is_panic)) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* A733: panic message and backtraces are on the console now; save them to the microSD log. */
++		extern void a733_sd_log_panic_flush(void);
++		a733_sd_log_panic_flush();
++#endif
+ 		PEHaltRestart(kPEPanicDiagnosticsDone);
+ 	}
+ 

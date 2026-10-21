@@ -36,6 +36,8 @@ on:
       - "a733/tests/test_sdmmc_patch.py"
       - "a733/tests/test_sdmmc_logic.c"
       - "a733/tests/sdmmc_kernel_stubs.h"
+      - "a733/tests/test_sdlog_tool.py"
+      - "a733/tools/a733_sdlog.py"
       - "a733/tests/test_ios_display.py"
       - "a733/tools/adapt_xnu_a733.py"
       - "a733/tests/test_adapt_xnu.py"
@@ -255,6 +257,9 @@ jobs:
           if sd not in kernel:
               raise SystemExit("FAIL: A733 microSD overlay was SKIPPED; refusing to package rd=sdroot0 kernel")
           print("PASS: A733 SMHC0 microSD driver marker found in compiled XNU Mach-O")
+          if b"A733 LOG: console saved to A733LOG.TXT" not in kernel:
+              raise SystemExit("FAIL: microSD console log code missing from the compiled kernel")
+          print("PASS: A733 microSD console log code found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)
@@ -328,7 +333,7 @@ jobs:
           name: xnu-kernel
           path: kernel
       - name: Install AArch64 Stage0 toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu u-boot-tools hfsprogs
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu u-boot-tools hfsprogs dosfstools mtools
       - name: Compile and test A733 Stage0
         run: make -C a733 test adt all test-boot
       - name: Check opt-in A733 iOS display device tree and rotation
@@ -450,6 +455,7 @@ jobs:
             a733/build/a733-xnu-sdroot.payload.sha256
             a733/build/stage0.uimg
             a733/SDMMC-ROOT-RU.md
+            a733/tools/a733_sdlog.py
           if-no-files-found: error
           retention-days: 14
 

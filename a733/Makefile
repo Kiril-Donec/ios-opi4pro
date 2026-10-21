@@ -67,6 +67,7 @@ test: build/test_display
 	python3 tests/test_adapt_xnu.py
 	python3 tests/test_a76_probe_script.py
 	python3 -m unittest discover -s tests -p test_sdmmc_patch.py -v
+	python3 -m unittest discover -s tests -p test_sdlog_tool.py -v
 
 test-boot: all
 	python3 tests/test_boot_image.py

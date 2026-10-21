@@ -20,6 +20,10 @@ typedef long long int64_t;
 typedef unsigned long long uint64_t;
 typedef unsigned long uintptr_t;
 void *memcpy(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
+size_t strlen(const char *s);
+int snprintf(char *buf, size_t n, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+#define UINT64_MAX 0xffffffffffffffffull
 int memcmp(const void *a, const void *b, size_t n);
 
 typedef uintptr_t vm_offset_t;
@@ -35,6 +39,7 @@ struct uio;
 struct tty;
 
 #define EPERM 1
+#define EAGAIN 35
 #define ENOENT 2
 #define EIO 5
 #define ENXIO 6
@@ -157,3 +162,15 @@ typedef struct { int opaque; } lck_mtx_t;
 void lck_mtx_lock(lck_mtx_t *lck);
 void lck_mtx_unlock(lck_mtx_t *lck);
 #define __unused __attribute__((unused))
+
+/* osfmk/kern/kern_types.h, bsd/sys/proc.h, osfmk/kdp/kdp_callout.h */
+typedef int kern_return_t;
+#define KERN_SUCCESS 0
+typedef struct thread *thread_t;
+typedef int wait_result_t;
+typedef void (*thread_continue_t)(void *, wait_result_t);
+#define PZERO 22
+int tsleep(void *chan, int pri, const char *wmesg, int timo);
+typedef enum { KDP_EVENT_ENTER, KDP_EVENT_EXIT, KDP_EVENT_PANICLOG } kdp_event_t;
+typedef void (*kdp_callout_fn_t)(void *arg, kdp_event_t event);
+void kdp_register_callout(kdp_callout_fn_t fn, void *arg);

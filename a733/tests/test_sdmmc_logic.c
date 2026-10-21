@@ -216,18 +216,230 @@ test_hfs(void)
 	CHECK(a733sd_hfs_check(vh, part, &h) == EFTYPE && h.signature == 0x4244);
 }
 
-int
-main(void)
+/* In-memory FAT32 volume: 1 sector per cluster, 2 FATs, root at cluster 2. */
+#define VOL_CLUSTERS    70000u
+#define VOL_RESERVED    32u
+#define VOL_FATSZ       ((VOL_CLUSTERS + 2) * 4 / 512 + 1)
+#define VOL_DATA        (VOL_RESERVED + 2 * VOL_FATSZ)
+#define VOL_SECTORS     (VOL_DATA + VOL_CLUSTERS)
+
+struct vol {
+	uint8_t *img;
+	uint64_t sectors;
+	int reads;
+};
+
+static int
+vol_read(void *ctx, uint64_t sector, uint8_t *buf)
 {
+	struct vol *v = ctx;
+	v->reads++;
+	if (sector >= v->sectors) {
+		return EIO;
+	}
+	memcpy(buf, v->img + sector * 512, 512);
+	return 0;
+}
+
+static void
+vol_fat_set(struct vol *v, uint32_t cluster, uint32_t value)
+{
+	for (unsigned f = 0; f < 2; f++) {
+		put32(v->img + (VOL_RESERVED + f * VOL_FATSZ) * 512 + cluster * 4, value);
+	}
+}
+
+static uint8_t *
+vol_cluster(struct vol *v, uint32_t cluster)
+{
+	return v->img + (VOL_DATA + cluster - 2) * 512;
+}
+
+static void
+dirent(uint8_t *e, const char name[11], uint8_t attr, uint32_t cluster, uint32_t size)
+{
+	memcpy(e, name, 11);
+	e[11] = attr;
+	e[20] = (uint8_t)(cluster >> 16);
+	e[21] = (uint8_t)(cluster >> 24);
+	e[26] = (uint8_t)cluster;
+	e[27] = (uint8_t)(cluster >> 8);
+	put32(e + 28, size);
+}
+
+static void
+vol_make(struct vol *v, uint32_t file_clusters)
+{
+	v->sectors = VOL_SECTORS;
+	v->img = calloc(VOL_SECTORS, 512);
+	if (!v->img) {
+		abort();
+	}
+	uint8_t *bs = v->img;
+	bs[0] = 0xeb; bs[1] = 0x58; bs[2] = 0x90;
+	memcpy(bs + 3, "MSDOS5.0", 8);
+	bs[11] = 0x00; bs[12] = 0x02;                   /* 512 bytes per sector */
+	bs[13] = 1;                                     /* sectors per cluster */
+	bs[14] = VOL_RESERVED; bs[15] = 0;
+	bs[16] = 2;                                     /* FATs */
+	bs[21] = 0xf8;
+	put32(bs + 32, VOL_SECTORS);
+	put32(bs + 36, VOL_FATSZ);
+	put32(bs + 44, 2);                              /* root cluster */
+	memcpy(bs + 82, "FAT32   ", 8);
+	bs[510] = 0x55; bs[511] = 0xaa;
+	vol_fat_set(v, 0, 0x0ffffff8);
+	vol_fat_set(v, 1, 0x0fffffff);
+	vol_fat_set(v, 2, 0x0fffffff);                  /* root: one cluster */
+	uint8_t *root = vol_cluster(v, 2);
+	dirent(root, "LOGS       ", 0x08, 0, 0);       /* volume label */
+	root[32] = 0x41; root[32 + 11] = 0x0f;          /* long-name entry */
+	dirent(root + 64, "OLDLOG  TXT", 0x20, 100, 4096);
+	root[64] = 0xe5;                                /* deleted */
+	dirent(root + 96, "A733LOG TXT", 0x20, 3, file_clusters * 512);
+	for (uint32_t c = 3; c < 3 + file_clusters; c++) {
+		vol_fat_set(v, c, c + 1 < 3 + file_clusters ? c + 1 : 0x0fffffff);
+	}
+	memcpy(vol_cluster(v, 3), "A733 first sector", 17);
+}
+
+static void
+test_fat(void)
+{
+	struct vol v;
+	struct a733sd_fat f;
+	uint8_t sec[512];
+	uint64_t first = 0;
+	uint32_t size = 0, bad = 0;
+
+	vol_make(&v, 1024);                             /* 512 KiB log file */
+	CHECK(a733sd_fat32_parse(v.img, v.sectors, &f) == 0);
+	CHECK(f.sectors_per_cluster == 1 && f.fat_start == VOL_RESERVED && f.data_start == VOL_DATA &&
+	    f.root_cluster == 2 && f.clusters == VOL_CLUSTERS);
+	CHECK(a733sd_fat32_parse(v.img, v.sectors - 1, &f) == EFTYPE);    /* larger than partition */
+
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == 0);
+	CHECK(first == VOL_DATA + 1 && size == 1024 * 512 && bad == 0);
+	CHECK(memcmp(v.img + first * 512, "A733 first sector", 17) == 0);
+
+	/* The file entry in a second root directory cluster */
+	uint8_t *root = vol_cluster(&v, 2);
+	uint8_t entry[32];
+	memcpy(entry, root + 96, 32);
+	memset(root + 96, 0, 32);
+	root[96] = 'X';                                 /* keep the directory going */
+	memcpy(root + 96, "NOTES   TXT", 11);
+	for (unsigned i = 4; i < 16; i++) {
+		dirent(root + 32 * i, "FILLER  BIN", 0x20, 0, 0);
+	}
+	vol_fat_set(&v, 2, 5000);
+	vol_fat_set(&v, 5000, 0x0fffffff);
+	memcpy(vol_cluster(&v, 5000), entry, 32);
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == 0);
+	CHECK(first == VOL_DATA + 1);
+
+	/* Fragmented file: never written */
+	vol_fat_set(&v, 500, 6000);
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == EINVAL && bad == 500);
+	vol_fat_set(&v, 500, 501);
+	/* Chain longer than the size says: last cluster must be end of chain */
+	vol_fat_set(&v, 1026, 1027);
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == EINVAL && bad == 1026);
+	vol_fat_set(&v, 1026, 0x0fffffff);
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == 0);
+
+	/* Too small */
+	put32(vol_cluster(&v, 5000) + 28, 64 * 1024);
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == EINVAL && bad == 0);
+	put32(vol_cluster(&v, 5000) + 28, 1024 * 512);
+
+	/* No file, then not FAT32 at all */
+	vol_cluster(&v, 5000)[0] = 0xe5;
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == ENOENT);
+	v.img[510] = 0;
+	CHECK(a733sd_fat_find_log(vol_read, &v, v.sectors, sec, &first, &size, &bad) == ENODEV);
+	free(v.img);
+
+	/* Directory scan helper on its own */
+	uint8_t d[512] = { 0 };
+	dirent(d, "A733LOG TXT", 0x10, 9, 0);           /* a directory, not the file */
+	CHECK(a733sd_fat_dir_find(d, &bad, &size) == ENOENT);
+	memset(d, 0, sizeof(d));
+	for (unsigned i = 0; i < 16; i++) {
+		dirent(d + 32 * i, "OTHER   TXT", 0x20, 9, 1);
+	}
+	CHECK(a733sd_fat_dir_find(d, &bad, &size) == EAGAIN);
+}
+
+struct file_ctx {
+	FILE *f;
+	uint64_t base;
+};
+
+static int
+file_read(void *ctx, uint64_t sector, uint8_t *buf)
+{
+	struct file_ctx *c = ctx;
+	if (fseek(c->f, (long)((c->base + sector) * 512), SEEK_SET) != 0) {
+		return EIO;
+	}
+	return fread(buf, 1, 512, c->f) == 512 ? 0 : EIO;
+}
+
+/*
+ * test_sdmmc_logic IMAGE: find A733LOG.TXT with the driver's own code in a
+ * FAT32 image made by mkfs.fat + mcopy; print where it starts.
+ */
+static int
+image_mode(const char *path)
+{
+	struct file_ctx c = { fopen(path, "rb"), 0 };
+	uint8_t sec[512], head[32];
+	uint64_t first = 0;
+	uint32_t size = 0, bad = 0;
+
+	if (!c.f) {
+		perror(path);
+		return 2;
+	}
+	fseek(c.f, 0, SEEK_END);
+	uint64_t sectors = (uint64_t)ftell(c.f) / 512;
+	int error = a733sd_fat_find_log(file_read, &c, sectors, sec, &first, &size, &bad);
+	if (error) {
+		printf("ERROR %d bad_cluster %u\n", error, bad);
+		return 1;
+	}
+	if (file_read(&c, first, sec) != 0) {
+		return 1;
+	}
+	memcpy(head, sec, sizeof(head) - 1);
+	head[sizeof(head) - 1] = 0;
+	for (unsigned i = 0; i < sizeof(head) - 1; i++) {
+		if (head[i] < 0x20 || head[i] > 0x7e) {
+			head[i] = '.';
+		}
+	}
+	printf("FOUND sector %llu size %u head \"%s\"\n", (unsigned long long)first, size, head);
+	fclose(c.f);
+	return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc == 2) {
+		return image_mode(argv[1]);
+	}
 	test_clock();
 	test_csd();
 	test_mbr();
 	test_gpt();
 	test_hfs();
+	test_fat();
 	if (failures) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;
 	}
-	printf("PASS: A733 SD/MMC clock, CSD/CID, MBR/GPT and HFS+ helpers\n");
+	printf("PASS: A733 SD/MMC clock, CSD/CID, MBR/GPT, HFS+ and FAT32 log-file helpers\n");
 	return 0;
 }

@@ -5,7 +5,9 @@ on:
     branches: [topaz]
     paths:
       - "a733/tools/inspect_ios16_root.py"
+      - "a733/tools/extract_iphone_x_ipsw.py"
       - "a733/tests/test_ios16_root_preflight.py"
+      - "a733/tests/test_extract_iphone_x_ipsw.py"
       - ".github/workflows/ios16-preflight.yml"
   workflow_dispatch:
 
@@ -16,5 +18,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate ARM64 Mach-O, genuine-path discovery, symlink safety and size guards
         run: python3 -m unittest discover -s a733/tests -p 'test_ios16_root_preflight.py' -v
+      - name: Validate D22AP Erase manifest and safe DMG extraction
+        run: python3 -m unittest discover -s a733/tests -p 'test_extract_iphone_x_ipsw.py' -v
       - name: Verify CLI help (no Apple files in repository)
-        run: python3 a733/tools/inspect_ios16_root.py --help
+        run: |
+          python3 a733/tools/inspect_ios16_root.py --help
+          python3 a733/tools/extract_iphone_x_ipsw.py --help

@@ -121,7 +121,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +}
 +
  class IOMobileFramebufferUserClient : public IOUserClient {
-@@ -256,3 +372,6 @@
+@@ -253,9 +369,12 @@
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
 -	topaz_modem_init();
  	PE_current_console(&video);
  	fPhys = video.v_baseAddr;
@@ -129,11 +132,14 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	if (fPhys != 0xBBF11000ULL) {
 +		topaz_modem_init();
 +	}
-@@ -291,5 +410,28 @@
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+@@ -290,6 +409,28 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
  		return false;
  	}
-+	/* A733: register the real Apple framebuffer ABI on HDMI. All Qualcomm
-+	 * MDP/DSI/backlight MMIO below is bypassed on this SoC. */
++	/* A733: register the real iOS graphics ABI; bypass all topaz MMIO. */
 +	if (fPhys == 0xBBF11000ULL) {
 +		fVig0 = NULL;
 +		fCtl0 = NULL;
@@ -158,7 +164,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
  	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
  	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
-@@ -879,6 +1021,12 @@
+@@ -879,6 +1020,12 @@
  AppleCLCD::present(const uint8_t *rec)
  {
  	uint32_t mask = get32(rec, 0x104);

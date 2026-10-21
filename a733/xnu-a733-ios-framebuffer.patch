@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1,0 +1,0 @@
+@@ -1,4 +1,119 @@
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
 +/*

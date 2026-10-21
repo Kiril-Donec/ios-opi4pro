@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1,4 +1,108 @@
+@@ -1,0 +1,0 @@
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
 +/*
@@ -14,6 +14,8 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 + * In this first bring-up, source layers are sampled over their full image;
 + * crop rectangles and high-performance compositing still need porting.
 + */
++extern "C" void a733_fbcon_overlay(void);
++
 +static void
 +a733_cpu_present(AppleCLCD *fb, const uint8_t *rec)
 +{
@@ -103,6 +105,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		}
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
++	/* Real IOSurface pixels first; debug text composited on top. */
++	static int show_logs = -1;
++	if (show_logs < 0) {
++		show_logs = 1;
++		PE_parse_boot_argn("a733fb_logs", &show_logs, sizeof(show_logs));
++	}
++	if (show_logs) {
++		a733_fbcon_overlay();
++	}
 +	/* Mapped as framebuffer device/write-combine memory by SweetSurface. */
 +	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
 +		OSSafeReleaseNULL(layers[i]);
@@ -136,3 +147,86 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	}
 +
  	/* boot-arg sweetfb_console=1: debugging, the panel keeps showing the kernel console */
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -1,3 +1,18 @@
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
++/* A733: keep recent kernel output as a debug layer over REAL iOS frames. */
++#define A733_LOG_ROWS 8
++#define A733_LOG_COLS 72
++static char a733_log_lines[A733_LOG_ROWS][A733_LOG_COLS];
++static uint32_t a733_log_row, a733_log_col;
++static void
++a733_log_newline(void)
++{
++	a733_log_col = 0;
++	a733_log_row = (a733_log_row + 1) % A733_LOG_ROWS;
++	for (uint32_t i = 0; i < A733_LOG_COLS; i++) {
++		a733_log_lines[a733_log_row][i] = 0;
++	}
++}
++
+ /* A733 HDMI timing stays physical 1024x600; text coordinates are portrait
+@@ -1,4 +1,5 @@
+ fbcon_newline(void)
+ {
++	a733_log_newline();
+ 	fbcon_col = 0;
+ 	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+@@ -1,4 +1,10 @@
+ 	if (fbcon_col >= fbcon_cols) {
+ 		fbcon_newline();
+ 	}
++	if (c >= 32 && c < 127) {
++		if (a733_log_col >= A733_LOG_COLS) {
++			a733_log_newline();
++		}
++		a733_log_lines[a733_log_row][a733_log_col++] = (char)c;
++	}
+ 	const unsigned char *glyph = iso_font + c * 16;
+@@ -1,5 +1,43 @@
+ 	fbcon_col++;
+ }
+ 
++/* Overlay the last eight kernel log lines over an actual Apple IOSurface. */
++void
++a733_fbcon_overlay(void)
++{
++	if (fbcon_base == NULL || fbcon_height != 600 || fbcon_width != 1024 ||
++	    fbcon_stride != 4096) {
++		return;
++	}
++	const uint32_t y0 = 1024 - (A733_LOG_ROWS * 16 + 8);
++	const uint32_t stride = fbcon_stride / 4;
++	/* Darken the existing iOS frame; retain some visible pixels underneath. */
++	for (uint32_t y = y0; y < 1024; y++) {
++		for (uint32_t x = 0; x < 600; x++) {
++			uint32_t off = (599u - x) * stride + y;
++			uint32_t color = fbcon_base[off];
++			fbcon_base[off] = 0xff000000u | ((color & 0xfefefeu) >> 1);
++		}
++	}
++	for (uint32_t r = 0; r < A733_LOG_ROWS; r++) {
++		uint32_t line = (a733_log_row + 1 + r) % A733_LOG_ROWS;
++		for (uint32_t col = 0; col < A733_LOG_COLS; col++) {
++			unsigned char c = (unsigned char)a733_log_lines[line][col];
++			if (c < 32 || c > 126) {
++				continue;
++			}
++			const unsigned char *glyph = iso_font + c * 16;
++			for (uint32_t gy = 0; gy < 16; gy++) {
++				for (uint32_t gx = 0; gx < 8; gx++) {
++					if (glyph[gy] & (1u << gx)) {
++						fbcon_portrait_pixel(12 + col * 8 + gx,
++						    y0 + r * 16 + gy, 0xffffffffu);
++					}
++				}
++			}
++		}
++	}
++}
++
+ static unsigned int
+ fbcon_receive_ready(void)

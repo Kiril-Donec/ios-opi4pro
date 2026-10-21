@@ -54,6 +54,14 @@ The successful v17 single-core XNU kernel and Stage0 are intentionally **unchang
 
 **Observed on hardware:** `A733 V18 PASS: read(4B Mach-O) + close + ENOENT` followed by repeated `A733 init: still alive` and successful `write` exits; the deliberate negative-path open returns `errno=2` as expected. The on-screen `V16` and `V17` marker prefixes are retained diagnostic labels from the v17 XNU kernel, not evidence that v18 loaded the wrong image.
 
+## Experimental v19 — anonymous virtual-memory self-test (21 October 2026)
+
+**Hardware status: pending test.** After [v18 passed file I/O on the real A733 board](a733/V18-TEST-RU.md), v19 retains the same XNU v17 kernel, single-core Stage0, partition layout and HFSX RAM-root; only the signed PID 1 test Mach-O changes. The new [a733-init-v19.S](a733/src/a733-init-v19.S) first reruns the successful file-I/O checks and then exercises `mmap` for one 16-KiB anonymous RW page, read/write checks at both ends, `mprotect` to read-only, a read check and `munmap`. It prints an explicit `A733 V19 PASS: mmap RW + mprotect RO + munmap` or a specific `A733 V19 FAIL: ...` message before continuing the heartbeat.
+
+**Locally packaged AutoBoot IMG:** `ios-a733-xnu-autoboot-v19-mmap-mprotect-20261021.img`, 64 MiB, SHA-256 `0edbf0f5d82bb81028fbbefa3b0f256ce1549101d79cd5302f26d6d8e0b08c64`. Compared with the verified v18 IMG SHA-256 `0923c1e9eab7bf9fea87520ceed57acf9f166b18cfa0eb9ec165431797b500a7`, precisely 16,635 file bytes at offset `59,534,880` were replaced. The rest of the image was byte-for-byte identical, and the new Mach-O CodeDirectory SHA-256 slots passed offline verification. **Hardware execution has not yet been proven; compiling and packing successfully are not a runtime pass.**
+
+[Hardware test procedure and hashes](a733/V19-TEST-RU.md) · [v19 user program source](a733/src/a733-init-v19.S)
+
 ## Current limitations
 
 **Historical v15 hardware result (stalled in user pathname copying; FIXED IN v17 for the test PID 1):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Use a spare microSD or an adequate backup before testing the offline-audited IMG.
@@ -75,6 +83,8 @@ The successful v17 single-core XNU kernel and Stage0 are intentionally **unchang
 - [`a733/xnu-a733-pid1-v15-open.patch`](a733/xnu-a733-pid1-v15-open.patch) — PID1-only `open`/VFS tracepoints; board-tested, stopped at `copyinstr`.
 - [`a733/src/a733-init-v18.S`](a733/src/a733-init-v18.S) — v18 userspace probe for `read`/`close`/`ENOENT`, board-tested 21 Oct 2026.
 - [`a733/V18-TEST-RU.md`](a733/V18-TEST-RU.md) — v18 image hashes, test expectations and hardware-test precautions.
+- [`a733/src/a733-init-v19.S`](a733/src/a733-init-v19.S) — v19 anonymous VM mapping, protect and unmap self-test, hardware test pending.
+- [`a733/V19-TEST-RU.md`](a733/V19-TEST-RU.md) — v19 image SHA-256 and expected VM success/failure output.
 - [`.github/workflows/xnu.yml`](.github/workflows/xnu.yml) — builds patched XNU on macOS, audits the Mach-O, compiles Stage0, creates and validates HFS+ RAM-root payloads.
 - [`.github/workflows/a733-stage0.yml`](.github/workflows/a733-stage0.yml) — Linux Stage0 tests.
 - [`xnu/patches/`](xnu/patches/) — upstream-derived XNU patch series.
@@ -96,4 +106,4 @@ The guarded Stage0 rejects legacy Xiaomi `SWEETXNU` payloads and accepts only `A
 
 The board owner's primary microSD card is repeatedly reused for experiments. **No automatic flashing or destructive operations are performed by CI or this repository.** Verify the device and any backups before writing an IMG; a successful kernel build is not a guarantee of bootability.
 
-**Milestones achieved on 21 Oct 2026:** test PID 1 completes file and console `open()`, reads and validates a Mach-O header using `read()`, closes the descriptor with `close()`, handles expected `ENOENT`, and keeps running on one A76 core. Next focus: memory mapping, process/thread lifecycle and IPC checks with bounded, observable test programs. Real Apple userspace, SMP and storage/display drivers remain later milestones. SMP, persistent storage and iOS UI remain later milestones.
+**Milestones achieved on 21 Oct 2026:** test PID 1 opens, reads and closes files, handles `ENOENT`, and keeps running on one A76 core. The v19 `mmap`/`mprotect`/`munmap` memory test is built and waiting for hardware validation. Process/thread lifecycle, Mach IPC, real Apple userspace, SMP and storage/display drivers remain future work. SMP, persistent storage and iOS UI remain later milestones.

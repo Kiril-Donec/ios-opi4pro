@@ -1,6 +1,6 @@
 # Orange Pi 4 Pro — XNU v18 (read/close/ENOENT test)
 
-**21 October 2026. This build has NOT yet been tested on the board.** It is a deliberately narrow follow-up to the successful v17 test, which remained alive for at least 15 minutes.
+**21 October 2026: v18 BOOTED SUCCESSFULLY ON THE REAL Orange Pi 4 Pro.** Six photographed HDMI frames confirm its new file-I/O tests complete and PID 1 continues to run. This is still an experimental test program, not real iOS. It is a deliberately narrow follow-up to the successful v17 test, which remained alive for at least 15 minutes.
 
 ## What changed
 
@@ -27,24 +27,26 @@ The new PID 1 calls `getpid()`, then:
 - Exact replacement region: file offset `59,534,880`, length `16,635` bytes. Every byte outside this region was verified identical to the board-proven v17 IMG; the first 32 MiB are byte-for-byte identical.
 - Mach-O CodeDirectory SHA-256 code-page hashes (four 4-KiB code pages) checked successfully. MBR partition signature/type/start/length unchanged.
 
-**Limits of these checks:** the new image has not been booted on Orange Pi, the full filesystem `e2fsck` was not available in the local build environment, and the locally compiled binary has not yet been compared with macOS CI output. Do not label the v18 tests as hardware PASSED based on offline validation.
+**Limits of the offline packaging checks:** full filesystem `e2fsck` was not available and the locally compiled binary has not yet been compared with macOS CI output. The subsequent hardware photographs independently confirm that the **v18 runtime test passed**; they do not independently establish the flashed IMG checksum or complete filesystem integrity.
 
-## Expected HDMI result
+## Confirmed real-board HDMI result (21 October 2026)
 
-Success would look like:
+The user supplied six photographs showing the expected outcome:
 
 ```text
 A733 V18 PASS: read(4B Mach-O) + close + ENOENT
 A733 init: still alive
 ```
 
-The kernel's PID1 syscall trace should also show:
+The photographed kernel PID1 trace also shows a missing-file `open()` returning `errno=2`, followed by opening `/dev/console` and repeated successful `write()` exits. This is the expected ENOENT test, **not a crash**. The `V15`, `V16` and `V17` line prefixes are retained diagnostic labels from the unchanged v17 kernel and do not mean the v18 PID1 program was not loaded.
+
+The test program was designed to exercise:
 - `syscall enter 3` and `syscall exit 3 errno=0 result=4`;
 - `syscall enter 6` and `syscall exit 6 errno=0`;
 - the missing-file `open` returning an error 2 (expected, not a fatal failure);
 - `open("/dev/console")` and repeated `write` syscalls continuing.
 
-A `A733 V18 FAIL: ...` line tells us which new test failed; photograph it. If it stops before opening the console, photograph the **last kernel syscall trace**, not only a blank or early boot screen. The `PASS` banner can scroll away as the heartbeat repeats, so a photo shortly after boot is more useful than waiting 15 minutes.
+**Result: hardware PASS.** No more photos of the unchanged repeating `A733 init: still alive` screen are needed. Further tests should focus on new functionality rather than repeating the same `read()`/`close()` proof.
 
 **Do not write over your only working microSD without a backup.** Use a test card if possible.
 

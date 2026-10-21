@@ -1,0 +1,138 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1,4 +1,5 @@
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * A733: actual IOSurface pixels, CPU transformed into the U-Boot HDMI
++ * framebuffer. XNU's AppleCLCD/IOCoreSurfaceRoot user clients are real.
++ * The Qualcomm MDP is NEVER touched when fPhys == 0xBBF11000.
++ *
++ * This is deliberately a slow first-frame path, not GPU acceleration.
++ * Logical display: iPhone X 1125x2436. HDMI: 1024x600 rotated portrait.
++ * In this first bring-up, source layers are sampled over their full image;
++ * crop rectangles and high-performance compositing still need porting.
++ */
++static void
++a733_cpu_present(AppleCLCD *fb, const uint8_t *rec)
++{
++	const uint32_t physical_w = 1024, physical_h = 600;
++	const uint32_t portrait_w = 600, portrait_h = 1024;
++	const uint32_t canvas_w = 1125, canvas_h = 2436;
++	const uint32_t view_w = (portrait_h * canvas_w + canvas_h / 2) / canvas_h;
++	const uint32_t left = (portrait_w - view_w) / 2;
++	SweetSurface *layers[SWEET_FB_LAYERS] = {};
++	const uint8_t *pixels[SWEET_FB_LAYERS] = {};
++	uint32_t mask = 0;
++	memcpy(&mask, rec + 0x104, sizeof(mask));
++	bool have_pixels = false;
++
++	if (fb->fPhys != 0xBBF11000ULL || fb->fWidth != physical_w ||
++	    fb->fHeight != physical_h || fb->fRowBytes != physical_w * 4 ||
++	    fb->fPixels == 0) {
++		return;
++	}
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		uint32_t id = 0;
++		memcpy(&id, rec + 0x54 + i * 4, sizeof(id));
++		if (!(mask & (1u << i)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s == NULL) {
++			continue;
++		}
++		/* Never read outside an IOSurface's actual backing allocation. */
++		uint64_t end = (uint64_t)s->offset;
++		if (s->width == 0 || s->height == 0 || s->bytesPerElement != 4 ||
++		    s->elementWidth != 1 || s->elementHeight != 1 ||
++		    s->bytesPerRow < (uint64_t)s->width * 4 || s->memory == NULL) {
++			s->release();
++			continue;
++		}
++		end += (uint64_t)(s->height - 1) * s->bytesPerRow +
++		    (uint64_t)s->width * 4;
++		uintptr_t va = s->kernelAddress();
++		if (va == 0 || end > s->memory->getLength()) {
++			s->release();
++			continue;
++		}
++		layers[i] = s;
++		pixels[i] = (const uint8_t *)va + s->offset;
++		have_pixels = true;
++	}
++	if (!have_pixels) {
++		return; /* preserve serial diagnostics until an actual iOS frame */
++	}
++
++	volatile uint32_t *dst = (volatile uint32_t *)fb->fPixels;
++	const uint32_t stride = fb->fRowBytes / 4;
++	for (uint32_t y = 0; y < portrait_h; y++) {
++		/* CPU scaling: nearest neighbor, one single Cortex-A76 core. */
++		for (uint32_t x = 0; x < portrait_w; x++) {
++			uint32_t color = 0xff000000u;
++			if (x >= left && x < left + view_w) {
++				uint32_t vx = x - left;
++				for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++					const SweetSurface *s = layers[l];
++					if (s == NULL) {
++						continue;
++					}
++					uint32_t sx = (uint64_t)vx * s->width / view_w;
++					uint32_t sy = (uint64_t)y * s->height / portrait_h;
++					uint32_t src = 0;
++					memcpy(&src, pixels[l] + (uint64_t)sy * s->bytesPerRow +
++					    (uint64_t)sx * 4, sizeof(src));
++					unsigned a = src >> 24;
++					if (a == 255) {
++						color = src;
++					} else if (a != 0) {
++						unsigned rb = (((src & 0xffu) * a +
++						    (color & 0xffu) * (255 - a) + 127) / 255);
++						unsigned g = ((((src >> 8) & 0xffu) * a +
++						    ((color >> 8) & 0xffu) * (255 - a) + 127) / 255);
++						unsigned r = ((((src >> 16) & 0xffu) * a +
++						    ((color >> 16) & 0xffu) * (255 - a) + 127) / 255);
++						color = 0xff000000u | (r << 16) | (g << 8) | rb;
++					}
++				}
++			}
++			/* Stage0's proven clockwise portrait transform. */
++			dst[(physical_h - 1u - x) * stride + y] = color;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* Mapped as framebuffer device/write-combine memory by SweetSurface. */
++	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
++		OSSafeReleaseNULL(layers[i]);
++	}
++}
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -1,5 +1,10 @@
+ 		return false;
+ 	}
+-	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+-	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	/* A733's actual HDMI framebuffer is in DDR; Qualcomm MDP is absent. */
++	fVig0 = NULL;
++	fCtl0 = NULL;
++	if (fPhys != 0xBBF11000ULL) {
++		fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
++		fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	}
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+@@ -1,6 +1,12 @@
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	static int console_only = -1;
+ 
++	/* Real CoreAnimation IOSurface frames; no Qualcomm MDP MMIO on A733. */
++	if (fPhys == 0xBBF11000ULL) {
++		a733_cpu_present(this, rec);
++		return;
++	}
++
+ 	/* boot-arg sweetfb_console=1: debugging, the panel keeps showing the kernel console */

@@ -236,6 +236,16 @@ jobs:
         run: |
           test -s out/kernel.development.sweet
           python3 a733/tools/audit_a733_macho.py out/kernel.development.sweet
+          # Fail closed: dxb silently skips failed optional patches and can
+          # report a green kernel build containing the OLD Qualcomm driver.
+          python3 - <<'PY'
+          from pathlib import Path
+          kernel = Path("out/kernel.development.sweet").read_bytes()
+          marker = b"A733 FB: AppleCLCD IOSurface HDMI CPU path READY"
+          if marker not in kernel:
+              raise SystemExit("FAIL: A733 AppleCLCD overlay was SKIPPED; refusing to package graphics kernel")
+          print("PASS: A733 AppleCLCD CPU-scanout marker found in compiled XNU Mach-O")
+          PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)
         run: |

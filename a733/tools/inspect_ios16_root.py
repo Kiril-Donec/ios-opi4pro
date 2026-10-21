@@ -9,7 +9,7 @@ Usage:
     python3 a733/tools/inspect_ios16_root.py /mnt/iosroot --json report.json
     python3 a733/tools/inspect_ios16_root.py /mnt/iosroot --stage staging
 
---stage copies ONLY a diagnostic set (real launchd, dyld, dyld shared cache,
+--stage copies a large diagnostic set (real launchd, dyld, split dyld shared cache,
 launchd.plist) to a new directory. This is NOT a complete iOS root; full
 launchd needs many more frameworks, daemons and writable system directories.
 """
@@ -30,7 +30,7 @@ CURRENT_MD0_LIMIT = 16 * MIB
 CURRENT_PAYLOAD_LIMIT = 128 * MIB
 CURRENT_AUTOBOOT_IMAGE = 64 * MIB
 # Real CI-built v20 with 8-MiB md0, not a theoretical kernel estimate.
-V20_PAYLOAD_BYTES = 25471696
+V20_PAYLOAD_BYTES = 25471888
 V20_TEST_ROOT_BYTES = 8 * MIB
 REQUIRED = {
     "launchd": "sbin/launchd",
@@ -38,7 +38,7 @@ REQUIRED = {
     "launchd_plist": "System/Library/xpc/launchd.plist",
 }
 CACHE_DIR = "System/Library/Caches/com.apple.dyld"
-CACHE_RE = re.compile(r"dyld_shared_cache_arm64(?:[.]\d+)?$")
+CACHE_RE = re.compile(r"dyld_shared_cache_arm64(?:[.]\d+(?:[.]dylddata|[.]dyldlinkedit)?)?$")
 ARM64 = 0x0100000C
 MH_MAGIC_64 = 0xFEEDFACF
 LC_LOAD_DYLINKER = 0x0E
@@ -141,6 +141,8 @@ def analyze(root: Path) -> tuple[dict, list[tuple[str, Path]]]:
     selected = []
     if cache.is_dir():
         selected = sorted(p.name for p in cache.iterdir() if CACHE_RE.fullmatch(p.name))
+    # The iOS16 split cache also has numbered .dylddata/.dyldlinkedit files.
+    # Never mistake an incomplete cache set for a stand-alone bootable root.
     if not selected or "dyld_shared_cache_arm64" not in selected:
         result["errors"].append("missing arm64 dyld shared cache; mount/include SystemOS Cryptex")
     else:

@@ -1,0 +1,20 @@
+name: A733 real iOS userland preflight
+
+on:
+  push:
+    branches: [topaz]
+    paths:
+      - "a733/tools/inspect_ios16_root.py"
+      - "a733/tests/test_ios16_root_preflight.py"
+      - ".github/workflows/ios16-preflight.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate ARM64 Mach-O, genuine-path discovery, symlink safety and size guards
+        run: python3 -m unittest discover -s a733/tests -p 'test_ios16_root_preflight.py' -v
+      - name: Verify CLI help (no Apple files in repository)
+        run: python3 a733/tools/inspect_ios16_root.py --help

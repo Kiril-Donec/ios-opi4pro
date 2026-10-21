@@ -40,6 +40,7 @@ on:
       - "a733/tools/make_pid1_ramdisk_macos.sh"
       - "a733/src/a733-init.S"
       - "a733/src/a733-init-v18.S"
+      - "a733/src/a733-init-v19.S"
       - "tools/mkinit.py"
       - "a733/tests/test_ramdisk_pack.py"
       - "a733/src/xnu_payload.c"
@@ -236,7 +237,7 @@ jobs:
         run: |
           mkdir -p a733/build
           xcrun clang -target arm64-apple-ios16.0 -x assembler-with-cpp -c \
-            a733/src/a733-init-v18.S -o a733/build/a733-init.o
+            a733/src/a733-init-v19.S -o a733/build/a733-init.o
           python3 tools/mkinit.py a733/build/a733-init.o a733/build/a733-init.macho
           python3 - <<'PY'
           import struct
@@ -263,7 +264,13 @@ jobs:
           assert b"A733 V18 FAIL: expected ENOENT" in data, "missing ENOENT-failure marker"
           assert struct.pack("<I", 0xd2800070) in data, "missing SYS_read=3 instruction"
           assert struct.pack("<I", 0xd28000d0) in data, "missing SYS_close=6 instruction"
-          print("PASS: static signed ARM64 Mach-O with v18 getpid/open/read/close/ENOENT probes")
+          assert b"A733 V19 PASS: mmap RW + mprotect RO + munmap" in data, "missing v19 VM PASS marker"
+          for marker in (b"A733 V19 FAIL: mmap", b"A733 V19 FAIL: VM write/read", b"A733 V19 FAIL: mprotect", b"A733 V19 FAIL: munmap"):
+              assert marker in data, f"missing failure marker: {marker!r}"
+          assert struct.pack("<I", 0xd28018b0) in data, "missing SYS_mmap=197"
+          assert struct.pack("<I", 0xd2800950) in data, "missing SYS_mprotect=74"
+          assert struct.pack("<I", 0xd2800930) in data, "missing SYS_munmap=73"
+          print("PASS: static signed ARM64 Mach-O with v19 mmap/mprotect/munmap and previous v18 probes")
           PY
           bash a733/tools/make_pid1_ramdisk_macos.sh \
             a733/build/a733-init.macho a733/build/a733-pid1-root.hfs A733PID1

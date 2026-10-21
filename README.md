@@ -63,6 +63,14 @@ The successful v17 single-core XNU kernel and Stage0 are intentionally **unchang
 
 [Hardware test procedure and hashes](a733/V19-TEST-RU.md) · [v19 user program source](a733/src/a733-init-v19.S)
 
+## Experimental A733 real iOS graphics (21 October 2026; source candidate)
+
+The next experimental branch of work targets **actual Apple iOS userland frames**, not a mock home screen. A new [A733-specific XNU graphic overlay](a733/xnu-a733-ios-framebuffer.patch) changes the existing `AppleCLCD`/`IOMobileFramebuffer` driver to copy **real IOSurface surfaces** to the proven U-Boot/HDMI `0xBBF11000` framebuffer, CPU-scale an iPhone X canvas (1125×2436) to portrait 600×1024 and rotate it into physical 1024×600 pixels. The patch also keeps Qualcomm MDP accesses disabled on A733 and adds an eight-line kernel-log overlay over any real frame (`a733fb_logs=1`, default, or `=0` to hide).
+
+The [A733 Apple Device Tree generator](a733/tools/mkadt_a733.py) has a fail-closed, opt-in `--ios-display` mode that advertises `/arm-io/disp0` with the `sweet,display` matching interface required by `AppleCLCD`. The original v19 device tree remains the default. CI now builds the driver overlay and packages a **separate experimental display-enabled payload**. The included 8-MiB root still has only our custom test PID 1 and **no real Apple launchd, dyld shared cache, backboardd or SpringBoard**. Thus neither a successful compile nor a successful hardware boot with this test root would show genuine iOS frames.
+
+**Status: proposed implementation awaiting CI validation and real-board display tests.** The physically tested v19 image remains the rollback baseline, unchanged. This is not yet a flash-ready or successfully booted iOS GUI image. See [the complete real-iOS graphics bring-up notes](a733/IOS-GRAPHICS-RU.md).
+
 ## Current limitations
 
 **Historical v15 hardware result (stalled in user pathname copying; FIXED IN v17 for the test PID 1):** the test PID 1 first tries to open its own `/sbin/launchd` Mach-O with `O_RDONLY`, then `/dev/console` with `O_RDWR`. `a733/xnu-a733-pid1-v15-open.patch` traces `open()`, allocation, file-descriptor setup, vnode authorization, `namei()` and `VNOP_OPEN()` only for PID 1. This is a diagnostic change, **not a proven fix**. Use a spare microSD or an adequate backup before testing the offline-audited IMG.

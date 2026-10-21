@@ -39,6 +39,8 @@ class RootPreflightTests(unittest.TestCase):
                    plistlib.dumps({"LaunchDaemons": {"com.apple.test": {"Label": "com.apple.test"}}}))
         self.write("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64", b"real-byte-test-fixture")
         self.write("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.01", b"extra-test-fixture")
+        self.write("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.27.dylddata", b"data-test-fixture")
+        self.write("System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.28.dyldlinkedit", b"linkedit-test-fixture")
         self.write("System/Library/CoreServices/SystemVersion.plist",
                    plistlib.dumps({"ProductVersion": "16.7.16", "ProductBuildVersion": "20H392"}))
 
@@ -55,8 +57,10 @@ class RootPreflightTests(unittest.TestCase):
         self.assertEqual(result["files"]["launchd"]["macho"]["dylinker"], "/usr/lib/dyld")
         self.assertTrue(result["files"]["launchd"]["macho"]["has_code_signature_command"])
         self.assertIn("dyld_shared_cache_arm64.01", result["files"])
+        self.assertIn("dyld_shared_cache_arm64.27.dylddata", result["files"])
+        self.assertIn("dyld_shared_cache_arm64.28.dyldlinkedit", result["files"])
         self.assertEqual(result["files"]["launchd_plist"]["launchd_job_count"], 1)
-        self.assertEqual(len(paths), 5)
+        self.assertEqual(len(paths), 7)
         self.assertTrue(result["fits_existing_16mib_md0"])
         self.assertFalse(result["complete_root"])
 
@@ -64,11 +68,11 @@ class RootPreflightTests(unittest.TestCase):
         result, paths = iosroot.analyze(self.root)
         out = Path(self.t.name) / "stage"
         manifest = iosroot.stage_files(out, paths)
-        self.assertEqual(len(manifest), 5)
+        self.assertEqual(len(manifest), 7)
         for relative, src in paths:
             self.assertEqual((out / relative).read_bytes(), src.read_bytes())
         self.assertTrue((out / "A733_PROBE_NOT_A_COMPLETE_IOS_ROOT.txt").exists())
-        self.assertEqual(len(json.loads((out / "a733-probe-manifest.json").read_text())), 5)
+        self.assertEqual(len(json.loads((out / "a733-probe-manifest.json").read_text())), 7)
         with self.assertRaises(FileExistsError):
             iosroot.stage_files(out, paths)
 

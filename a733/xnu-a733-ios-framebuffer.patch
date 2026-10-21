@@ -1,7 +1,7 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1,4 +1,119 @@
+@@ -223,4 +223,119 @@
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
 +/*
@@ -121,20 +121,44 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +}
  
  class IOMobileFramebufferUserClient : public IOUserClient {
-@@ -1,5 +1,10 @@
+@@ -256,3 +371,6 @@
+-	topaz_modem_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
++	/* Qualcomm modem bootstrap belongs to topaz, never the A733. */
++	if (fPhys != 0xBBF11000ULL) {
++		topaz_modem_init();
++	}
+@@ -291,5 +409,28 @@
  		return false;
  	}
--	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
--	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
-+	/* A733's actual HDMI framebuffer is in DDR; Qualcomm MDP is absent. */
-+	fVig0 = NULL;
-+	fCtl0 = NULL;
-+	if (fPhys != 0xBBF11000ULL) {
-+		fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
-+		fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
++	/* A733: register the real Apple framebuffer ABI on HDMI. All Qualcomm
++	 * MDP/DSI/backlight MMIO below is bypassed on this SoC. */
++	if (fPhys == 0xBBF11000ULL) {
++		fVig0 = NULL;
++		fCtl0 = NULL;
++		fIntf1 = NULL;
++		fDsi = NULL;
++		fFlip[0] = NULL;
++		fFlip[1] = NULL;
++		fCons = NULL;
++		fFadeOrig = NULL;
++		fPowerOff = false;
++		fConsShown = false;
++		fFlushTicks = 1;
++		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++		setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
++		setProperty("external", false);
++		setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++		registerService();
++		IOLog("A733 FB: AppleCLCD IOSurface HDMI CPU path READY %ux%u -> %ux%u\n",
++		    fLogicalW, fLogicalH, fWidth, fHeight);
++		return true;
 +	}
- 	if (fVig0 != NULL && fCtl0 != NULL) {
-@@ -1,6 +1,12 @@
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
+@@ -879,6 +1020,12 @@
  AppleCLCD::present(const uint8_t *rec)
  {
  	uint32_t mask = get32(rec, 0x104);
@@ -150,7 +174,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -1,3 +1,18 @@
+@@ -722,3 +722,18 @@
  static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
  
 +/* A733: keep recent kernel output as a debug layer over REAL iOS frames. */
@@ -169,13 +193,13 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 +}
 +
  /* A733 HDMI timing stays physical 1024x600; text coordinates are portrait
-@@ -1,4 +1,5 @@
+@@ -747,4 +762,5 @@
  fbcon_newline(void)
  {
 +	a733_log_newline();
  	fbcon_col = 0;
  	fbcon_row = (fbcon_row + 1) % fbcon_rows;
-@@ -1,4 +1,10 @@
+@@ -783,4 +799,10 @@
  	if (fbcon_col >= fbcon_cols) {
  		fbcon_newline();
  	}
@@ -186,7 +210,7 @@ diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 +		a733_log_lines[a733_log_row][a733_log_col++] = (char)c;
 +	}
  	const unsigned char *glyph = iso_font + c * 16;
-@@ -1,5 +1,43 @@
+@@ -799,5 +821,43 @@
  	fbcon_col++;
  }
  

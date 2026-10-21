@@ -80,6 +80,20 @@ sha256sum a733-apple-launchd-probe.hfs
 
 ---
 
+## Результат физического теста v21: Apple launchd, EXEC WRONG_PLATFORM (2026-10-21)
+
+Пользователь физически загрузил экспериментальный v21 с **оригинальным** iPhone X /sbin/launchd на Orange Pi 4 Pro. По фотографиям HDMI:
+- Один Cortex-A76 MPIDR 0x600; XNU/IOKit/BSD и AppleCLCD зарегистрированы;
+- HFS+ том A733APPLE смонтирован как md0;
+- XNU попытался загрузить /usr/appleinternal/sbin/launchd.development (ENOENT), затем /sbin/launchd;
+- после копирования пути, namei lookup, загрузка остановилась kernel panic: `unexpected SIGKILL of launchd (CS_KILLED) reason -- namespace 9 code 0xe`.
+
+В XNU `OS_REASON_EXEC=9`, `EXEC_EXIT_REASON_WRONG_PLATFORM=14 (0xe)`, так что это **отказ проверки платформы exec**, а не уже доказанный крах Apple dyld. `CS_KILLED` — процессный флаг, сам по себе он не раскрывает причину. В исходниках XNU для macOS-hosted iOS binaries проверка в `check_for_signature` может выдавать этот код при отсутствии `psa_platform=PLATFORM_IOS` и непредоставленном исключении. Upstream ios-sweet и ios-topaz используют boot arg `unentitled_ios_sim_launch=1`; мы его в v21 пропустили.
+
+**Следующий диагностический эксперимент: v22**, который берёт физически проверенную v21 и изменяет ТОЛЬКО 608-байтный cmdline A733XNU1, добавляя `unentitled_ios_sim_launch=1`. Все байты SD IMG вне этого поля, kernel, HFSX RAM-root, один A76 и U-Boot неизменны (проверено побайтово при локальной упаковке). Контрольный SHA256 v22 IMG: `d8cf80fb6bdc09e6d19cccaf652153bc0f127ec556273f04239bb6d2026c2fd9`.
+
+Ожидаемый исход: либо kernel пропустит платформенную проверку и мы увидим следующую ошибку (скорее всего, отсутствует dyld shared cache), либо потребуется исследовать другой путь `WRONG_PLATFORM` в фактически скомпилированном XNU. **Это НЕ доказательство, что Apple launchd начал работать; v22 пока не прошёл физический тест.** v20 остаётся неизменным откатом.
+
 ## Дальше
 
 1. ~~Получаем подлинные Apple OS/SystemOS/AppOS DMG и собираем полный root.~~ DONE на сервере; семь ключевых Apple файлов и FS проверены.

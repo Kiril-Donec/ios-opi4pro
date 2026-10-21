@@ -1250,10 +1250,10 @@ index 0000000..f84d2dd
 +#endif /* !A733_SD_HOST_TEST */
 +#endif /* ARM64_BOARD_CONFIG_SWEET || A733_SD_HOST_TEST */
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 252ca45..6daaa6e 100644
+index 252ca45..f65ade8 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -769,6 +769,27 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -769,6 +769,25 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  		}
  	}
  
@@ -1264,15 +1264,13 @@ index 252ca45..6daaa6e 100644
 +	if (strcmp(rdBootVar, "sdroot0") == 0) {
 +		extern int a733_sd_rootdev(dev_t *dev);
 +		OSSafeReleaseNULL(matching);
-+		IOLog("A733 ROOT: rd=sdroot0, starting the SMHC0 microSD PIO driver
-+");
++		IOLog("A733 ROOT: rd=sdroot0, starting the SMHC0 microSD PIO driver\n");
 +		int sd_error = a733_sd_rootdev(root);
 +		if (sd_error) {
 +			panic("IOFindBSDRoot: A733 microSD root %s unavailable: %d", rdBootVar, sd_error);
 +		}
 +		strlcpy(rootName, rdBootVar, rootNameSize);
-+		IOLog("BSD root: %s, major %d, minor %d
-+", rootName, major(*root), minor(*root));
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
 +		*oflags = 0;
 +		goto iofrootx;
 +	}

@@ -109,6 +109,16 @@ class SdmmcPatch(unittest.TestCase):
         self.assertIn('+\tif (strcmp(rdBootVar, "sdroot0") == 0) {', hook)
         self.assertIn("+\t\tint sd_error = a733_sd_rootdev(root);", hook)
         self.assertIn("+\t\tgoto iofrootx;", hook)
+        self.assertIn('+\t\tIOLog("A733 ROOT: rd=sdroot0, starting the SMHC0 microSD PIO driver\\n");', hook)
+
+    def test_no_string_literal_split_across_lines(self) -> None:
+        # CI run 39673536036 failed on IOLog("...\n") whose \n had become a real newline.
+        for path, section in self.sections.items():
+            for line in section:
+                if line.startswith("+") and not line.startswith("+++"):
+                    code = line[1:].split("//")[0]
+                    quotes = len(re.findall(r'(?<!\\)"', code.replace("'\"'", "")))
+                    self.assertEqual(quotes % 2, 0, f"{path}: unbalanced quotes in {line!r}")
 
     def test_driver_safety_properties(self) -> None:
         src = self.source

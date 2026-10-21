@@ -31,6 +31,8 @@ on:
       - "a733/xnu-a733-pid1-v15-open.patch"
       - "a733/xnu-a733-pid1-v16-copyinstr.patch"
       - "a733/xnu-a733-pid1-v17-usercopy.patch"
+      - "a733/xnu-a733-ios-framebuffer.patch"
+      - "a733/tests/test_ios_display.py"
       - "a733/tools/adapt_xnu_a733.py"
       - "a733/tests/test_adapt_xnu.py"
       - "a733/tools/audit_a733_macho.py"
@@ -97,6 +99,8 @@ jobs:
           cp a733/xnu-a733-pid1-v15-open.patch dxb/patches/9999i-a733-pid1-v15-open.patch
           cp a733/xnu-a733-pid1-v16-copyinstr.patch dxb/patches/9999j-a733-pid1-v16-copyinstr.patch
           cp a733/xnu-a733-pid1-v17-usercopy.patch dxb/patches/9999k-a733-pid1-v17-usercopy.patch
+          # CPU scanout for real iOS IOSurface frames, no Qualcomm MDP accesses on A733.
+          cp a733/xnu-a733-ios-framebuffer.patch dxb/patches/9999l-a733-ios-framebuffer.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -307,6 +311,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu u-boot-tools hfsprogs
       - name: Compile and test A733 Stage0
         run: make -C a733 test adt all test-boot
+      - name: Check opt-in A733 iOS display device tree and rotation
+        run: python3 -m unittest discover -s a733/tests -p test_ios_display.py -v
+
       - name: Audit, pack and validate real XNU payload
         run: |
           test -s kernel/kernel.development.sweet
@@ -360,6 +367,44 @@ jobs:
           a733/build/test_real_xnu_payload a733/build/a733-xnu-pid1.payload
           sha256sum a733/build/a733-init.macho a733/build/a733-pid1-root.hfs \
             a733/build/a733-xnu-pid1.payload
+
+      # Separate opt-in display candidate: normal v19 PID1 artifact stays unchanged.
+      # No iOS userland is included; the framebuffer class cannot produce an
+      # iOS frame until Apple's real backboardd / CoreAnimation are running.
+      - name: Build opt-in AppleCLCD / IOSurface A733 payload
+        run: |
+          python3 a733/tools/mkadt_a733.py             a733/build/a733-ios-display.adt --ios-display
+          python3 a733/tools/package_xnu_a733.py             kernel/kernel.development.sweet a733/build/a733-ios-display.adt             a733/build/a733-xnu-ios-display.payload             --ramdisk a733/build/a733-pid1-root.hfs
+          a733/build/test_real_xnu_payload a733/build/a733-xnu-ios-display.payload
+          python3 - <<'PY'
+          import sys, struct
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          import adt
+          p = Path('a733/build/a733-xnu-ios-display.payload').read_bytes()
+          off, size = struct.unpack_from('<2Q', p, 0x20)
+          tree, _ = adt.parse(p[off:off + size])
+          armio = next(n for n in tree.children if n.name == 'arm-io')
+          disp = next(n for n in armio.children if n.name == 'disp0')
+          assert disp.prop('device_type') == b'display-subsystem\0'
+          assert disp.prop('compatible') == b'sweet,display\0'
+          assert struct.unpack('<I', disp.prop('canvas-width')) == (1125,)
+          assert struct.unpack('<I', disp.prop('canvas-height')) == (2436,)
+          print('PASS opt-in REAL AppleCLCD display node: iPhone X 1125x2436')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: a733-IOS-DISPLAY-CPU-EXPERIMENTAL
+          path: |
+            a733/build/a733-ios-display.adt
+            a733/build/a733-xnu-ios-display.payload
+            a733/build/a733-xnu-ios-display.payload.sha256
+            a733/build/a733-pid1-root.hfs
+            a733/build/stage0.uimg
+          if-no-files-found: error
+          retention-days: 14
 
       - uses: actions/upload-artifact@v4
         if: success()

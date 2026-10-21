@@ -39,6 +39,7 @@ on:
       - "a733/tools/make_pid1_ramdisk.sh"
       - "a733/tools/make_pid1_ramdisk_macos.sh"
       - "a733/src/a733-init.S"
+      - "a733/src/a733-init-v18.S"
       - "tools/mkinit.py"
       - "a733/tests/test_ramdisk_pack.py"
       - "a733/src/xnu_payload.c"
@@ -235,7 +236,7 @@ jobs:
         run: |
           mkdir -p a733/build
           xcrun clang -target arm64-apple-ios16.0 -x assembler-with-cpp -c \
-            a733/src/a733-init.S -o a733/build/a733-init.o
+            a733/src/a733-init-v18.S -o a733/build/a733-init.o
           python3 tools/mkinit.py a733/build/a733-init.o a733/build/a733-init.macho
           python3 - <<'PY'
           import struct
@@ -256,7 +257,13 @@ jobs:
           assert struct.pack("<I", 0xd4001001) in data, "missing userspace SVC #0x80"
           assert b"/sbin/launchd" in data, "v15: missing HFS+ regular-file probe"
           assert b"/dev/console" in data, "v15: missing devfs console probe"
-          print("PASS: static signed ARM64 Mach-O with getpid and v15 dual-open probes")
+          assert b"/a733-v18-definitely-missing" in data, "v18 missing ENOENT probe"
+          assert b"A733 V18 PASS: read(4B Mach-O) + close + ENOENT" in data, "missing v18 PASS marker"
+          assert b"A733 V18 FAIL: read(4B)" in data, "missing read-failure marker"
+          assert b"A733 V18 FAIL: expected ENOENT" in data, "missing ENOENT-failure marker"
+          assert struct.pack("<I", 0xd2800070) in data, "missing SYS_read=3 instruction"
+          assert struct.pack("<I", 0xd28000d0) in data, "missing SYS_close=6 instruction"
+          print("PASS: static signed ARM64 Mach-O with v18 getpid/open/read/close/ENOENT probes")
           PY
           bash a733/tools/make_pid1_ramdisk_macos.sh \
             a733/build/a733-init.macho a733/build/a733-pid1-root.hfs A733PID1

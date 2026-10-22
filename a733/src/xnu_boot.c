@@ -9,7 +9,6 @@
 #define A733_BOOT_A76_MPIDR 0x600ULL
 #define PSCI_CPU_ON 0xC4000003ULL
 #define PSCI_VERSION 0x84000000ULL
-#define PSCI_CPU_OFF 0x84000002ULL
 
 static uint64_t reg_mpidr(void)
 {
@@ -185,12 +184,6 @@ void stage0_try_xnu(uint64_t fdt_address)
         screen_hex("PSCI CPU_ON FAILURE", (uint64_t)rc);
         return;
     }
-    /*
-     * Power this boot A55 (MPIDR 0x000) really off, so XNU can start it later
-     * with CPU_ON (board test #10: a core parked in WFE answers ALREADY_ON,
-     * rc -4). CPU_OFF only returns on failure (DENIED): then park as before.
-     */
-    (void)smc64(PSCI_CPU_OFF, 0, 0, 0);
     for (;;)
         __asm__ volatile("wfe"); /* A55 does not touch RAM once A76 runs. */
 }

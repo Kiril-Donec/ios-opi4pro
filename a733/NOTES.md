@@ -313,3 +313,10 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   v22 one, 68d2e755...), and mkadt lists 0x000 last so cpus=7 works with any Stage0.
   **23:05, partition 1 v8c (new Stage0, cpus=8) written** (owner confirmed): 7c16bb15...0117,
   read-back verified. Fallback v8c-olds0 cpus=7 (old Stage0): 5658cea6...fd81. Board test #11 pending.
+- **Board tests #11 (v8c cpus=8) and #12 (v8c cpus=3), photos:** both froze right after `SWEET CPU:
+  requested=N` with no panic - not even the boot-CPU / cpu=1 lines (in test #10 the same kernel had
+  started the second A76). The only difference is the new Stage0: after its PSCI CPU_OFF of the boot
+  A55, the next CPU_ON hangs inside the firmware with the only running core. **Stage0 CPU_OFF reverted**;
+  0x000 stays last in the ADT and is not used. **23:3x, partition 1 v8c-olds0 (old Stage0, cpus=7:
+  2x A76 + A55 0x100-0x500) written** (owner confirmed): 5658cea6...fd81. Board test #13 pending.
+  The 8th core would need Stage0 to park 0x000 on a mailbox XNU can release (spin table), not CPU_OFF.

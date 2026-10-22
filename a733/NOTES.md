@@ -226,3 +226,11 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   `mkadt_a733.py --a76-pair` adds cpu1 (0x700, state "waiting", same cluster); XNU only uses it with
   `cpus=2` (`package_xnu_a733.py --cpus 2`, refused without the pair ADT). CI packs both
   `a733-xnu-sdroot.payload` (cpus=1) and `a733-xnu-sdroot-2cpu.payload` (cpus=2).
+- **2026-10-22 board test #5 card log (2.45 MB, local copy):** backboardd never crashes; SpringBoard ran 57
+  times and all 56 crashes are the same abort: `NSInternalInconsistencyException 'Failed to load bounding path
+  bitmap data from the asset manager for asset name: BoundingPathBitmap-1125x2436-375x812-3.00x'`. SD: 0 errors.
+  Upstream reached the SpringBoard home screen with a `/product` node copied from the real D22AP device tree
+  (root NOTES.md, patch 0059); our ADT has the identity, display-scale 3 and home-button-type 2 but no /product.
+- **2026-10-22 16:2x, partition 1 v5 (2x A76 cpus=2, SD High Speed, console fix) written to the real card**
+  (owner confirmed): CI run 39783367967 (commit d169786), image d0140d68...9a2d, read-back verified;
+  previous v4 (b708f443...) saved locally. A cpus=1 twin (d0498bcd...) is ready as fallback. Board test #6 pending.

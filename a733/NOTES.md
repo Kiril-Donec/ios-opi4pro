@@ -117,4 +117,9 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   not 64 MiB as written earlier); adds slot 2 HFS+ 0xAF at 196608 (16 GiB) and slot 3 FAT32 0x0C at
   33751040 (256 MiB) with a contiguous 64 MiB A733LOG.TXT; changes only bytes 462-493 of sector 0.
   Tested on a sparse full-card image (sfdisk, fsck.fat, mtools, the driver's FAT lookup) and in dry
-  run against the real Disk 1; NOT yet run on the real card.
+  run against the real Disk 1.
+- **2026-10-22 10:06, real card laid out by the owner** (`apply`, Disk 1): backup
+  `card1-first64MiB-before-sdlayout-20261022-100638.bin` (sha256 e29744f3...addcd, kept locally, not in git);
+  Windows now lists partition 2 (offset 96 MiB, 16 GiB, MbrType 175 = 0xAF) and partition 3 (E:, FAT32,
+  label A733LOG, Healthy) with `A733LOG.TXT` 67108864 bytes, first line "prepared ... not written yet".
+  Partition 1 (D:, 32 MiB) unchanged. iOS image not yet written; board not yet booted with this card.

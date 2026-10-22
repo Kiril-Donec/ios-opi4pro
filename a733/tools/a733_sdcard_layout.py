@@ -341,7 +341,8 @@ def apply_layout(dev: Device, info: dict, backup_dir: Path, confirm, recheck=Non
     if sha256(img.read_bytes()) != sha256(head):
         raise LayoutError("backup file read-back mismatch")
     digest = sha256(head)
-    base.with_suffix(".bin.sha256").write_text(f"{digest}  {img.name}\n")
+    # LF even on Windows, so `sha256sum -c` (Git Bash, Linux) can check it.
+    base.with_suffix(".bin.sha256").write_bytes(f"{digest}  {img.name}\n".encode())
     base.with_suffix(".json").write_text(json.dumps({
         "disk": info, "sectors": BACKUP_SECTORS, "sha256": digest, "created": stamp,
         "mbr_before": [describe(p) for p in parts]}, indent=2))

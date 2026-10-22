@@ -37,6 +37,10 @@ on:
       - "a733/xnu-a733-smp-a76.patch"
       - "a733/xnu-a733-usbtouch.patch"
       - "a733/xnu-a733-cores-fb-power.patch"
+      - "a733/xnu-a733-cpufreq-setup.patch"
+      - "a733/tests/test_cpufreq_setup_patch.py"
+      - "a733/tests/test_power_logic_r.c"
+      - "a733/tests/firstboot_kernel_stubs.h"
       - "a733/tests/test_cores_fb_power_patch.py"
       - "a733/tests/test_power_logic.c"
       - "a733/tests/test_fb_scaler.cpp"
@@ -133,6 +137,9 @@ jobs:
           cp a733/xnu-a733-usbtouch.patch dxb/patches/9999p-a733-usbtouch.patch
           # Six Cortex-A55s, row-order 30 Hz scaler, power button + PSCI power-off (needs 9999n-p).
           cp a733/xnu-a733-cores-fb-power.patch dxb/patches/9999q-a733-cores-fb-power.patch
+          # Vendor cpufreq ported (efuse bin, AXP8191 rails, CPU PLLs, THS), triple press,
+          # one-time Setup-skip preferences, 20 Hz (needs 9999q).
+          cp a733/xnu-a733-cpufreq-setup.patch dxb/patches/9999r-a733-cpufreq-setup.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -297,6 +304,11 @@ jobs:
               if m not in kernel:
                   raise SystemExit(f"FAIL: A733 cores/fb/power overlay was SKIPPED (missing {m!r})")
           print("PASS: A733 A55 / power button / PSCI power-off code found in compiled XNU Mach-O")
+          for m in (b"A733 CPUFREQ: efuse 0x%08x -> vf%04x", b"A733 THERMAL: THS on",
+                    b"A733 FIRSTBOOT: %u files written", b"A733 POWER: triple press: clean shutdown"):
+              if m not in kernel:
+                  raise SystemExit(f"FAIL: A733 cpufreq/setup overlay was SKIPPED (missing {m!r})")
+          print("PASS: A733 cpufreq, thermal, triple press and first-boot code found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)
@@ -460,7 +472,7 @@ jobs:
       - name: Build experimental microSD-root (rd=sdroot0) payload
         run: |
           python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc --a76-pair --usb-touch \
-            --a55 --power
+            --a55 --power --activation
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
             a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot --sdrw
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \

@@ -115,6 +115,16 @@ def main() -> None:
     assert struct.unpack("<2Q", pw.prop("rccu-reg")) == (0x07010000, 0x400)
     assert struct.unpack("<2Q", pw.prop("cpupll-reg")) == (0x08870000, 0x4000)
     assert pw.prop("interrupts") is None
+    assert struct.unpack("<2Q", pw.prop("sid-reg")) == (0x03006000, 0x1000)
+    assert struct.unpack("<2Q", pw.prop("ths-reg")) == (0x02522000, 0x500)
+    assert struct.unpack("<2Q", pw.prop("ccu-reg")) == (0x02002000, 0x2000)
+    # Hactivation: the /chosen security tuple (0, 0, 1, 1) only with --activation.
+    keys = ("certificate-production-status", "effective-production-status-ap",
+            "certificate-security-mode", "effective-security-mode-sep")
+    ch = next(n for n in parse(hw.build(sdmmc=True, activation=True).serialize())[0].children if n.name == "chosen")
+    assert [int.from_bytes(ch.prop(k), "little") for k in keys] == [0, 0, 1, 1]
+    ch = next(n for n in parse(hw.build(sdmmc=True).serialize())[0].children if n.name == "chosen")
+    assert all(ch.prop(k) is None for k in keys)
     check_product()
     assert not any(n.name == "a733-usb" for n in sd_root.children)
     usb_root, _ = parse(hw.build(sdmmc=True, usb_touch=True).serialize())

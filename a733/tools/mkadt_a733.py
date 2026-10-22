@@ -51,6 +51,10 @@ CCU_SIZE = 0x2000
 R_TWI0_BASE = 0x07083000
 R_CCU_BASE = 0x07010000
 CPUPLL_BASE = 0x08870000
+# cpufreq / thermal (ported vendor Linux): SID efuse (speed bin, THS
+# calibration), the THS sensor block, the main CCU (THS / GPADC clocks).
+SID_BASE = 0x03006000
+THS_BASE = 0x02522000
 # The six Cortex-A55 cores (vendor DT cpu@0..cpu@500), one core per Aff1.
 # 0x000 is the core the board boots on: Stage0 starts the A76 from it and
 # parks it in WFE, so CPU_ON answers ALREADY_ON (board test #10). Powering it
@@ -138,7 +142,7 @@ def read_product(path: Path) -> list[tuple[str, bytes]]:
 
 def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = False,
           usb_touch: bool = False, a55: bool = False, power: bool = False,
-          product: list[tuple[str, bytes]] | None = None) -> Node:
+          activation: bool = False, product: list[tuple[str, bytes]] | None = None) -> Node:
     # Opt-in ONLY: never expose an iOS display nub to the legacy Qualcomm
     # AppleCLCD driver unless the A733 CPU scanout overlay is installed.
     chosen = Node("chosen", [
@@ -153,6 +157,14 @@ def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = Fa
         ("crypto-hash-method", cstr("sha2-384")),
         ("unique-chip-id", u64(0x4137330000000001)),
         ("chip-id", u32(0x8015)),
+        # Upstream tools/mkadt.py: security status of a dev-fused, undemoted
+        # board (0, 0, 1, 1); MobileGestalt reads it from /chosen and
+        # mobileactivationd then takes its native "Hactivation" branch
+        # (Activated without an activation record, no SEP, no baseband).
+        *([("certificate-production-status", u32(0)),
+           ("effective-production-status-ap", u32(0)),
+           ("certificate-security-mode", u32(1)),
+           ("effective-security-mode-sep", u32(1))] if activation else []),
     ], [
         Node("memory-map"),
         Node("asmb", [("lp-sip0", u64(0x6F)), ("lp-sip1", u32(1))]),
@@ -276,6 +288,9 @@ def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = Fa
             ("twi-reg", u64(R_TWI0_BASE, 0x400)),
             ("rccu-reg", u64(R_CCU_BASE, 0x400)),
             ("cpupll-reg", u64(CPUPLL_BASE, 0x4000)),
+            ("sid-reg", u64(SID_BASE, 0x1000)),
+            ("ths-reg", u64(THS_BASE, 0x500)),
+            ("ccu-reg", u64(CCU_BASE, CCU_SIZE)),
         ]))
     if usb_touch:
         # Polled too: no "interrupts" for the same reason as /a733-sdmmc.
@@ -330,12 +345,15 @@ def main() -> None:
                         help="add the six Cortex-A55 cores after the A76 pair (cpus=3..8 to use)")
     parser.add_argument("--power", action="store_true",
                         help="add /a733-power: power button on the PMIC, PSCI power-off, CPU clock report")
+    parser.add_argument("--activation", action="store_true",
+                        help="/chosen security status of a dev-fused board (upstream Hactivation, Setup skip)")
     parser.add_argument("--usb-touch", action="store_true",
                         help="add /a733-usb for the USB1 OHCI touch screen driver")
     args = parser.parse_args()
     product = read_product(args.product_adt) if args.product_adt else None
     data = build(ios_display=args.ios_display, sdmmc=args.sdmmc, a76_pair=args.a76_pair,
-                 usb_touch=args.usb_touch, a55=args.a55, power=args.power, product=product).serialize()
+                 usb_touch=args.usb_touch, a55=args.a55, power=args.power,
+                 activation=args.activation, product=product).serialize()
     args.output.write_bytes(data)
     print(f"A733 early ADT: {len(data)} bytes -> {args.output}")
     print("MPIDR 0x600 / GICD 0x03400000 / GICR 0x03460000 / vtimer 27")
@@ -344,6 +362,7 @@ def main() -> None:
     print("Second Cortex-A76 (0x700):", "IN ADT (cpus=2 to use)" if args.a76_pair else "OFF")
     print("microSD SMHC0 node:", "ENABLED (/a733-sdmmc, rd=sdroot0)" if args.sdmmc else "OFF")
     print("Cortex-A55 x6:", "IN ADT (cpus=3..8 to use)" if args.a55 else "OFF")
+    print("Activation security status in /chosen:", "ON (Hactivation)" if args.activation else "OFF")
     print("Power button / PSCI off node:", "ENABLED (/a733-power)" if args.power else "OFF")
     print("USB1 touch screen node:", "ENABLED (/a733-usb)" if args.usb_touch else "OFF")
     print("EXPERIMENTAL: A76 PSCI verified; A733 XNU source rebuild still required")

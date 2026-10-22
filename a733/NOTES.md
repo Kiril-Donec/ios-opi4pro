@@ -330,3 +330,16 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   does not answer): side button and the volume-up chord reach SpringBoard, the slider appears, but no
   shutdown ever reached the kernel (no reboot/halt lines) - the slide did not complete; the owner used
   the PMIC 6 s hard-off.
+- **Patch 9999r (`xnu-a733-cpufreq-setup.patch`):** vendor Linux cpufreq ported into `a733_power.c`:
+  speed bin from the efuse (SID+0x24C, dvfs_bak over dvfs_ori, `vf_mapping_table`), the 24 MHz rows of
+  `sun60iw2p1-cpu-vf.dtsi` embedded (A76 up to 1992 MHz, A55 up to 1800, DSU up to 1296 depending on the
+  bin), AXP8191 DCDC3 (A76) / DCDC5 (A55 + DSU) raised before and lowered after the in-place PLL retune
+  (`ccu_nkmp_set_rate`: N, update bit 26, lock bit 28), every step flushed to the card log first
+  (`a733_sd_log_sync`); THS (0x02522000, vendor formula + efuse calibration) steps both clusters down above
+  90 C, floor at 105 C, back up below 80 C. Boot-arg `a733cpufreq=0|1|2|3` (off / <=800 mV / <=950 mV /
+  bin max, default 3). Triple press of the power button = `reboot_kernel(RB_HALT)` (clean unmount, then
+  PSCI off). `a733_firstboot.c` (bsd_init hook after the root mount, before launchd): one-time Setup-skip
+  preferences as upstream `sweet-root-tweaks.py` (purplebuddy, migration LastSystemVersion, SpringBoard
+  watchdogs, cloud config, data ark if the upstream container exists) + Reduce Motion / Transparency,
+  marker `/private/var/root/.a733-firstboot-v1`, boot-arg `a733setupskip=0|1|2`. ADT `--activation`:
+  /chosen security tuple (0,0,1,1) for Hactivation. Screen 20 Hz.

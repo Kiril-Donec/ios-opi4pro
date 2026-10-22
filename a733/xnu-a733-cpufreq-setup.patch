@@ -1,0 +1,992 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c0322dc..5f413e4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a733_sdmmc.c			standard
+ bsd/dev/a733_usbtouch.c			standard
+ bsd/dev/a733_power.c			standard
++bsd/dev/a733_firstboot.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a733_firstboot.c b/bsd/dev/a733_firstboot.c
+new file mode 100644
+index 0000000..e4e5c17
+--- /dev/null
++++ b/bsd/dev/a733_firstboot.c
+@@ -0,0 +1,247 @@
++/*
++ * A733: one-time changes to the iOS root on the first boot that has them
++ * (Setup skip), written by the kernel right after the root mount (hook in
++ * bsd_init), through HFS and its journal, before launchd runs.
++ *
++ * The keys are the ones upstream tools/sweet-root-tweaks.py merges into the
++ * phone images that reach the home screen: Setup done (purplebuddy), no
++ * mini-buddies / cloud configuration, the data migration recorded as done
++ * for 20H392 (no "iOS updated" screen and no hour-long datamigrator runs),
++ * SpringBoard without launch watchdogs, and the mobileactivationd data ark
++ * (only if its system container is where the upstream image has it; the
++ * Activated state itself comes from the /chosen security properties in the
++ * ADT, mkadt_a733.py --activation). Plus Reduce Motion and Reduce
++ * Transparency: every frame is drawn by the CPU here (no GPU).
++ *
++ * The preference files are written whole (XML plists), not merged. A marker
++ * file is written last, so this runs once; boot-arg a733setupskip=0 turns
++ * it off, a733setupskip=2 writes again even with the marker.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/namei.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++
++#define FB_MOBILE       501
++#define FB_PREFS        "/private/var/mobile/Library/Preferences/"
++#define FB_MARKER       "/private/var/root/.a733-firstboot-v1"
++#define FB_ARK_DIR      "/private/var/containers/Data/System/D90C94C4-F94E-4FCF-8A28-A93BE3846D8E"
++
++#define FB_HEAD "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" \
++	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" \
++	"<plist version=\"1.0\">\n<dict>\n"
++#define FB_TAIL "</dict>\n</plist>\n"
++
++static const struct {
++	const char *name;
++	const char *body;
++} fb_prefs[] = {
++	{ "com.apple.purplebuddy.plist",
++	  "\t<key>SetupDone</key>\n\t<true/>\n"
++	  "\t<key>SetupFinishedAllSteps</key>\n\t<true/>\n"
++	  "\t<key>SetupVersion</key>\n\t<integer>11</integer>\n"
++	  "\t<key>daemonizeNeedsToRun</key>\n\t<false/>\n" },
++	{ "com.apple.purplebuddy.notbackedup.plist",
++	  "\t<key>ShouldRunDiagnosticsMiniBuddy</key>\n\t<false/>\n"
++	  "\t<key>ShouldRunHSA2MiniBuddy</key>\n\t<false/>\n"
++	  "\t<key>ShouldRunKeychainSyncMiniBuddy</key>\n\t<false/>\n"
++	  "\t<key>ShouldRunMesaMiniBuddy</key>\n\t<false/>\n"
++	  "\t<key>ShouldRunPaymentMiniBuddy</key>\n\t<false/>\n"
++	  "\t<key>ShouldRunStandardMiniBuddy</key>\n\t<false/>\n"
++	  "\t<key>SilentICDPUpgrade</key>\n\t<false/>\n" },
++	{ "com.apple.managedconfiguration.notbackedup.plist",
++	  "\t<key>LockdownActivationIndicatesCloudConfigurationAvailable</key>\n\t<false/>\n" },
++	{ "com.apple.migration.plist",
++	  "\t<key>LastSystemVersion</key>\n\t<string>20H392</string>\n"
++	  "\t<key>DMUserDataDisposition</key>\n\t<dict>\n"
++	  "\t\t<key>SyntheticDidUpgrade</key>\n\t\t<false/>\n"
++	  "\t\t<key>buildVersion</key>\n\t\t<string>20H392</string>\n\t</dict>\n" },
++	{ "com.apple.springboard.plist",
++	  "\t<key>BKNoWatchdogs</key>\n\t<true/>\n"
++	  "\t<key>FBLaunchWatchdogExceptions</key>\n\t<dict>\n"
++	  "\t\t<key>com.apple.purplebuddy</key>\n\t\t<real>100</real>\n\t</dict>\n"
++	  "\t<key>MCForceShowCloudConfigurationUI</key>\n\t<false/>\n" },
++	{ "com.apple.Accessibility.plist",
++	  "\t<key>ReduceMotionEnabled</key>\n\t<true/>\n"
++	  "\t<key>EnhancedBackgroundContrastEnabled</key>\n\t<true/>\n" },
++};
++
++static const char fb_ark_body[] =
++    "\t<key>-ActivationState</key>\n\t<string>Activated</string>\n"
++    "\t<key>-BrickState</key>\n\t<false/>\n"
++    "\t<key>-BuildVersion</key>\n\t<string>20H392</string>\n"
++    "\t<key>-ProductVersion</key>\n\t<string>16.7.16</string>\n"
++    "\t<key>-DataMigrationCompleted</key>\n\t<true/>\n"
++    "\t<key>-PreSydroDataMigrationCompleted</key>\n\t<true/>\n";
++
++static bool
++fb_exists(const char *path)
++{
++	vnode_t vp = NULLVP;
++	if (vnode_lookup(path, 0, &vp, vfs_context_kernel()) != 0) {
++		return false;
++	}
++	vnode_put(vp);
++	return true;
++}
++
++static int
++fb_write(const char *path, const char *head, const char *body, const char *tail, uid_t uid, mode_t mode)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error) {
++		return error;
++	}
++	const char *parts[3] = { head, body, tail };
++	off_t off = 0;
++	for (unsigned i = 0; i < 3 && !error; i++) {
++		int len = (int)strlen(parts[i]), resid = 0;
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)parts[i], len, off, UIO_SYSSPACE,
++		    IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++		off += len;
++	}
++	if (!error) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, uid);
++		VATTR_SET(&va, va_gid, uid);
++		VATTR_SET(&va, va_mode, mode);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	int cerr = vnode_close(vp, FWRITE, ctx);
++	return error ? error : cerr;
++}
++
++/* mkdir path (one level) owned by uid; an existing directory is fine. */
++static int
++fb_mkdir(const char *path, uid_t uid)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct nameidata nd;
++	struct vnode_attr va;
++	vnode_t vp = NULLVP;
++
++	NDINIT(&nd, CREATE, OP_MKDIR, LOCKPARENT, UIO_SYSSPACE, CAST_USER_ADDR_T(path), ctx);
++	int error = namei(&nd);
++	if (error) {
++		return error;
++	}
++	if (nd.ni_vp != NULLVP) {
++		vnode_put(nd.ni_vp);
++	} else {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_type, VDIR);
++		VATTR_SET(&va, va_mode, 0755);
++		VATTR_SET(&va, va_uid, uid);
++		VATTR_SET(&va, va_gid, uid);
++		error = vn_mkdir(nd.ni_dvp, &vp, &nd, &va, ctx);
++		if (!error && vp != NULLVP) {
++			vnode_put(vp);
++		}
++	}
++	vnode_put(nd.ni_dvp);
++	nameidone(&nd);
++	return error;
++}
++
++/* True if the first 4 KiB of path contain needle (a binary plist string). */
++static bool
++fb_file_has(const char *path, const char *needle)
++{
++	static char buf[4096];
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int resid = 0;
++	if (vnode_open(path, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0) {
++		return false;
++	}
++	int error = vn_rdwr(UIO_READ, vp, buf, (int)sizeof(buf), 0, UIO_SYSSPACE, IO_NODELOCKED,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	(void)vnode_close(vp, FREAD, ctx);
++	if (error) {
++		return false;
++	}
++	size_t n = sizeof(buf) - (size_t)resid, nl = strlen(needle);
++	for (size_t i = 0; i + nl <= n; i++) {
++		if (memcmp(buf + i, needle, nl) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++void a733_firstboot_tweaks(void);
++
++void
++a733_firstboot_tweaks(void)
++{
++	static char path[256];
++	uint32_t mode = 1;
++	unsigned ok = 0, failed = 0;
++
++	PE_parse_boot_argn("a733setupskip", &mode, sizeof(mode));
++	if (mode == 0) {
++		return;
++	}
++	if (mode != 2 && fb_exists(FB_MARKER)) {
++		printf("A733 FIRSTBOOT: done before (%s), nothing to do\n", FB_MARKER);
++		return;
++	}
++	if (!fb_exists(FB_PREFS)) {
++		printf("A733 FIRSTBOOT: %s missing, not an iOS root; skipped\n", FB_PREFS);
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(fb_prefs) / sizeof(fb_prefs[0]); i++) {
++		snprintf(path, sizeof(path), "%s%s", FB_PREFS, fb_prefs[i].name);
++		int error = fb_write(path, FB_HEAD, fb_prefs[i].body, FB_TAIL, FB_MOBILE, 0600);
++		printf("A733 FIRSTBOOT: %s %s (%d)\n", fb_prefs[i].name, error ? "FAILED" : "written", error);
++		if (error) {
++			failed++;
++		} else {
++			ok++;
++		}
++	}
++	/* mobileactivationd data ark, only in the upstream image's container. */
++	if (fb_file_has(FB_ARK_DIR "/.com.apple.mobile_container_manager.metadata.plist",
++	    "com.apple.mobileactivationd")) {
++		int error = fb_mkdir(FB_ARK_DIR "/Library", FB_MOBILE);
++		if (!error) {
++			error = fb_mkdir(FB_ARK_DIR "/Library/internal", FB_MOBILE);
++		}
++		if (!error) {
++			error = fb_write(FB_ARK_DIR "/Library/internal/data_ark.plist", FB_HEAD, fb_ark_body, FB_TAIL,
++			    FB_MOBILE, 0600);
++		}
++		printf("A733 FIRSTBOOT: activation data ark %s (%d)\n", error ? "FAILED" : "written", error);
++		if (error) {
++			failed++;
++		} else {
++			ok++;
++		}
++	} else {
++		printf("A733 FIRSTBOOT: mobileactivationd container not at the upstream path; data ark skipped "
++		    "(activation from the ADT security properties only)\n");
++	}
++	if (failed == 0) {
++		int error = fb_write(FB_MARKER, "", "A733 first-boot changes v1 (Setup skip)\n", "", 0, 0644);
++		printf("A733 FIRSTBOOT: %u files written, marker %s (%d)\n", ok, error ? "FAILED" : "written", error);
++	} else {
++		printf("A733 FIRSTBOOT: %u written, %u failed; no marker, retried next boot\n", ok, failed);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/a733_power.c b/bsd/dev/a733_power.c
+index 723cd34..bd6dcff 100644
+--- a/bsd/dev/a733_power.c
++++ b/bsd/dev/a733_power.c
+@@ -18,8 +18,17 @@
+  * file systems; the microSD log is flushed first. Panic paths keep the old
+  * behaviour (nothing is powered off).
+  *
+- * CPU clock: the CPU PLL block (0x08870000) is only read and the result
+- * printed, with a timed loop on the boot A76 as a cross-check.
++ * Three presses within PK_TRIPLE_MS: a clean shutdown from the kernel
++ * (reboot_kernel(RB_HALT): processes stopped, disks synced and unmounted,
++ * then the PSCI power-off), for when the iOS slider does not get through.
++ *
++ * CPU frequency: the vendor Linux cpufreq ported (see cf_* below): chip bin
++ * from the efuse, OPP rows of that bin, AXP8191 rails raised before the
++ * in-place PLL retune and lowered after it; the THS sensors steps both
++ * clusters down above 90 C and back up below 80 C. It starts once the
++ * microSD log is up, and every step is flushed to the card before it is
++ * taken. Boot-arg a733cpufreq: 0 off, 1 rows up to 800 mV (no voltage
++ * raise), 2 up to 950 mV, 3 (default) the bin's top row.
+  *
+  * Boot-args: a733pwrkey=0 turns the button thread off, a733psci_off=0 keeps
+  * the old "halt = spin" behaviour.
+@@ -37,6 +46,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <sys/reboot.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -44,6 +54,8 @@ extern void thread_deallocate(thread_t);
+ extern void sweet_hid_key(int key, int down);
+ extern int (*PE_halt_restart)(unsigned int type);
+ extern void a733_sd_log_panic_flush(void);
++extern bool a733_sd_log_sync(void);
++extern int reboot_kernel(int howto, char *message);
+ #else
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -54,26 +66,41 @@ extern void a733_sd_log_panic_flush(void);
+ #define PK_POWER        0               /* sweet_hid_key: side button */
+ #define PK_VOLUP        1               /* volume up */
+ #define PK_CHORD_MS     1500
++#define PK_TRIPLE_MS    1500
+ 
+ struct pk_state {
+ 	bool down, chord;
+ 	uint64_t since_ms;
++	unsigned clicks;                /* short presses in the current triple window */
++	uint64_t first_ms;
+ };
+ 
+ typedef void (*pk_key_fn)(int key, int down);
+ 
+-/* One poll: press/release edges seen since the last poll, and the time. */
+-static void
++/*
++ * One poll: press/release edges seen since the last poll, and the time.
++ * Returns true on the third short press inside PK_TRIPLE_MS (clean shutdown).
++ */
++static bool
+ pk_step(struct pk_state *s, bool press, bool release, uint64_t now_ms, pk_key_fn key)
+ {
++	bool triple = false;
+ 	if (press && !s->down) {
+ 		s->down = true;
+ 		s->chord = false;
+ 		s->since_ms = now_ms;
+ 		key(PK_POWER, 1);
++		if (s->clicks == 0 || now_ms - s->first_ms > PK_TRIPLE_MS) {
++			s->clicks = 1;
++			s->first_ms = now_ms;
++		} else if (++s->clicks == 3) {
++			s->clicks = 0;
++			triple = true;
++		}
+ 	}
+ 	if (s->down && !s->chord && !release && now_ms - s->since_ms >= PK_CHORD_MS) {
+ 		s->chord = true;
++		s->clicks = 0;                  /* a hold is not a click */
+ 		key(PK_VOLUP, 1);
+ 	}
+ 	if (release && s->down) {
+@@ -84,6 +111,7 @@ pk_step(struct pk_state *s, bool press, bool release, uint64_t now_ms, pk_key_fn
+ 		s->down = false;
+ 		s->chord = false;
+ 	}
++	return triple;
+ }
+ 
+ /*
+@@ -123,6 +151,219 @@ cpu_pll_mhz(uint32_t pll, uint32_t clk)
+ 	return (24u * n) >> p;
+ }
+ 
++
++/*
++ * CPU frequency (port of the vendor Linux cpufreq: sun50i-cpufreq-nvmem.c,
++ * sun60iw2p1-cpu-vf.dtsi, ccu-sun60iw2-cpupll.c, axp2101-regulator.c).
++ * The chip's speed bin comes from the efuse (SID + 0x24C: dvfs_ori in bits
++ * 15:8, dvfs_bak in bits 23:16, bak wins when non-zero), mapped through
++ * vf_mapping_table to one column of the OPP tables below (24 MHz dcxo rows).
++ */
++#define CF_BINS         9
++
++struct cf_opp {
++	uint16_t mhz;
++	uint16_t mv[CF_BINS];           /* 0: this frequency is not for that bin */
++};
++
++/* vf_mapping_table (V0.9): efuse dvfs code -> table column */
++static const struct { uint8_t code; uint16_t index; } cf_vf_map[] = {
++	{ 0x00, 0x0000 }, { 0x01, 0x0100 }, { 0x11, 0x0101 }, { 0x02, 0x0200 }, { 0x12, 0x0201 }, { 0x03, 0x0300 }, { 0x04, 0x0400 }, { 0x05, 0x0500 }, { 0x06, 0x0600 }, { 0x14, 0x0401 }, { 0x15, 0x0501 },
++};
++static const uint16_t cf_bins[CF_BINS] = { 0x0000, 0x0100, 0x0200, 0x0300, 0x0400, 0x0500, 0x0600, 0x0401, 0x0501 };
++/* cluster0_opp_table, 24 MHz dcxo rows: MHz, mV per bin (0 = not for this bin) */
++static const struct cf_opp cf_a55[] = {
++	{  408, {  800,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{  720, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{  792, {    0,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{ 1008, {  800,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{ 1104, {    0,  800,    0,    0,    0,    0,    0,    0,    0 } },
++	{ 1200, {  800,  850,  800,  800,  800,  800,  800,  800,  800 } },
++	{ 1296, {    0,  900,  800,    0,    0,    0,    0,    0,    0 } },
++	{ 1392, {    0,  950,  850,  860,  840,  800,  840,  800,  800 } },
++	{ 1416, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{ 1512, {    0, 1000,  900,    0,  880,  820,    0,  820,  820 } },
++	{ 1608, {  900, 1050,  950,    0,  920,  860,    0,  860,  840 } },
++	{ 1704, {    0,    0, 1000,    0,  960,  900,    0,  900,  860 } },
++	{ 1800, { 1000,    0, 1050,    0, 1000,  950,    0,  950,  900 } },
++};
++/* cluster1_opp_table, 24 MHz dcxo rows: MHz, mV per bin (0 = not for this bin) */
++static const struct cf_opp cf_a76[] = {
++	{  408, {  800,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{  720, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{  792, {    0,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{ 1008, {  800,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{ 1200, {  800,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{ 1296, {    0,  800,    0,    0,    0,    0,    0,    0,    0 } },
++	{ 1392, {  800,  850,  800,  820,  800,  800,  800,  800,  800 } },
++	{ 1512, {  800,  900,  800,  860,  820,  800,  800,  800,  800 } },
++	{ 1608, {  850,  950,  850,  900,  840,  820,  850,  820,  820 } },
++	{ 1704, {  900, 1000,  900,    0,  870,  850,    0,  850,  840 } },
++	{ 1800, {  950, 1050,  950,    0,  920,  900,    0,  900,  870 } },
++	{ 1896, {    0,    0, 1000,    0,  970,  940,    0,  940,  900 } },
++	{ 1920, { 1000,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{ 1944, {    0,    0,    0,    0, 1000,  970,    0,  970,  930 } },
++	{ 1992, { 1050,    0,    0,    0, 1050, 1000,    0, 1000,  960 } },
++};
++/* dsu_opp_table, 24 MHz dcxo rows: MHz, mV per bin (0 = not for this bin) */
++static const struct cf_opp cf_dsu[] = {
++	{  288, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{  312, {    0,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{  528, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{  600, {    0,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{  744, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{  792, {    0,  800,  800,  800,  800,  800,  800,  800,  800 } },
++	{  840, {    0,  800,    0,    0,    0,    0,    0,    0,    0 } },
++	{  888, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{  912, {    0,  850,  800,  800,  800,  800,  800,  800,  800 } },
++	{  984, {    0,  900,  800,    0,    0,    0,    0,    0,    0 } },
++	{ 1032, {  800,    0,    0,    0,    0,    0,    0,    0,    0 } },
++	{ 1056, {    0,  950,  850,  860,  840,  800,  840,  800,  800 } },
++	{ 1152, {  900, 1000,  900,    0,  880,  820,    0,  820,  820 } },
++	{ 1200, {    0, 1050,  950,    0,  920,  860,    0,  860,  840 } },
++	{ 1224, {    0,    0, 1000,    0,  960,  900,    0,  900,  860 } },
++	{ 1248, {    0,    0, 1050,    0, 1000,  950,    0,  950,  900 } },
++	{ 1296, { 1000,    0,    0,    0,    0,    0,    0,    0,    0 } },
++};
++#define CF_N(t)         (sizeof(t) / sizeof((t)[0]))
++
++/* Efuse word at SID + 0x24C -> OPP column, and the vendor index it stands for. */
++static int
++cf_column(uint32_t sid_24c, uint16_t *index)
++{
++	uint32_t ori = (sid_24c >> 8) & 0xff, bak = (sid_24c >> 16) & 0xff;
++	uint32_t dvfs = bak ? bak : ori;
++	uint16_t idx = 0x0100;                  /* the vendor default when nothing matches */
++	for (unsigned i = 0; i < CF_N(cf_vf_map); i++) {
++		if (cf_vf_map[i].code == dvfs) {
++			idx = cf_vf_map[i].index;
++			break;
++		}
++	}
++	*index = idx;
++	/* 0x0101 / 0x0201 have no rows in the V0.9 tables: use their base bins. */
++	uint16_t col_idx = (idx == 0x0101 || idx == 0x0201) ? (uint16_t)(idx & 0xff00) : idx;
++	for (int c = 0; c < CF_BINS; c++) {
++		if (cf_bins[c] == col_idx) {
++			return c;
++		}
++	}
++	return -1;
++}
++
++/* Highest row of t for column col with mv <= max_mv and mhz in [min_mhz, max_mhz]; -1 if none. */
++static int
++cf_pick(const struct cf_opp *t, unsigned n, int col, uint16_t max_mv, uint16_t min_mhz, uint16_t max_mhz)
++{
++	int best = -1;
++	for (unsigned i = 0; i < n; i++) {
++		uint16_t mv = t[i].mv[col];
++		if (mv && mv <= max_mv && t[i].mhz >= min_mhz && t[i].mhz <= max_mhz) {
++			best = (int)i;
++		}
++	}
++	return best;
++}
++
++/* Next usable row below / above row r for column col (r itself if none). */
++static int
++cf_step(const struct cf_opp *t, unsigned n, int col, int r, int dir, uint16_t min_mhz, int limit)
++{
++	for (int i = r + dir; i >= 0 && i < (int)n && (dir < 0 || i <= limit); i += dir) {
++		if (t[i].mv[col] && t[i].mhz >= min_mhz) {
++			return i;
++		}
++	}
++	return r;
++}
++
++/* AXP8191 DCDC2-5: 0.5 V + 10 mV/step up to 1.2 V (code 0x46), then 20 mV/step. */
++static uint8_t
++cf_mv_code(uint16_t mv)
++{
++	if (mv < 500) {
++		mv = 500;
++	}
++	if (mv <= 1200) {
++		return (uint8_t)((mv - 500) / 10);
++	}
++	return (uint8_t)(0x47 + (mv - 1220 + 19) / 20);
++}
++
++static uint16_t
++cf_code_mv(uint8_t code)
++{
++	code &= 0x7f;
++	return code <= 0x46 ? (uint16_t)(500 + 10 * code) : (uint16_t)(1220 + 20 * (code - 0x47));
++}
++
++/* CPU PLL N for mhz at 24 MHz with P = 1 (N 28..94); 0 if not reachable. */
++static uint32_t
++cf_pll_n(uint16_t mhz)
++{
++	if (mhz % 24) {
++		return 0;
++	}
++	uint32_t n = mhz / 24u;
++	return (n >= 28 && n <= 94) ? n : 0;
++}
++
++/*
++ * THS (sun60iw2p1, sunxi_thermal.c): code -> millidegrees C, and the per
++ * sensor calibration value from the three efuse words at SID + 0x244..0x24C.
++ */
++static int
++ths_mc(int reg)
++{
++	return reg > 1769 ? (reg - 2822) * -62 : (reg - 2835) * -59;
++}
++
++static int
++ths_calib(const uint32_t cal[3], unsigned i, uint32_t *cdata)
++{
++	int ft = (int)(cal[0] & 0xfff), reg;
++	if (!ft) {
++		return -1;
++	}
++	switch (i) {
++	case 0: reg = (int)((cal[0] >> 12) & 0xfff); break;
++	case 1: reg = (int)(((cal[0] >> 24) | (cal[1] << 8)) & 0xfff); break;
++	case 2: reg = (int)((cal[1] >> 4) & 0xfff); break;
++	case 3: reg = (int)((cal[1] >> 16) & 0xfff); break;
++	case 4: reg = (int)(((cal[1] >> 28) | (cal[2] << 4)) & 0xfff); break;
++	default: return -1;
++	}
++	int delta = (ft * 100 - ths_mc(reg)) / -62;
++	int c = 0x800 - delta;
++	if (c & ~0xfff) {
++		return -1;
++	}
++	*cdata = (uint32_t)c;
++	return 0;
++}
++
++/* Thermal policy (vendor trips: passive 90 C, critical 110 C). */
++#define CF_HOT_MC       90000
++#define CF_COOL_MC      80000
++#define CF_CRIT_MC      105000
++
++enum { CF_HOLD = 0, CF_DOWN = -1, CF_UP = 1, CF_FLOOR = -2 };
++
++static int
++cf_thermal_action(int mc)
++{
++	if (mc >= CF_CRIT_MC) {
++		return CF_FLOOR;
++	}
++	if (mc >= CF_HOT_MC) {
++		return CF_DOWN;
++	}
++	if (mc < CF_COOL_MC) {
++		return CF_UP;
++	}
++	return CF_HOLD;
++}
++
+ #ifndef A733_POWER_HOST_TEST
+ /* ---------------------------------------------------------------- kernel */
+ 
+@@ -336,6 +577,288 @@ pw_twi_init(void)
+ 	return true;
+ }
+ 
++static void pw_cpu_report(void);
++#define CF_NO_TEMP              (-2147483647 - 1)
++
++/* ------------------------------------------------------- CPU frequency */
++
++#define AXP8191_DCDC_CTL1       0x10            /* bit 2 DCDC3, bit 4 DCDC5 enabled */
++#define AXP8191_DC3_VOL         0x14            /* DCDC3: Cortex-A76 cluster */
++#define AXP8191_DC5_VOL         0x16            /* DCDC5: Cortex-A55 cluster + DSU */
++#define CPUPLL_A55              0x1000
++#define CPUPLL_A76              0x2000
++#define CPUPLL_DSU              0x3000
++#define PLL_UPDATE              (1u << 26)      /* "clear" in ccu-sun60iw2-cpupll.c */
++#define PLL_LOCK                (1u << 28)
++#define CF_MAX_MV               1050            /* highest voltage in the vendor tables */
++#define CF_FLOOR_MHZ            1008            /* thermal floor for both clusters */
++
++#define SID_DVFS                0x24c
++#define SID_THS_CAL             0x244           /* + 0x248, 0x24c */
++#define CCU_GPADC0_24M          0x0fc0          /* bit 31 gate, 26:24 mux (0 sys24M), 4:0 M */
++#define CCU_GPADC0_BGR          0x0fc4          /* bit 0 gate, bit 16 reset */
++#define CCU_THS0_BGR            0x0fe4          /* bit 0 gate, bit 16 reset */
++#define THS_CTRL0               0x00
++#define THS_ENABLE              0x04
++#define THS_PC                  0x08
++#define THS_DATA_INTS           0x20
++#define THS_MFC                 0x30
++#define THS_CALIB               0xa0
++#define THS_DATA                0xc0
++#define THS_SENSORS             5               /* 0: A76 (cpub), 3: A55 (cpul) */
++
++static struct {
++	vm_offset_t sid, ths, ccu;
++	int col;                        /* OPP column (chip bin); -1: cpufreq off */
++	uint16_t index;
++	int a76, a55, dsu;              /* current OPP rows; -1 = U-Boot's clock */
++	int a76_max, a55_max;           /* targets of the chosen level */
++	uint16_t v3, v5;                /* rail voltages now (mV) */
++	bool ths_ok;
++	int last_mc;
++} cf = { .col = -1, .a76 = -1, .a55 = -1, .dsu = -1 };
++
++static void
++cf_sync(void)
++{
++	(void)a733_sd_log_sync();
++}
++
++static int
++cf_read_mv(uint8_t reg, uint16_t *mv)
++{
++	uint8_t code;
++	int error = twi_read(AXP8191_ADDR, reg, &code);
++	if (!error) {
++		*mv = cf_code_mv(code);
++	}
++	return error;
++}
++
++/* Rail to mv, then wait for the 250 uV/us ramp (vendor DT) twice over, then read back. */
++static int
++cf_set_mv(uint8_t reg, uint16_t mv, uint16_t *cur)
++{
++	uint8_t code = cf_mv_code(mv), back = 0;
++	if (mv > CF_MAX_MV || mv < 700) {
++		return EINVAL;
++	}
++	printf("A733 CPUFREQ: rail 0x%02x %u -> %u mV\n", reg, *cur, mv);
++	cf_sync();
++	if (twi_write(AXP8191_ADDR, reg, code) != 0) {
++		return EIO;
++	}
++	uint32_t delta = mv > *cur ? (uint32_t)(mv - *cur) : (uint32_t)(*cur - mv);
++	delay((int)(200 + delta * 8));
++	if (twi_read(AXP8191_ADDR, reg, &back) != 0 || (back & 0x7f) != code) {
++		printf("A733 CPUFREQ: rail 0x%02x read back 0x%02x, wanted 0x%02x\n", reg, back, code);
++		return EIO;
++	}
++	*cur = mv;
++	return 0;
++}
++
++/* In-place PLL retune as ccu_nkmp_set_rate(): N, update bit, wait for lock. */
++static int
++cf_set_pll(uint32_t off, uint16_t mhz, const char *name)
++{
++	uint32_t n = cf_pll_n(mhz), clk = rd32(pw.cpupll, off + 0x1c);
++	if (!n || ((clk >> 24) & 7) != 3 || ((clk >> 16) & 3) != 0) {
++		printf("A733 CPUFREQ: %s not on its own PLL with P=1 (clk 0x%08x); left alone\n", name, clk);
++		return EINVAL;
++	}
++	printf("A733 CPUFREQ: %s PLL -> %u MHz (N %u)\n", name, mhz, n);
++	cf_sync();
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	uint32_t reg = (rd32(pw.cpupll, off) & ~(0xffu << 8)) | (n << 8);
++	wr32(pw.cpupll, off, reg);
++	wr32(pw.cpupll, off, reg | PLL_UPDATE);
++	int error = 0;
++	unsigned i, locked = 0;
++	for (i = 0; i < 1000 && (rd32(pw.cpupll, off) & PLL_UPDATE); i++) {
++		delay(10);
++	}
++	if (i == 1000) {
++		error = ETIMEDOUT;
++	}
++	for (i = 0; !error && i < 7000 && locked < 3; i++) {
++		locked = (rd32(pw.cpupll, off) & PLL_LOCK) ? locked + 1 : 0;
++		delay(3);
++	}
++	if (!error && locked < 3) {
++		error = ETIMEDOUT;
++	}
++	ml_set_interrupts_enabled(istate);
++	if (error) {
++		printf("A733 CPUFREQ: %s PLL did not lock (0x%08x)\n", name, rd32(pw.cpupll, off));
++	}
++	return error;
++}
++
++/* Move to the given rows: raise rails first, retune, then lower rails. */
++static int
++cf_apply(int a76, int a55, int dsu)
++{
++	uint16_t w3 = cf_a76[a76].mv[cf.col];
++	uint16_t w5 = cf_a55[a55].mv[cf.col] > cf_dsu[dsu].mv[cf.col] ? cf_a55[a55].mv[cf.col] : cf_dsu[dsu].mv[cf.col];
++	int error = 0;
++	if (w3 > cf.v3) {
++		error = cf_set_mv(AXP8191_DC3_VOL, w3, &cf.v3);
++	}
++	if (!error && w5 > cf.v5) {
++		error = cf_set_mv(AXP8191_DC5_VOL, w5, &cf.v5);
++	}
++	if (error) {
++		return error;
++	}
++	if (a76 != cf.a76 && (error = cf_set_pll(CPUPLL_A76, cf_a76[a76].mhz, "A76")) == 0) {
++		cf.a76 = a76;
++	}
++	if (!error && a55 != cf.a55 && (error = cf_set_pll(CPUPLL_A55, cf_a55[a55].mhz, "A55")) == 0) {
++		cf.a55 = a55;
++	}
++	if (!error && dsu != cf.dsu && (error = cf_set_pll(CPUPLL_DSU, cf_dsu[dsu].mhz, "DSU")) == 0) {
++		cf.dsu = dsu;
++	}
++	if (error) {
++		return error;                   /* keep the higher voltage */
++	}
++	if (w3 < cf.v3) {
++		error = cf_set_mv(AXP8191_DC3_VOL, w3, &cf.v3);
++	}
++	if (!error && w5 < cf.v5) {
++		error = cf_set_mv(AXP8191_DC5_VOL, w5, &cf.v5);
++	}
++	return error;
++}
++
++static bool
++ths_init(void)
++{
++	uint32_t cal[3];
++	wr32(cf.ccu, CCU_GPADC0_24M, (rd32(cf.ccu, CCU_GPADC0_24M) & ~((7u << 24) | 0x1fu)) | (1u << 31));
++	wr32(cf.ccu, CCU_GPADC0_BGR, rd32(cf.ccu, CCU_GPADC0_BGR) | (1u << 16) | 1u);
++	wr32(cf.ccu, CCU_THS0_BGR, rd32(cf.ccu, CCU_THS0_BGR) | (1u << 16) | 1u);
++	delay(50);
++	for (unsigned i = 0; i < 3; i++) {
++		cal[i] = rd32(cf.sid, SID_THS_CAL + 4 * i);
++	}
++	unsigned calibrated = 0;
++	for (unsigned i = 0; i < THS_SENSORS; i++) {
++		uint32_t cdata;
++		if (ths_calib(cal, i, &cdata) == 0) {
++			uint32_t o = THS_CALIB + (i / 2) * 4, sh = (i % 2) * 16;
++			wr32(cf.ths, o, (rd32(cf.ths, o) & ~(0xfffu << sh)) | (cdata << sh));
++			calibrated++;
++		}
++	}
++	/* sun60iw2_thermal_init() */
++	wr32(cf.ths, THS_CTRL0, 47u | (479u << 16));
++	wr32(cf.ths, THS_MFC, (1u << 2) | 1u);
++	wr32(cf.ths, THS_PC, 28u << 12);
++	wr32(cf.ths, THS_DATA_INTS, 0x1f);
++	wr32(cf.ths, THS_ENABLE, 0x1f);
++	printf("A733 THERMAL: THS on, efuse calibration 0x%08x 0x%08x 0x%08x (%u/%u sensors)\n",
++	    cal[0], cal[1], cal[2], calibrated, THS_SENSORS);
++	return true;
++}
++
++/* Hottest sensor in millidegrees, or CF_NO_TEMP without data. */
++static int
++ths_max_mc(void)
++{
++	int best = CF_NO_TEMP;
++	uint32_t ints = rd32(cf.ths, THS_DATA_INTS);
++	for (unsigned i = 0; i < THS_SENSORS; i++) {
++		uint32_t v = rd32(cf.ths, THS_DATA + 4 * i) & 0xfff;
++		if (v && (ints & (1u << i))) {
++			int mc = ths_mc((int)v);
++			best = mc > best ? mc : best;
++		}
++	}
++	return best;
++}
++
++static void
++cf_init(void)
++{
++	uint32_t level = 3;
++	PE_parse_boot_argn("a733cpufreq", &level, sizeof(level));
++	if (!cf.sid || !pw.cpupll || level == 0) {
++		printf("A733 CPUFREQ: off (a733cpufreq=%u)\n", level);
++		return;
++	}
++	uint32_t word = rd32(cf.sid, SID_DVFS);
++	cf.col = cf_column(word, &cf.index);
++	uint16_t max_mv = level == 1 ? 800 : level == 2 ? 950 : CF_MAX_MV;
++	uint8_t ctl = 0;
++	if (cf.col < 0 || cf_read_mv(AXP8191_DC3_VOL, &cf.v3) || cf_read_mv(AXP8191_DC5_VOL, &cf.v5) ||
++	    twi_read(AXP8191_ADDR, AXP8191_DCDC_CTL1, &ctl) || (ctl & 0x14) != 0x14) {
++		printf("A733 CPUFREQ: efuse 0x%08x column %d, PMIC rails unreadable or off (ctl 0x%02x); off\n",
++		    word, cf.col, ctl);
++		cf.col = -1;
++		return;
++	}
++	cf.a76_max = cf_pick(cf_a76, CF_N(cf_a76), cf.col, max_mv, CF_FLOOR_MHZ, 2256);
++	cf.a55_max = cf_pick(cf_a55, CF_N(cf_a55), cf.col, max_mv, CF_FLOOR_MHZ, 2256);
++	int dsu = cf_pick(cf_dsu, CF_N(cf_dsu), cf.col, max_mv, 672, 2256);
++	if (cf.a76_max < 0 || cf.a55_max < 0 || dsu < 0) {
++		printf("A733 CPUFREQ: no OPP for column %d at %u mV; off\n", cf.col, max_mv);
++		cf.col = -1;
++		return;
++	}
++	printf("A733 CPUFREQ: efuse 0x%08x -> vf%04x (column %d), level %u (<= %u mV): A76 %u MHz %u mV, "
++	    "A55 %u MHz %u mV, DSU %u MHz; rails now DCDC3 %u mV, DCDC5 %u mV\n",
++	    word, cf.index, cf.col, level, max_mv, cf_a76[cf.a76_max].mhz, cf_a76[cf.a76_max].mv[cf.col],
++	    cf_a55[cf.a55_max].mhz, cf_a55[cf.a55_max].mv[cf.col], cf_dsu[dsu].mhz, cf.v3, cf.v5);
++	int error = cf_apply(cf.a76_max, cf.a55_max, dsu);
++	printf("A733 CPUFREQ: %s\n", error ? "stopped (see above)" : "done");
++	pw_cpu_report();
++	cf_sync();
++}
++
++/* Once a second: step both clusters one row down when hot, back up when cool. */
++static void
++cf_thermal_tick(void)
++{
++	int mc = ths_max_mc();
++	if (mc == CF_NO_TEMP) {
++		return;
++	}
++	int act = cf_thermal_action(mc), a76 = cf.a76, a55 = cf.a55;
++	if (cf.col >= 0 && cf.a76 >= 0 && cf.a55 >= 0 && cf.dsu >= 0) {
++		int f76 = cf_pick(cf_a76, CF_N(cf_a76), cf.col, CF_MAX_MV, CF_FLOOR_MHZ, CF_FLOOR_MHZ);
++		int f55 = cf_pick(cf_a55, CF_N(cf_a55), cf.col, CF_MAX_MV, CF_FLOOR_MHZ, CF_FLOOR_MHZ);
++		if (act == CF_FLOOR) {
++			a76 = f76 >= 0 ? f76 : a76;
++			a55 = f55 >= 0 ? f55 : a55;
++		} else if (act != CF_HOLD) {
++			a76 = cf_step(cf_a76, CF_N(cf_a76), cf.col, cf.a76, act, CF_FLOOR_MHZ, cf.a76_max);
++			a55 = cf_step(cf_a55, CF_N(cf_a55), cf.col, cf.a55, act, CF_FLOOR_MHZ, cf.a55_max);
++		}
++		if (a76 != cf.a76 || a55 != cf.a55) {
++			printf("A733 THERMAL: %d.%d C -> A76 %u MHz, A55 %u MHz\n", mc / 1000, (mc % 1000) / 100,
++			    cf_a76[a76].mhz, cf_a55[a55].mhz);
++			(void)cf_apply(a76, a55, cf.dsu);
++		}
++	}
++	if (cf.last_mc == 0 || mc - cf.last_mc >= 5000 || cf.last_mc - mc >= 5000) {
++		cf.last_mc = mc;
++		printf("A733 THERMAL: %d.%d C, A76 %u MHz, A55 %u MHz\n", mc / 1000, (mc % 1000) / 100,
++		    cf.a76 >= 0 ? cf_a76[cf.a76].mhz : 0, cf.a55 >= 0 ? cf_a55[cf.a55].mhz : 0);
++	}
++}
++
++static void
++pw_shutdown(void)
++{
++	static char msg[] = "A733 power button: triple press";
++	printf("A733 POWER: triple press: clean shutdown (stop processes, sync, unmount, power off)\n");
++	(void)a733_sd_log_sync();
++	int error = reboot_kernel(RB_HALT, msg);
++	printf("A733 POWER: reboot_kernel returned %d\n", error);
++}
++
+ static void
+ pw_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -359,9 +882,22 @@ pw_thread(__unused void *arg, __unused wait_result_t wr)
+ 		printf("A733 POWER: no PMIC on R_TWI0; power button off\n");
+ 		return;
+ 	}
+-	printf("A733 POWER: power button ready (short press: lock/wake, hold %u ms: slide to power off)\n",
+-	    PK_CHORD_MS);
+-	for (;;) {
++	printf("A733 POWER: power button ready (short press: lock/wake, hold %u ms: slide to power off, "
++	    "3 presses: clean shutdown)\n", PK_CHORD_MS);
++	bool cf_started = false;
++	for (uint32_t tick = 1;; tick++) {
++		/* Once a second: start cpufreq when the card log is up (or after 60 s), then thermal. */
++		if (tick % 20 == 0) {
++			if (!cf_started && (a733_sd_log_sync() || tick >= 1200)) {
++				cf_started = true;
++				cf_init();
++				if (cf.ths && cf.ccu && cf.sid) {
++					cf.ths_ok = ths_init();
++				}
++			} else if (cf_started && cf.ths_ok) {
++				cf_thermal_tick();
++			}
++		}
+ 		bool press = false, release = false;
+ 		for (unsigned c = 0; c < 2; c++) {
+ 			uint8_t st;
+@@ -375,7 +911,9 @@ pw_thread(__unused void *arg, __unused wait_result_t wr)
+ 				release |= (edges & pk_chips[c].release) != 0;
+ 			}
+ 		}
+-		pk_step(&pw.pk, press, release, pw_now_ms(), pw_key);
++		if (pk_step(&pw.pk, press, release, pw_now_ms(), pw_key)) {
++			pw_shutdown();
++		}
+ 		pw_sleep_ms(50);
+ 	}
+ }
+@@ -437,8 +975,8 @@ void
+ a733_power_start(void)
+ {
+ 	DTEntry node;
+-	uintptr_t const *twi = NULL, *rccu = NULL, *cpupll = NULL;
+-	unsigned int s1 = 0, s2 = 0, s3 = 0;
++	uintptr_t const *twi = NULL, *rccu = NULL, *cpupll = NULL, *sid = NULL, *ths = NULL, *ccu = NULL;
++	unsigned int s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
+ 	uint32_t on = 1, psci_off = 1;
+ 	thread_t thread;
+ 	static bool started;
+@@ -457,6 +995,14 @@ a733_power_start(void)
+ 	if (pw.cpupll) {
+ 		pw_cpu_report();
+ 	}
++	/* Optional (cpufreq / thermal): efuse, THS and the main CCU for the THS clocks. */
++	if (SecureDTGetProperty(node, "sid-reg", (void const **)&sid, &s4) == kSuccess && s4 >= 2 * sizeof(uintptr_t) &&
++	    SecureDTGetProperty(node, "ths-reg", (void const **)&ths, &s5) == kSuccess && s5 >= 2 * sizeof(uintptr_t) &&
++	    SecureDTGetProperty(node, "ccu-reg", (void const **)&ccu, &s6) == kSuccess && s6 >= 2 * sizeof(uintptr_t)) {
++		cf.sid = ml_io_map(sid[0], 0x1000);
++		cf.ths = ml_io_map(ths[0], 0x1000);
++		cf.ccu = ml_io_map(ccu[0], 0x2000);
++	}
+ 	PE_parse_boot_argn("a733psci_off", &psci_off, sizeof(psci_off));
+ 	if (psci_off) {
+ 		PE_halt_restart = a733_halt_restart;
+diff --git a/bsd/dev/a733_sdmmc.c b/bsd/dev/a733_sdmmc.c
+index a365edf..60c5893 100644
+--- a/bsd/dev/a733_sdmmc.c
++++ b/bsd/dev/a733_sdmmc.c
+@@ -1460,6 +1460,24 @@ sdlog_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * Flush the console log now, from normal thread context (a733_power.c calls
++ * it before every CPU voltage / PLL step). False while the log is not set up.
++ */
++bool a733_sd_log_sync(void);
++
++bool
++a733_sd_log_sync(void)
++{
++	if (!sdlog.ready || sdlog.failed) {
++		return false;
++	}
++	lck_mtx_lock(&a733_sd_lock);
++	int error = sdlog_flush();
++	lck_mtx_unlock(&a733_sd_lock);
++	return error == 0 || error == EAGAIN;
++}
++
+ /*
+  * Panic: no locks, no threads. Bring the controller back to a known state
+  * (it may have been interrupted mid-command) and write the log once more.
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index dd20279..925e458 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -968,6 +968,13 @@ bsd_init(void)
+ #endif
+ 		}
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* A733: one-time Setup-skip preferences, before launchd (bsd/dev/a733_firstboot.c). */
++		extern void a733_firstboot_tweaks(void);
++		a733_firstboot_tweaks();
++	}
++#endif
+ 
+ 
+ #if CONFIG_NETBOOT
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index db90152..876c034 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -547,8 +547,8 @@ AppleCLCD::start(IOService *provider)
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+ 	}
+-	/* A733: the row-order scaler keeps up with 30 Hz on the A76 (Qualcomm path: 10). */
+-	uint32_t hz = fPhys == 0xBBF11000ULL ? 30 : 10;
++	/* A733: 20 Hz leaves the CPU for iOS itself (board test #13 at 30 Hz; Qualcomm path: 10). */
++	uint32_t hz = fPhys == 0xBBF11000ULL ? 20 : 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);

@@ -6,3 +6,8 @@
  */
 void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
 int cpu_number(void);
+/* 9999r: cpufreq PLL retune with interrupts off, clean shutdown (osfmk/arm, bsd/sys/reboot.h). */
+typedef int boolean_t;
+#define FALSE 0
+boolean_t ml_set_interrupts_enabled(boolean_t enable);
+#define RB_HALT 0x08

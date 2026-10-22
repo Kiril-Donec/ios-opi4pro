@@ -296,3 +296,7 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   up = "slide to power off"), PE_halt_restart -> PSCI SYSTEM_OFF/RESET after the log flush, CPU PLL
   report + timed loop. `serial=1` stays: XNU never uses the A733 UART; that boot-arg is the screen
   console, which also feeds the card log.
+- **2026-10-22 22:22, partition 1 v8 (8 cores, 30 Hz scaler, power button, PSCI off) written to the card**
+  (owner confirmed): kernel CI 39835724694 (commit 1e5c0de), ADT v7 + `--a55 --power`, cpus=8, image
+  15b33e51...69dc, read-back verified; previous v7 (7d3035ef...) saved locally. Fallbacks: v8 cpus=4
+  514c8a49...849d, cpus=2 a6567335...8ad8. iOS partition = clean image, journal on. Board test #9 pending.

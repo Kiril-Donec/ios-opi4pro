@@ -343,3 +343,8 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   watchdogs, cloud config, data ark if the upstream container exists) + Reduce Motion / Transparency,
   marker `/private/var/root/.a733-firstboot-v1`, boot-arg `a733setupskip=0|1|2`. ADT `--activation`:
   /chosen security tuple (0,0,1,1) for Hactivation. Screen 20 Hz.
+- **2026-10-23, partition 1 v9 written to the card** (owner confirmed): kernel CI 39864370989 (commit
+  ba5e0b9, 9999r; CI ADT reproduces its 2cpu payload 1621c025... byte for byte), ADT v8c + `--activation`
+  + /a733-power sid/ths/ccu, old Stage0 (body 68d2e755...), cpus=7, `a733cpufreq=3`: 9a4ee85b...e270,
+  read-back verified. Fallbacks: `a733cpufreq=1` (<=800 mV, no voltage raise) 6ad12951...5a42,
+  `a733cpufreq=0` 6e51ed59...f5bd. First boot will also write the Setup-skip preferences. Test #14 pending.

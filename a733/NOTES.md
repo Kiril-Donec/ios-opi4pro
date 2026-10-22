@@ -180,3 +180,7 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - Driver: root writes with boot-arg `sdrw=1` (`sd_write_root`, bounded to partition 2 and never over the
   log file; all CMD24/25 still go through `sd_write_sectors`, which also refuses sector 0).
   `package_xnu_a733.py --sdroot --sdrw` adds `sdrw=1 rootrw=1`; CI packs the sdroot payload that way.
+- **2026-10-22 14:49, partition 1 v3 (writable root) on the real card** (owner confirmed): CI run
+  39771632443 (commit afd11f8, kernel sha256 6fda4d2d...f790, payload 2dd5f990...2896 with
+  `sdrw=1 rootrw=1`, ADT without `interrupts`), v22 stage0 40605aeb...; image 8491aa0b...eab1,
+  read-back verified; previous v2 (93309c82...) saved locally. Board test #4 pending.

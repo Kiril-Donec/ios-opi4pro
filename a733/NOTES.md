@@ -270,3 +270,6 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   confirmed): kernel CI 39794332437 (commit 415dd69; CI ADT reproduces its 2cpu payload 63516538...
   byte for byte), ADT v6 + /a733-usb, image 7d3035ef...9b33, read-back verified; previous v6
   (576dbdfb...) saved locally. cpus=1 twin 62d9851f...3088 ready as fallback. Board test #7 pending.
+- **🎉 2026-10-22 board test #7 (owner report): the display's USB touch screen works in iOS** with partition 1
+  v7 (patch 9999p, default orientation, no axis boot-args). Card log not read yet (which USB 2.0 port,
+  direct or behind a hub).

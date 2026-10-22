@@ -216,3 +216,13 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   (no damage, no accumulated darkening); a panic redraws the full text console; `a733fb_console=1` keeps the
   old full console over graphics. Host test `tests/test_console_graphics_patch.py` rebuilds the patched
   console code: scroll order, frame untouched above the band, band = darkened frame + text, panic text.
+- **SD speed (driver):** the vendor v5p3x driver runs SDR modes with module clock = 2 x card clock and
+  internal divider 0, so the card clock is module/2 (div 0) or module/(4 div). With the U-Boot module
+  clock of 100 MHz the old transfer divider 2 gave only **12.5 MHz**. Now: identification div 63
+  (397 kHz), Default Speed div 1 (25 MHz), then **High Speed** (CMD6 query/switch group 1 function 1,
+  52M-table phases: cmd+data drive 180, sample phase 1) at div 0 = **50 MHz**, kept only if sector 0 reads
+  back identical; any failure returns to 25 MHz. `sdhs=0` stays at Default Speed.
+- **Second Cortex-A76:** `xnu-a733-smp-a76.patch` (9999o) lets SweetCPU accept MPIDR 0x700 (boot stays 0x600);
+  `mkadt_a733.py --a76-pair` adds cpu1 (0x700, state "waiting", same cluster); XNU only uses it with
+  `cpus=2` (`package_xnu_a733.py --cpus 2`, refused without the pair ADT). CI packs both
+  `a733-xnu-sdroot.payload` (cpus=1) and `a733-xnu-sdroot-2cpu.payload` (cpus=2).

@@ -12,10 +12,10 @@ index 21cdb5c..b67565c 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a733_sdmmc.c b/bsd/dev/a733_sdmmc.c
 new file mode 100644
-index 0000000..7f613e0
+index 0000000..a365edf
 --- /dev/null
 +++ b/bsd/dev/a733_sdmmc.c
-@@ -0,0 +1,1851 @@
+@@ -0,0 +1,1954 @@
 +/*
 + * Allwinner A733 microSD root device (SMHC0), polled PIO, read-only root.
 + *
@@ -48,8 +48,13 @@ index 0000000..7f613e0
 + *
 + * Boot-args: sdpart=N (1-based MBR/GPT index, default 2), sdforce=1 (accept
 + * a partition without an HFS+ volume header), sdclkdiv=N (override the
-+ * transfer clock divider), sd4bit=0 (stay on a 1-bit bus), sdrw=1 (writable
-+ * root partition), a733log=0, a733logsecs=N, a733sdlog=1.
++ * transfer clock divider, disables High Speed), sd4bit=0 (stay on a 1-bit
++ * bus), sdhs=0 (stay at Default Speed 25 MHz), sdrw=1 (writable root
++ * partition), a733log=0, a733logsecs=N, a733sdlog=1.
++ *
++ * Speed: Default Speed 25 MHz after identification, then High Speed 50 MHz
++ * (CMD6 group 1 function 1) if the card supports it and sector 0 reads back
++ * identical at the new speed; otherwise it stays at 25 MHz.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_SD_HOST_TEST)
 +
@@ -210,6 +215,10 @@ index 0000000..7f613e0
 +#define SD_MAX_BLOCKS           256u            /* per CMD18: 128 KiB */
 +#define SD_IDENT_HZ             400000ull
 +#define SD_DS_HZ                25000000ull
++#define SD_HS_HZ                50000000ull
++#define SD_CMD6_CHECK_HS        0x00fffff1u     /* mode 0: query group 1 function 1 */
++#define SD_CMD6_SWITCH_HS       0x80fffff1u     /* mode 1: switch group 1 to function 1 */
++#define NTSR_SAMPLE_PHASE_HS    0x110u          /* cmd and data sample phase 1 (52M table) */
 +#define SD_MOD_MAX_HZ           408000000ull    /* identification still <= 400 kHz */
 +
 +#define HFS_SIG_PLUS            0x482bu         /* 'H+' */
@@ -270,26 +279,44 @@ index 0000000..7f613e0
 +}
 +
 +/*
-+ * Card clock upper bound for internal divider d: mod / (2 d), or mod for
-+ * d == 0. In the 2x timing mode the vendor driver uses, the real card clock
-+ * is half of this; the bound stays safe whichever way the divider and the 2x
-+ * mode combine.
++ * Card clock for internal divider d in the 2x timing mode: the vendor driver
++ * (sunxi_mmc_clk_set_rate_for_sdmmc_v5p3x, SDR modes) sets the module clock
++ * to twice the card clock with d = 0, so the card runs at module / 2 for
++ * d == 0 and module / (4 d) otherwise.
 + */
 +static uint64_t
-+a733sd_card_hz_max(uint64_t mod_hz, uint32_t div)
++a733sd_card_hz(uint64_t mod_hz, uint32_t div)
 +{
-+	return div ? mod_hz / (2ull * div) : mod_hz;
++	return div ? mod_hz / (4ull * div) : mod_hz / 2;
 +}
 +
-+/* Smallest divider whose upper bound is <= limit_hz, or 256 if none fits. */
++/* Smallest divider whose card clock is <= limit_hz, or 256 if none fits. */
 +static uint32_t
 +a733sd_pick_div(uint64_t mod_hz, uint64_t limit_hz)
 +{
-+	if (mod_hz <= limit_hz) {
++	if (mod_hz / 2 <= limit_hz) {
 +		return 0;
 +	}
-+	uint64_t div = (mod_hz + 2 * limit_hz - 1) / (2 * limit_hz);
++	uint64_t div = (mod_hz + 4 * limit_hz - 1) / (4 * limit_hz);
 +	return div > CLKCR_DIV_MASK ? CLKCR_DIV_MASK + 1 : (uint32_t)div;
++}
++
++/*
++ * CMD6 switch function status (64 bytes, bit 511 first): group 1 support
++ * bits 415:400 (function 1 = High Speed is bit 401, byte 13 bit 1) and the
++ * group 1 function selected by the command, bits 379:376 (byte 16, low
++ * nibble; 0xf = cannot switch).
++ */
++static bool
++a733sd_cmd6_hs_supported(const uint8_t *status)
++{
++	return (status[13] & 0x02) != 0;
++}
++
++static uint32_t
++a733sd_cmd6_group1(const uint8_t *status)
++{
++	return status[16] & 0x0fu;
 +}
 +
 +/* Bits [lsb + width - 1 : lsb] of a 128-bit R2 response, r[0] = bits 31:0. */
@@ -623,7 +650,8 @@ index 0000000..7f613e0
 +	vm_offset_t regs;
 +	vm_offset_t ccu;
 +	uint64_t mod_hz;
-+	uint32_t ident_div, xfer_div;
++	uint32_t ident_div, xfer_div, hs_div;
++	bool high_speed;
 +	uint32_t rca;
 +	bool high_capacity;
 +	bool wide;
@@ -730,12 +758,13 @@ index 0000000..7f613e0
 +}
 +
 +/*
-+ * Card clock off, new divider, 2x timing mode with the vendor's <= 26 MHz
-+ * phases (cmd drive 180, data drive 90, sample phase 0), clock on. DATA0 is
-+ * masked only while the clock is being updated, as the v5p3x driver does.
++ * Card clock off, new divider, 2x timing mode with the vendor's phases, clock
++ * on: <= 26 MHz cmd drive 180, data drive 90, sample phase 0; High Speed
++ * (52M table) cmd and data drive 180, sample phase 1. DATA0 is masked only
++ * while the clock is being updated, as the v5p3x driver does.
 + */
 +static int
-+smhc_set_clock(uint32_t div)
++smhc_set_clock(uint32_t div, bool hs)
 +{
 +	uint32_t v = smhc_rd(SMHC_CLKCR);
 +	v &= ~(CLKCR_CARD_CLOCK_ON | CLKCR_LOW_POWER_ON | CLKCR_MASK_DATA0);
@@ -747,10 +776,10 @@ index 0000000..7f613e0
 +	v = (v & ~CLKCR_DIV_MASK) | (div & CLKCR_DIV_MASK);
 +	smhc_wr(SMHC_CLKCR, v | CLKCR_MASK_DATA0);
 +
-+	uint32_t n = smhc_rd(SMHC_NTSR);
-+	smhc_wr(SMHC_NTSR, (n & ~NTSR_SAMPLE_PHASE_MASK) | NTSR_2X_TIMING_MODE);
-+	uint32_t d = smhc_rd(SMHC_DRV_DL);
-+	smhc_wr(SMHC_DRV_DL, (d | DRV_DL_CMD_DRV_PH_SEL) & ~DRV_DL_DAT_DRV_PH_SEL);
++	uint32_t n = smhc_rd(SMHC_NTSR) & ~NTSR_SAMPLE_PHASE_MASK;
++	smhc_wr(SMHC_NTSR, n | NTSR_2X_TIMING_MODE | (hs ? NTSR_SAMPLE_PHASE_HS : 0));
++	uint32_t d = smhc_rd(SMHC_DRV_DL) | DRV_DL_CMD_DRV_PH_SEL;
++	smhc_wr(SMHC_DRV_DL, hs ? (d | DRV_DL_DAT_DRV_PH_SEL) : (d & ~DRV_DL_DAT_DRV_PH_SEL));
 +
 +	smhc_wr(SMHC_CLKCR, v | CLKCR_CARD_CLOCK_ON | CLKCR_MASK_DATA0);
 +	error = smhc_update_clk();
@@ -847,7 +876,7 @@ index 0000000..7f613e0
 + */
 +static int
 +smhc_xfer(uint32_t idx, uint32_t arg, uint32_t rt, uint32_t *resp, uint32_t *buf, uint32_t nblk,
-+    bool write)
++    uint32_t blksz, bool write)
 +{
 +	uint32_t *dst = buf;
 +	uint32_t cmd = CMD_START | idx;
@@ -886,17 +915,17 @@ index 0000000..7f613e0
 +		}
 +		smhc_wr(SMHC_GCTRL, smhc_rd(SMHC_GCTRL) | GCTRL_FIFO_RESET);
 +		(void)smhc_wait_clear(SMHC_GCTRL, GCTRL_FIFO_RESET, 10);
-+		smhc_wr(SMHC_BLKSZ, SD_SECTOR);
-+		smhc_wr(SMHC_BCNTR, nblk * SD_SECTOR);
++		smhc_wr(SMHC_BLKSZ, blksz);
++		smhc_wr(SMHC_BCNTR, nblk * blksz);
 +	}
 +	smhc_wr(SMHC_CARG, arg);
 +	smhc_wr(SMHC_CMDR, cmd);
 +
 +	error = 0;
 +	if (dst && write) {
-+		error = smhc_pio_write(dst, nblk * (SD_SECTOR / 4), deadline_ms(1000 + 5 * nblk));
++		error = smhc_pio_write(dst, nblk * (blksz / 4), deadline_ms(1000 + 5 * nblk));
 +	} else if (dst) {
-+		error = smhc_pio_read(dst, nblk * (SD_SECTOR / 4), deadline_ms(1000 + 2 * nblk));
++		error = smhc_pio_read(dst, nblk * (blksz / 4), deadline_ms(1000 + 2 * nblk));
 +	}
 +	if (!error) {
 +		error = smhc_wait_rint(RINT_COMMAND_DONE, 1000);
@@ -931,7 +960,7 @@ index 0000000..7f613e0
 +static int
 +smhc_cmd(uint32_t idx, uint32_t arg, uint32_t rt, uint32_t *resp, uint32_t *dst, uint32_t nblk)
 +{
-+	return smhc_xfer(idx, arg, rt, resp, dst, nblk, false);
++	return smhc_xfer(idx, arg, rt, resp, dst, nblk, SD_SECTOR, false);
 +}
 +
 +static int
@@ -957,7 +986,7 @@ index 0000000..7f613e0
 +
 +	sd.rca = 0;
 +	smhc_wr(SMHC_WIDTH, 0);
-+	error = smhc_set_clock(sd.ident_div);
++	error = smhc_set_clock(sd.ident_div, false);
 +	if (error) {
 +		printf("A733 SD: identification clock update timed out\n");
 +		return error;
@@ -1057,11 +1086,12 @@ index 0000000..7f613e0
 +		}
 +	}
 +
-+	error = smhc_set_clock(sd.xfer_div);
++	error = smhc_set_clock(sd.xfer_div, false);
 +	if (error) {
 +		printf("A733 SD: transfer clock update timed out\n");
 +		return error;
 +	}
++	sd.high_speed = false;
 +	error = smhc_cmd(13, sd.rca << 16, RT_R1, r, NULL, 0);  /* SEND_STATUS */
 +	if (error || R1_STATE(r[0]) != R1_STATE_TRAN || (r[0] & R1_ERRORS)) {
 +		printf("A733 SD: card not in transfer state: error %d status 0x%08x\n", error, r[0]);
@@ -1157,6 +1187,66 @@ index 0000000..7f613e0
 +	return 0;
 +}
 +
++/*
++ * Default Speed -> High Speed: query and switch with CMD6 (64-byte status),
++ * move to the High Speed divider and phases, then read sector 0 again and
++ * compare it with the copy read at Default Speed. Any failure returns to
++ * the Default Speed clock (a High Speed card also works at 25 MHz).
++ */
++static uint32_t sd_cmd6_status[16] __attribute__((aligned(64)));
++static uint8_t sd_sector0_ds[SD_SECTOR];
++
++static int
++sd_switch_high_speed(void)
++{
++	const uint8_t *st = (const uint8_t *)sd_cmd6_status;
++	uint32_t r[4] = { 0 };
++	int error;
++
++	error = sd_read(0, 1, sd_bounce);
++	if (error) {
++		return error;
++	}
++	memcpy(sd_sector0_ds, sd_bounce, SD_SECTOR);
++	error = smhc_xfer(6, SD_CMD6_CHECK_HS, RT_R1, r, sd_cmd6_status, 1, 64, false);
++	if (error) {
++		printf("A733 SD: CMD6 query failed %d (rint 0x%x); staying at Default Speed\n", error, sd.last_rint);
++		return error;
++	}
++	if (!a733sd_cmd6_hs_supported(st) || a733sd_cmd6_group1(st) != 1) {
++		printf("A733 SD: card has no High Speed (group 1 support 0x%02x%02x, function %u)\n",
++		    st[12], st[13], a733sd_cmd6_group1(st));
++		return ENOTSUP;
++	}
++	error = smhc_xfer(6, SD_CMD6_SWITCH_HS, RT_R1, r, sd_cmd6_status, 1, 64, false);
++	if (error || a733sd_cmd6_group1(st) != 1) {
++		printf("A733 SD: CMD6 switch failed %d (function %u)\n", error, a733sd_cmd6_group1(st));
++		return error ? error : EIO;
++	}
++	delay(100);                     /* the switch takes effect within 8 clocks */
++	error = smhc_set_clock(sd.hs_div, true);
++	if (!error) {
++		error = smhc_cmd(13, sd.rca << 16, RT_R1, r, NULL, 0);
++		if (!error && (R1_STATE(r[0]) != R1_STATE_TRAN || (r[0] & R1_ERRORS))) {
++			error = EIO;
++		}
++	}
++	if (!error) {
++		error = sd_read(0, 1, sd_bounce);
++	}
++	if (!error && memcmp(sd_sector0_ds, sd_bounce, SD_SECTOR) != 0) {
++		error = EIO;
++		printf("A733 SD: sector 0 differs at High Speed\n");
++	}
++	if (error) {
++		printf("A733 SD: High Speed check failed %d; back to Default Speed\n", error);
++		(void)smhc_set_clock(sd.xfer_div, false);
++		return error;
++	}
++	sd.high_speed = true;
++	return 0;
++}
++
 +static int
 +sd_find_partition(unsigned idx)
 +{
@@ -1207,7 +1297,7 @@ index 0000000..7f613e0
 +	uint32_t r1_mask = R1_READ_ERRORS & ~(nblk > 1 ? R1_OUT_OF_RANGE : 0u);
 +	for (int attempt = 0; attempt < 2; attempt++) {
 +		r[0] = 0;
-+		error = smhc_xfer(nblk > 1 ? 25 : 24, arg, RT_R1, r, (uint32_t *)(uintptr_t)src, nblk, true);
++		error = smhc_xfer(nblk > 1 ? 25 : 24, arg, RT_R1, r, (uint32_t *)(uintptr_t)src, nblk, SD_SECTOR, true);
 +		if (!error && (r[0] & r1_mask)) {
 +			error = EIO;
 +		}
@@ -1721,6 +1811,7 @@ index 0000000..7f613e0
 +		sd.ident_div = CLKCR_DIV_MASK;  /* 2x mode keeps it <= 400 kHz up to SD_MOD_MAX_HZ */
 +	}
 +	sd.xfer_div = a733sd_pick_div(sd.mod_hz, SD_DS_HZ);
++	sd.hs_div = a733sd_pick_div(sd.mod_hz, SD_HS_HZ);
 +	if (div_override <= CLKCR_DIV_MASK) {
 +		sd.xfer_div = div_override;
 +	}
@@ -1731,9 +1822,11 @@ index 0000000..7f613e0
 +	printf("A733 SD: SMHC version 0x%x, GCTRL 0x%08x CLKCR 0x%08x NTSR 0x%08x STAS 0x%08x\n",
 +	    smhc_rd(SMHC_VERS), smhc_rd(SMHC_GCTRL), smhc_rd(SMHC_CLKCR), smhc_rd(SMHC_NTSR),
 +	    smhc_rd(SMHC_STAS));
-+	printf("A733 SD: module clock %llu Hz; identification div %u (<= %llu Hz), transfer div %u (<= %llu Hz)\n",
-+	    sd.mod_hz, sd.ident_div, a733sd_card_hz_max(sd.mod_hz, sd.ident_div),
-+	    sd.xfer_div, a733sd_card_hz_max(sd.mod_hz, sd.xfer_div));
++	printf("A733 SD: module clock %llu Hz; identification div %u (%llu Hz), Default Speed div %u (%llu Hz), "
++	    "High Speed div %u (%llu Hz)\n",
++	    sd.mod_hz, sd.ident_div, a733sd_card_hz(sd.mod_hz, sd.ident_div),
++	    sd.xfer_div, a733sd_card_hz(sd.mod_hz, sd.xfer_div),
++	    sd.hs_div, a733sd_card_hz(sd.mod_hz, sd.hs_div));
 +
 +	lck_mtx_lock(&a733_sd_lock);
 +	error = smhc_reset();
@@ -1751,9 +1844,19 @@ index 0000000..7f613e0
 +		smhc_reset();
 +	}
 +	if (!error) {
++		uint32_t hs = 1;
++		PE_parse_boot_argn("sdhs", &hs, sizeof(hs));
++		if (hs && sd.wide && div_override > CLKCR_DIV_MASK && sd.hs_div < sd.xfer_div &&
++		    a733sd_card_hz(sd.mod_hz, sd.hs_div) <= SD_HS_HZ) {
++			(void)sd_switch_high_speed();
++		}
++	}
++	if (!error) {
 +		sd_card_up = true;
-+		printf("A733 SD: card RCA 0x%04x, %llu MiB, %s bus\n", sd.rca,
-+		    sd.card_sectors >> 11, sd.wide ? "4-bit" : "1-bit");
++		printf("A733 SD: card RCA 0x%04x, %llu MiB, %s bus, %s %llu Hz\n", sd.rca,
++		    sd.card_sectors >> 11, sd.wide ? "4-bit" : "1-bit",
++		    sd.high_speed ? "High Speed" : "Default Speed",
++		    a733sd_card_hz(sd.mod_hz, sd.high_speed ? sd.hs_div : sd.xfer_div));
 +		/* Before the root checks: a root failure panics, the log keeps it. */
 +		sdlog_setup();
 +	}

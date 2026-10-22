@@ -138,7 +138,16 @@ class SdmmcPatch(unittest.TestCase):
         self.assertIn('PE_parse_boot_argn("sdrw", &rw, sizeof(rw));', src)
         self.assertIn("sd.writable = (rw == 1);", src)
         # No erase, switch-function or other state-changing commands.
-        self.assertIsNone(re.search(r"\b(?:smhc_cmd|smhc_xfer)\((?:38|32|33|6, 0x8)", src))
+        self.assertIsNone(re.search(r"\b(?:smhc_cmd|smhc_xfer)\((?:38|32|33)\b", src))
+        # CMD6 only as the High Speed query/switch: group 1 function 1, all other groups unchanged.
+        cmd6 = re.findall(r"\bsmhc_xfer\(6, (\w+),", src)
+        self.assertEqual(sorted(cmd6), ["SD_CMD6_CHECK_HS", "SD_CMD6_SWITCH_HS"])
+        self.assertIn("#define SD_CMD6_CHECK_HS        0x00fffff1u", src)
+        self.assertIn("#define SD_CMD6_SWITCH_HS       0x80fffff1u", src)
+        self.assertIsNone(re.search(r"\bsmhc_cmd\(6\b", src))
+        # High Speed is kept only after sector 0 reads back identical.
+        self.assertIn("memcmp(sd_sector0_ds, sd_bounce, SD_SECTOR) != 0", src)
+        self.assertIn('PE_parse_boot_argn("sdhs", &hs, sizeof(hs));', src)
         # The one write command site is sd_write_sectors(); it refuses sector 0
         # (MBR) and anything past the card.
         code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)

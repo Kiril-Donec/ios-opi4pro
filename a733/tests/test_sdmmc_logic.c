@@ -44,28 +44,46 @@ test_clock(void)
 	CHECK(a733sd_ccu_mod_hz(0x01000003u) == 0);     /* gated */
 	CHECK(a733sd_ccu_mod_hz(0x85000000u) == 0);     /* unknown parent */
 
-	CHECK(a733sd_pick_div(100000000ull, 400000ull) == 125);
-	CHECK(a733sd_card_hz_max(100000000ull, 125) == 400000ull);
-	CHECK(a733sd_pick_div(100000000ull, 25000000ull) == 2);
+	/* Vendor 2x mode: card = module / 2 (div 0) or module / (4 div). */
+	CHECK(a733sd_card_hz(100000000ull, 0) == 50000000ull);
+	CHECK(a733sd_card_hz(100000000ull, 1) == 25000000ull);
+	CHECK(a733sd_card_hz(100000000ull, 2) == 12500000ull);    /* the old transfer divider */
+	CHECK(a733sd_pick_div(100000000ull, 400000ull) == 63);    /* 396825 Hz */
+	CHECK(a733sd_card_hz(100000000ull, 63) <= 400000ull);
+	CHECK(a733sd_pick_div(100000000ull, 25000000ull) == 1);   /* board: Default Speed 25 MHz */
+	CHECK(a733sd_pick_div(100000000ull, 50000000ull) == 0);   /* board: High Speed 50 MHz */
 	CHECK(a733sd_pick_div(24000000ull, 25000000ull) == 0);
-	CHECK(a733sd_pick_div(24000000ull, 400000ull) == 30);
-	CHECK(a733sd_pick_div(400000000ull, 400000ull) == 256);   /* does not fit */
+	CHECK(a733sd_pick_div(24000000ull, 400000ull) == 15);
+	CHECK(a733sd_pick_div(408000000ull, 400000ull) == 255);
+	CHECK(a733sd_pick_div(420000000ull, 400000ull) == 256);   /* does not fit */
 
-	/* The chosen divider is the smallest one whose bound respects the limit. */
-	static const uint64_t limits[] = { 400000ull, 25000000ull };
+	/* The chosen divider is the smallest one whose card clock respects the limit. */
+	static const uint64_t limits[] = { 400000ull, 25000000ull, 50000000ull };
 	for (uint64_t mod = 1000000ull; mod <= 408000000ull; mod += 997000ull) {
-		for (unsigned l = 0; l < 2; l++) {
+		for (unsigned l = 0; l < 3; l++) {
 			uint32_t d = a733sd_pick_div(mod, limits[l]);
 			if (d > 255) {
-				CHECK(a733sd_card_hz_max(mod, 255) > limits[l]);
+				CHECK(a733sd_card_hz(mod, 255) > limits[l]);
 				continue;
 			}
-			CHECK(a733sd_card_hz_max(mod, d) <= limits[l]);
+			CHECK(a733sd_card_hz(mod, d) <= limits[l]);
 			if (d > 0) {
-				CHECK(a733sd_card_hz_max(mod, d - 1) > limits[l]);
+				CHECK(a733sd_card_hz(mod, d - 1) > limits[l]);
 			}
 		}
 	}
+
+	/* CMD6 switch status: group 1 support (byte 13 bit 1) and selection (byte 16 low nibble). */
+	uint8_t st[64] = { 0 };
+	st[13] = 0x03;                                  /* functions 0 and 1 supported */
+	st[16] = 0x01;
+	CHECK(a733sd_cmd6_hs_supported(st) && a733sd_cmd6_group1(st) == 1);
+	st[13] = 0x01;
+	CHECK(!a733sd_cmd6_hs_supported(st));
+	st[16] = 0x0f;                                  /* cannot switch */
+	CHECK(a733sd_cmd6_group1(st) == 0x0f);
+	st[16] = 0xf1;                                  /* group 2 nibble must not matter */
+	CHECK(a733sd_cmd6_group1(st) == 1);
 }
 
 static void

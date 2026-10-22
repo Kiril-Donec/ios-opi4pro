@@ -40,6 +40,7 @@ struct tty;
 
 #define EPERM 1
 #define EAGAIN 35
+#define ENOTSUP 45
 #define ENOENT 2
 #define EIO 5
 #define ENXIO 6

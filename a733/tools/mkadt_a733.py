@@ -20,6 +20,7 @@ GIC_REDISTRIBUTORS = 0x03460000
 VIRTUAL_TIMER_INTID = 27
 CNTFRQ = 24_000_000
 BOOT_CPU_MPIDR = 0x600
+SECOND_A76_MPIDR = 0x700
 
 # Conservative early-boot slice in the top 1 GiB of the 4-GiB bank.
 # This excludes U-Boot / BL31 / the candidate 0xBBF11000 framebuffer, but
@@ -73,7 +74,7 @@ class Node:
         return bytes(out)
 
 
-def build(*, ios_display: bool = False, sdmmc: bool = False) -> Node:
+def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = False) -> Node:
     # Opt-in ONLY: never expose an iOS display nub to the legacy Qualcomm
     # AppleCLCD driver unless the A733 CPU scanout overlay is installed.
     chosen = Node("chosen", [
@@ -108,10 +109,30 @@ def build(*, ios_display: bool = False, sdmmc: bool = False) -> Node:
         ("peripheral-frequency", u32(CNTFRQ)),
         ("clock-frequency", u32(2_000_000_000)),
     ])
+    cpu_nodes = [cpu]
+    if a76_pair:
+        # Second Cortex-A76 (vendor DT cpu@700). XNU only uses it with boot-arg
+        # cpus=2 (SweetCPU starts it with PSCI CPU_ON); with cpus=1 the node is
+        # ignored. Same cluster as cpu0 (no HAS_CLUSTER on this target).
+        cpu_nodes.append(Node("cpu1", [
+            ("device_type", cstr("cpu")),
+            ("compatible", cstr("arm,cortex-a76") + cstr("ARM,v8")),
+            ("reg", u32(SECOND_A76_MPIDR)),
+            ("cpu-id", u32(1)),
+            ("cluster-id", u32(0)),
+            ("cluster-type", u32(0)),
+            ("die-cluster-id", u32(0)),
+            ("cluster-core-id", u32(1)),
+            ("state", cstr("waiting")),
+            ("timebase-frequency", u32(CNTFRQ)),
+            ("fixed-frequency", u32(CNTFRQ)),
+            ("peripheral-frequency", u32(CNTFRQ)),
+            ("clock-frequency", u32(2_000_000_000)),
+        ]))
     cpus = Node("cpus", [
         ("#address-cells", u32(1)),
         ("#size-cells", u32(0)),
-    ], [cpu])
+    ], cpu_nodes)
 
     gic = Node("gic", [
         ("compatible", cstr("arm,gic-v3")),
@@ -192,14 +213,17 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--ios-display", action="store_true",
                         help="opt in to experimental AppleCLCD A733 HDMI path")
+    parser.add_argument("--a76-pair", action="store_true",
+                        help="add the second Cortex-A76 (MPIDR 0x700); used only with boot-arg cpus=2")
     parser.add_argument("--sdmmc", action="store_true",
                         help="add /a733-sdmmc for the SMHC0 microSD root driver (rd=sdroot0)")
     args = parser.parse_args()
-    data = build(ios_display=args.ios_display, sdmmc=args.sdmmc).serialize()
+    data = build(ios_display=args.ios_display, sdmmc=args.sdmmc, a76_pair=args.a76_pair).serialize()
     args.output.write_bytes(data)
     print(f"A733 early ADT: {len(data)} bytes -> {args.output}")
     print("MPIDR 0x600 / GICD 0x03400000 / GICR 0x03460000 / vtimer 27")
     print("iOS AppleCLCD display nub:", "ENABLED (A733 overlay required)" if args.ios_display else "OFF (v19 safe)")
+    print("Second Cortex-A76 (0x700):", "IN ADT (cpus=2 to use)" if args.a76_pair else "OFF")
     print("microSD SMHC0 node:", "ENABLED (/a733-sdmmc, rd=sdroot0)" if args.sdmmc else "OFF")
     print("EXPERIMENTAL: A76 PSCI verified; A733 XNU source rebuild still required")
 

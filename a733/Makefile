@@ -70,6 +70,7 @@ test: build/test_display
 	python3 -m unittest discover -s tests -p test_sdlog_tool.py -v
 	python3 -m unittest discover -s tests -p test_sdcard_layout.py -v
 	python3 -m unittest discover -s tests -p test_console_graphics_patch.py -v
+	python3 -m unittest discover -s tests -p test_smp_a76_patch.py -v
 	python3 -m unittest discover -s tests -p test_bootpart.py -v
 
 test-boot: all

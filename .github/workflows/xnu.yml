@@ -34,6 +34,8 @@ on:
       - "a733/xnu-a733-ios-framebuffer.patch"
       - "a733/xnu-a733-sdmmc.patch"
       - "a733/xnu-a733-console-graphics.patch"
+      - "a733/xnu-a733-smp-a76.patch"
+      - "a733/tests/test_smp_a76_patch.py"
       - "a733/tests/test_console_graphics_patch.py"
       - "a733/tests/test_fbcon_logic.c"
       - "a733/tests/test_sdmmc_patch.py"
@@ -116,6 +118,8 @@ jobs:
           cp a733/xnu-a733-sdmmc.patch dxb/patches/9999m-a733-sdmmc.patch
           # Console scrolls; after the first iOS frame only a log band over the frame.
           cp a733/xnu-a733-console-graphics.patch dxb/patches/9999n-a733-console-graphics.patch
+          # SweetCPU accepts the second Cortex-A76 (MPIDR 0x700) for cpus=2.
+          cp a733/xnu-a733-smp-a76.patch dxb/patches/9999o-a733-smp-a76.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -434,10 +438,13 @@ jobs:
       # payload stays small and kernel updates never rewrite the iOS partition.
       - name: Build experimental microSD-root (rd=sdroot0) payload
         run: |
-          python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc
+          python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc --a76-pair
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
             a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot --sdrw
+          python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
+            a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot-2cpu.payload --sdroot --sdrw --cpus 2
           a733/build/test_real_xnu_payload a733/build/a733-xnu-sdroot.payload
+          a733/build/test_real_xnu_payload a733/build/a733-xnu-sdroot-2cpu.payload
           python3 - <<'PY'
           import sys, struct
           from pathlib import Path
@@ -455,6 +462,11 @@ jobs:
           assert mmap.prop('RAMDisk') is None, 'sdroot payload must not carry a RAM disk'
           assert b'rd=sdroot0' in p and b'cpus=1' in p and b'sdrw=1 rootrw=1 launchd_unsecure_cache=1' in p
           print(f'PASS microSD-root payload: {len(p)} bytes, /a733-sdmmc node, no RAM disk')
+          q = Path('a733/build/a733-xnu-sdroot-2cpu.payload').read_bytes()
+          assert b' cpus=2 ' in q and b' cpus=1 ' not in q
+          cpus = next(n for n in tree.children if n.name == 'cpus').children
+          assert [struct.unpack('<I', c.prop('reg'))[0] for c in cpus] == [0x600, 0x700]
+          print('PASS two-A76 payload: cpus=2, ADT cpus 0x600 + 0x700')
           PY
 
       - uses: actions/upload-artifact@v4
@@ -465,6 +477,8 @@ jobs:
             a733/build/a733-sdroot.adt
             a733/build/a733-xnu-sdroot.payload
             a733/build/a733-xnu-sdroot.payload.sha256
+            a733/build/a733-xnu-sdroot-2cpu.payload
+            a733/build/a733-xnu-sdroot-2cpu.payload.sha256
             a733/build/stage0.uimg
             a733/SDMMC-ROOT-RU.md
             a733/tools/a733_sdlog.py

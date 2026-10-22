@@ -66,8 +66,13 @@ def _validate_sdroot_args(cmdline: str, ramdisk: Path | None, adt_bytes: bytes) 
     sdrw = any(t.startswith("sdrw=") and t != "sdrw=0" for t in tokens)
     if rootrw != sdrw or (sdrw and "sdrw=1" not in tokens):
         raise ValueError("a writable root needs both sdrw=1 (driver) and rootrw=1 (mount), or neither")
-    if "cpus=1" not in tokens:
-        raise ValueError("A733 bring-up stays on one Cortex-A76: cpus=1 is required")
+    cpus = [t for t in tokens if t.startswith("cpus=")]
+    if cpus == ["cpus=2"]:
+        # Only the two Cortex-A76 cores; the second must be in the ADT (--a76-pair).
+        if b"cpu1\x00" not in adt_bytes:
+            raise ValueError("cpus=2 requires an ADT built with mkadt_a733.py --a76-pair")
+    elif cpus != ["cpus=1"]:
+        raise ValueError("A733 runs on the Cortex-A76 cores only: exactly cpus=1 or cpus=2 is required")
 
 
 def _validate_ramdisk_args(cmdline: str, ramdisk: Path | None) -> None:
@@ -140,6 +145,8 @@ def main() -> None:
     ap.add_argument("--ramdisk", type=Path, help="4..16 MiB HFS+ test image; sets rd=md0 if no --cmdline")
     ap.add_argument("--sdroot", action="store_true",
                     help=f"root on the microSD card partition (adds '{SDROOT_ARGS}')")
+    ap.add_argument("--cpus", type=int, choices=(1, 2), default=1,
+                    help="with --sdroot: Cortex-A76 cores to use (2 needs an ADT from mkadt_a733.py --a76-pair)")
     ap.add_argument("--sdrw", action="store_true",
                     help=f"with --sdroot: writable iOS root for launchd (adds '{SDRW_ARGS} {USERLAND_ARGS}', drops {NO_KPRINTF_SPAM})")
     args = ap.parse_args()
@@ -151,8 +158,10 @@ def main() -> None:
         if args.sdrw:
             cmdline += " " + SDRW_ARGS + " " + USERLAND_ARGS
             cmdline = " ".join(t for t in cmdline.split() if t != NO_KPRINTF_SPAM)
-    elif args.sdrw:
-        ap.exit(1, "REFUSED: --sdrw needs --sdroot\n")
+        if args.cpus != 1:
+            cmdline = " ".join(f"cpus={args.cpus}" if t.startswith("cpus=") else t for t in cmdline.split())
+    elif args.sdrw or args.cpus != 1:
+        ap.exit(1, "REFUSED: --sdrw and --cpus need --sdroot\n")
     if args.ramdisk is not None and not any(
         t.startswith(("rd=", "rootdev=")) for t in cmdline.split()
     ):

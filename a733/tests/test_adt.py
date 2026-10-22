@@ -78,6 +78,15 @@ def main() -> None:
     for variant in ({}, {"ios_display": True}, {"sdmmc": True}, {"ios_display": True, "sdmmc": True}):
         tree, _ = parse(hw.build(**variant).serialize())
         check_interrupt_parents(tree, [], variant)
+    # Second A76 only on request; XNU needs a non-running state for secondaries.
+    assert len(next(n for n in root.children if n.name == "cpus").children) == 1
+    pair, _ = parse(hw.build(sdmmc=True, a76_pair=True).serialize())
+    cpus = next(n for n in pair.children if n.name == "cpus").children
+    assert [int.from_bytes(c.prop("reg"), "little") for c in cpus] == [0x600, 0x700]
+    assert [int.from_bytes(c.prop("cpu-id"), "little") for c in cpus] == [0, 1]
+    assert cpus[0].prop("state").rstrip(b"\0") == b"running"
+    assert cpus[1].prop("state").rstrip(b"\0") == b"waiting"
+    assert cpus[1].prop("cluster-type") == cpus[0].prop("cluster-type")
     print("A733 ADT round-trip: PASS")
 
 

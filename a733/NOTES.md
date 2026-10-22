@@ -195,3 +195,11 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   Repacked locally from the CI 39771632443 kernel/ADT: the CI cmdline reproduces its payload
   byte for byte (2dd5f990...); the new payload 91c1fa88...92e6 differs only in the cmdline field.
   Partition 1 v4 `card1-part1-sdroot-v4-userland-20261022.img` sha256 b708f443...0ba5.
+- Test #4 card log (39084 bytes, `ref` copy local): boot tasks mount-phase-1/2 (bindfs preboot/firmware
+  and /private/var/hardware lookups fail, error 2, non-fatal), data-protection (seputil),
+  finish-obliteration, detect-installed-roots, commit-boot-mode, restore-datapartition,
+  init-with-data-volume, MSUEarlyBootTask, fips, keybag (keybagd), usermanagerd, dirs_cleaner,
+  xpcroleaccountd, init_featureflags, auearlyboot, tzinit, finish-restore, finish-demo-restore,
+  sysstatuscheck, prng_seedctl, then launchd_cache_loader ("Using default cache paths") -> AMFI abort.
+- **2026-10-22 15:30, partition 1 v4 written to the real card** (owner confirmed): b708f443...0ba5,
+  read-back verified; previous v3 (8491aa0b...) saved locally. Board test #5 pending.

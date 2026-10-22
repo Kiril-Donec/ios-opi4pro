@@ -142,3 +142,14 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   The replaced UEFI v59.2 partition is saved as `card1-part1-before-bootpart-20261022-110505.bin`
   (sha256 a5c418d3...b001, local). The card now holds: partition 1 = v22 stage0 + sdroot payload
   (CI 39738424472), partition 2 = iOS 16 root, partition 3 = A733LOG.TXT. **Board not yet booted.**
+- **2026-10-22 board test #1 of the sdroot card (photos):** U-Boot loaded `stage0.uimg`, the DTB and the
+  17101568-byte payload ("A733 SDROOT: bootm handoff to Cortex-A76"), Stage0 drew its screen and
+  "XNU: INSTALLING KERNEL / HIGH RAM 0x100000000", then XNU printed `unexpected
+  ../xnu/iokit/Kernel/IODeviceTreeSupport.cpp:579` forever. Cause: `/a733-sdmmc` had `interrupts = 161`
+  with no interrupt controller on the parent path (root), so `IODTMapOneInterrupt` never terminates.
+  The SD driver never ran (log file untouched). Fix: the node has no `interrupts` (informational `gic-spi`),
+  `tests/test_adt.py` now requires an interrupt controller for every `interrupts` property.
+- Repacked locally from the same CI kernel (run 39738424472, kernel sha256 e048b718...255f): the old ADT
+  reproduces the card payload byte for byte (eccb3d03...bd03); the fixed ADT gives payload 2bd3a5aa...4128
+  (differs only inside the ADT: the renamed property and the per-build random-seed). New partition 1 image
+  `card1-part1-sdroot-v2-noirq-20261022.img` sha256 93309c82...58f1 (same boot.cmd, stage0 and UEFI files).

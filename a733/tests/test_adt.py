@@ -67,9 +67,28 @@ def main() -> None:
     ccu = struct.unpack("<2Q", sd.prop("ccu-reg"))
     assert reg == (0x04020000, 0x1000), reg
     assert ccu == (0x02002000, 0x2000), ccu
-    assert int.from_bytes(sd.prop("interrupts"), "little") == 161
+    assert sd.prop("interrupts") is None and sd.prop("AAPL,interrupts") is None
+    assert int.from_bytes(sd.prop("gic-spi"), "little") == 161
     assert sd.prop("compatible").rstrip(b"\0") == b"allwinner,sunxi-mmc-v5p3x"
+
+    # IOKit maps every "interrupts" property at boot by walking interrupt
+    # parents (IODTMapOneInterrupt). Without an "interrupt-controller" on
+    # the way it loops forever printing "unexpected IODeviceTreeSupport.cpp:579"
+    # (board test 2026-10-22, /a733-sdmmc had interrupts = 161).
+    for variant in ({}, {"ios_display": True}, {"sdmmc": True}, {"ios_display": True, "sdmmc": True}):
+        tree, _ = parse(hw.build(**variant).serialize())
+        check_interrupt_parents(tree, [], variant)
     print("A733 ADT round-trip: PASS")
+
+
+def check_interrupt_parents(node, ancestors, variant) -> None:
+    for key in ("interrupts", "AAPL,interrupts"):
+        if node.prop(key) is not None:
+            assert node.prop("interrupt-parent") is not None or any(
+                a.prop("interrupt-controller") is not None and a.prop("#interrupt-cells") is not None
+                for a in ancestors), f"{variant}: node {node.name} has {key} but no interrupt controller"
+    for child in node.children:
+        check_interrupt_parents(child, ancestors + [node], variant)
 
 
 if __name__ == "__main__":

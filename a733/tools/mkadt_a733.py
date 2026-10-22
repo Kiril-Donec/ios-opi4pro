@@ -147,12 +147,15 @@ def build(*, ios_display: bool = False, sdmmc: bool = False) -> Node:
     extra = []
     if sdmmc:
         # Absolute physical addresses, like /sweet-ufs: the driver maps
-        # "reg" and "ccu-reg" itself with ml_io_map().
+        # "reg" and "ccu-reg" itself with ml_io_map(). NO "interrupts": the
+        # driver polls, and IOKit would walk up to the root looking for an
+        # interrupt controller and loop forever in IODTMapOneInterrupt
+        # ("unexpected IODeviceTreeSupport.cpp:579", board test 2026-10-22).
         extra.append(Node("a733-sdmmc", [
             ("compatible", cstr("allwinner,sunxi-mmc-v5p3x")),
             ("reg", u64(SMHC0_BASE, SMHC0_SIZE)),
             ("ccu-reg", u64(CCU_BASE, CCU_SIZE)),
-            ("interrupts", u32(SMHC0_SPI)),
+            ("gic-spi", u32(SMHC0_SPI)),       # informational only
             ("bus-width", u32(4)),
         ]))
 

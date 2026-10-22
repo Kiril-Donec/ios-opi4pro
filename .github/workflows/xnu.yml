@@ -38,6 +38,8 @@ on:
       - "a733/tests/sdmmc_kernel_stubs.h"
       - "a733/tests/test_sdlog_tool.py"
       - "a733/tools/a733_sdlog.py"
+      - "a733/tools/a733_sdcard_layout.py"
+      - "a733/tests/test_sdcard_layout.py"
       - "a733/tests/test_ios_display.py"
       - "a733/tools/adapt_xnu_a733.py"
       - "a733/tests/test_adapt_xnu.py"
@@ -456,6 +458,7 @@ jobs:
             a733/build/stage0.uimg
             a733/SDMMC-ROOT-RU.md
             a733/tools/a733_sdlog.py
+            a733/tools/a733_sdcard_layout.py
           if-no-files-found: error
           retention-days: 14
 

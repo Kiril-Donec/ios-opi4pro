@@ -55,8 +55,13 @@ def volume_fs(path: Path) -> str | None:
     return name.value if ok else None
 
 
+def prepared_bytes(size: int) -> bytes:
+    """Content of a fresh log file: header sector, then blank sectors."""
+    return PREPARED.ljust(SECTOR - 1) + b"\n" + BLANK_SECTOR * ((size - SECTOR) // SECTOR)
+
+
 def blank(f, size: int) -> None:
-    header = PREPARED.ljust(SECTOR - 1) + b"\n"
+    header = prepared_bytes(SECTOR)
     f.write(header)
     left = size - SECTOR
     block = BLANK_SECTOR * (CHUNK // SECTOR)

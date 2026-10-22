@@ -112,3 +112,9 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   on a FAT32 partition every 5 s and twice during a panic; the only write path is bounded to that file.
   PC tool `a733/tools/a733_sdlog.py` (prepare/show/clear). `a733sdlog=1` enables it with `rd=md0` too.
   FAT lookup verified on real mkfs.fat/mtools images; card writes NOT verified on the board.
+- Card layout tool `a733/tools/a733_sdcard_layout.py` (plan/apply/write-ios/restore-mbr, Windows, admin):
+  keeps MBR (boot loader at sector 16 forbids GPT) and partition 1 (0x80/0x83, sector 65536, **32 MiB**,
+  not 64 MiB as written earlier); adds slot 2 HFS+ 0xAF at 196608 (16 GiB) and slot 3 FAT32 0x0C at
+  33751040 (256 MiB) with a contiguous 64 MiB A733LOG.TXT; changes only bytes 462-493 of sector 0.
+  Tested on a sparse full-card image (sfdisk, fsck.fat, mtools, the driver's FAT lookup) and in dry
+  run against the real Disk 1; NOT yet run on the real card.

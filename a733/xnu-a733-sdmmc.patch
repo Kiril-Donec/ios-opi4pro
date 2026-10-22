@@ -12,10 +12,10 @@ index 21cdb5c..b67565c 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a733_sdmmc.c b/bsd/dev/a733_sdmmc.c
 new file mode 100644
-index 0000000..ca41219
+index 0000000..7f613e0
 --- /dev/null
 +++ b/bsd/dev/a733_sdmmc.c
-@@ -0,0 +1,1798 @@
+@@ -0,0 +1,1851 @@
 +/*
 + * Allwinner A733 microSD root device (SMHC0), polled PIO, read-only root.
 + *
@@ -27,13 +27,17 @@ index 0000000..ca41219
 + * through the FIFO with CMD17/CMD18, one command at a time, no IDMAC and no
 + * interrupts. A partition of the card (MBR or GPT, boot-arg sdpart=, default
 + * 2) is exposed as the BSD disk sdroot0 (rsdroot0); root on it with
-+ * rd=sdroot0. Writes to it are refused.
++ * rd=sdroot0. Writes to it are refused unless boot-arg sdrw=1 is set (iOS
++ * needs a writable root: launchd's mount-phase-1 remounts / read-write; use
++ * rootrw=1 as well). Every root write is checked against the partition
++ * bounds and the log file.
 + *
 + * Console log: if a FAT32 partition holds a contiguous A733LOG.TXT (made on
 + * the PC by a733/tools/a733_sdlog.py), all console output since the start of
 + * boot is written into that file every a733logsecs seconds (default 5) and
-+ * once more during a panic. sd_write_log() is the only write path and only
-+ * accepts sectors inside that file. a733log=0 disables it; a733sdlog=1 also
++ * once more during a panic. All writes go through sd_write_sectors(), which
++ * only sd_write_log() (sectors inside that file) and sd_write_root()
++ * (sectors inside the root partition, sdrw=1) call. a733log=0 disables it; a733sdlog=1 also
 + * starts it when the root is not on the card (e.g. rd=md0).
 + *
 + * Register layout and clock rules follow the Orange Pi A733 vendor kernel
@@ -44,8 +48,8 @@ index 0000000..ca41219
 + *
 + * Boot-args: sdpart=N (1-based MBR/GPT index, default 2), sdforce=1 (accept
 + * a partition without an HFS+ volume header), sdclkdiv=N (override the
-+ * transfer clock divider), sd4bit=0 (stay on a 1-bit bus), a733log=0,
-+ * a733logsecs=N, a733sdlog=1.
++ * transfer clock divider), sd4bit=0 (stay on a 1-bit bus), sdrw=1 (writable
++ * root partition), a733log=0, a733logsecs=N, a733sdlog=1.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_SD_HOST_TEST)
 +
@@ -630,8 +634,10 @@ index 0000000..ca41219
 +	uint64_t bytes_read;
 +	uint64_t next_report;
 +	uint32_t errors;
++	uint64_t bytes_written;
 +	int bmajor, cmajor;
 +	dev_t bdev;
++	bool writable;                  /* boot-arg sdrw=1 */
 +	bool ready;
 +} sd;
 +
@@ -1185,17 +1191,16 @@ index 0000000..ca41219
 +static int sdlog_chan;
 +
 +/*
-+ * The only write path of this driver: nblk sectors at card sector lba,
-+ * which must lie entirely inside the log file.
++ * The single place that sends write commands (CMD24/CMD25). Callers check
++ * which sectors they may touch: sd_write_log() and sd_write_root() only.
 + */
 +static int
-+sd_write_log(uint64_t lba, uint32_t nblk, const uint32_t *src)
++sd_write_sectors(uint64_t lba, uint32_t nblk, const uint32_t *src)
 +{
 +	uint32_t r[4];
 +	int error = EIO;
 +
-+	if (!sdlog.ready || nblk == 0 || nblk > SD_MAX_BLOCKS || lba < sdlog.first ||
-+	    lba + nblk > sdlog.first + sdlog.sectors || lba + nblk > sd.card_sectors) {
++	if (nblk == 0 || nblk > SD_MAX_BLOCKS || lba == 0 || lba + nblk > sd.card_sectors) {
 +		return EPERM;
 +	}
 +	uint32_t arg = sd.high_capacity ? (uint32_t)lba : (uint32_t)(lba * SD_SECTOR);
@@ -1225,6 +1230,29 @@ index 0000000..ca41219
 +		}
 +	}
 +	return error;
++}
++
++/* nblk sectors at card sector lba, entirely inside the log file. */
++static int
++sd_write_log(uint64_t lba, uint32_t nblk, const uint32_t *src)
++{
++	if (!sdlog.ready || lba < sdlog.first || lba + nblk > sdlog.first + sdlog.sectors) {
++		return EPERM;
++	}
++	return sd_write_sectors(lba, nblk, src);
++}
++
++/* nblk sectors at card sector lba, inside the root partition (sdrw=1 only). */
++static int
++sd_write_root(uint64_t lba, uint32_t nblk, const uint32_t *src)
++{
++	if (!sd.writable || lba < sd.part.start || lba + nblk > sd.part.start + sd.part.count) {
++		return EPERM;
++	}
++	if (sdlog.ready && lba < sdlog.first + sdlog.sectors && sdlog.first < lba + nblk) {
++		return EPERM;
++	}
++	return sd_write_sectors(lba, nblk, src);
 +}
 +
 +/* Write the console bytes not yet on the card, then the header sector. */
@@ -1438,7 +1466,7 @@ index 0000000..ca41219
 +	if (!sd.ready) {
 +		return ENXIO;
 +	}
-+	return (flags & FWRITE) ? EROFS : 0;
++	return ((flags & FWRITE) && !sd.writable) ? EROFS : 0;
 +}
 +
 +static int
@@ -1455,9 +1483,10 @@ index 0000000..ca41219
 +	uint64_t off = (uint64_t)buf_blkno(bp) * sd.secsize;
 +	uint32_t count = buf_count(bp);
 +	uint64_t part_bytes = sd.part.count * SD_SECTOR;
++	bool rd = buf_flags(bp) & B_READ;
 +
 +	buf_setresid(bp, count);
-+	if (!(buf_flags(bp) & B_READ)) {
++	if (!rd && !sd.writable) {
 +		error = EROFS;
 +		goto done;
 +	}
@@ -1484,13 +1513,22 @@ index 0000000..ca41219
 +
 +		if (skip == 0 && left >= SD_SECTOR && ((uintptr_t)p & 3) == 0) {
 +			uint32_t n = MIN(left / SD_SECTOR, SD_MAX_BLOCKS);
-+			error = sd_read(lba, n, (uint32_t *)(void *)p);
++			error = rd ? sd_read(lba, n, (uint32_t *)(void *)p) :
++			    sd_write_root(lba, n, (const uint32_t *)(const void *)p);
 +			step = n * SD_SECTOR;
-+		} else {
++		} else if (rd) {
 +			error = sd_read(lba, 1, sd_bounce);
 +			step = MIN(SD_SECTOR - skip, left);
 +			if (!error) {
 +				memcpy(p, (const char *)sd_bounce + skip, step);
++			}
++		} else {
++			/* Partial or unaligned sector: read, merge, write back. */
++			step = MIN(SD_SECTOR - skip, left);
++			error = (skip || step < SD_SECTOR) ? sd_read(lba, 1, sd_bounce) : 0;
++			if (!error) {
++				memcpy((char *)sd_bounce + skip, p, step);
++				error = sd_write_root(lba, 1, sd_bounce);
 +			}
 +		}
 +		if (error) {
@@ -1498,11 +1536,15 @@ index 0000000..ca41219
 +		}
 +		done += step;
 +		buf_setresid(bp, count - done);
-+		sd.bytes_read += step;
++		if (rd) {
++			sd.bytes_read += step;
++		} else {
++			sd.bytes_written += step;
++		}
 +	}
 +	if (sd.bytes_read >= sd.next_report) {
-+		printf("A733 SD: %llu MiB read from the card, %u retried errors\n",
-+		    sd.bytes_read >> 20, sd.errors);
++		printf("A733 SD: %llu MiB read from / %llu MiB written to the card, %u retried errors\n",
++		    sd.bytes_read >> 20, sd.bytes_written >> 20, sd.errors);
 +		sd.next_report = sd.bytes_read + (64ull << 20);
 +	}
 +	lck_mtx_unlock(&a733_sd_lock);
@@ -1543,7 +1585,7 @@ index 0000000..ca41219
 +		*o = sd.part.count * SD_SECTOR / sd.secsize;
 +		return 0;
 +	case DKIOCISWRITABLE:
-+		*f = 0;
++		*f = sd.writable;
 +		return 0;
 +	case DKIOCSYNCHRONIZE:
 +	case DKIOCSYNCHRONIZECACHE:
@@ -1552,7 +1594,7 @@ index 0000000..ca41219
 +		*o = SD_MAX_BLOCKS * SD_SECTOR / sd.secsize;
 +		return 0;
 +	case DKIOCGETMAXBLOCKCOUNTWRITE:
-+		*o = 0;
++		*o = sd.writable ? SD_MAX_BLOCKS * SD_SECTOR / sd.secsize : 0;
 +		return 0;
 +	case DKIOCGETMAXSEGMENTCOUNTREAD:
 +	case DKIOCGETMAXSEGMENTCOUNTWRITE:
@@ -1588,9 +1630,12 @@ index 0000000..ca41219
 +}
 +
 +static int
-+a733_sd_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++a733_sd_write(dev_t dev, struct uio *uio, __unused int ioflag)
 +{
-+	return EROFS;
++	if (!sd.writable) {
++		return EROFS;
++	}
++	return physio(a733_sd_strategy, NULL, dev, B_WRITE, minphys, uio, (int)sd.secsize);
 +}
 +
 +static const struct bdevsw a733_sd_bdevsw = {
@@ -1778,9 +1823,17 @@ index 0000000..ca41219
 +	sd.bdev = makedev(sd.bmajor, 0);
 +	devfs_make_node(sd.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "sdroot0");
 +	devfs_make_node(makedev(sd.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "rsdroot0");
++	uint32_t rw = 0;
++	PE_parse_boot_argn("sdrw", &rw, sizeof(rw));
 +	sd.next_report = 64ull << 20;
++	/* Only now, with the partition bounds known, can root writes be allowed. */
++	sd.writable = (rw == 1);
 +	sd.ready = true;
-+	printf("A733 SD: sdroot0 ready, read-only PIO\n");
++	if (sd.writable) {
++		printf("A733 SD: sdroot0 ready, READ-WRITE PIO (sdrw=1)\n");
++	} else {
++		printf("A733 SD: sdroot0 ready, read-only PIO\n");
++	}
 +	return 0;
 +}
 +

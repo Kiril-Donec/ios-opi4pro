@@ -94,8 +94,10 @@ class SdrootArgsTests(unittest.TestCase):
             _validate_sdroot_args(self.SD, Path("x.img"), self.sd_adt)
         with self.assertRaisesRegex(ValueError, "exactly rd=sdroot0"):
             _validate_sdroot_args(self.SD + " rd=md0", None, self.sd_adt)
-        with self.assertRaisesRegex(ValueError, "read-only"):
-            _validate_sdroot_args(self.SD + " rootrw=1", None, self.sd_adt)
+        for extra in (" rootrw=1", " sdrw=1", " sdrw=2 rootrw=1"):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "sdrw=1"):
+                _validate_sdroot_args(self.SD + extra, None, self.sd_adt)
+        _validate_sdroot_args(self.SD + " sdrw=1 rootrw=1", None, self.sd_adt)
         with self.assertRaisesRegex(ValueError, "cpus=1"):
             _validate_sdroot_args(self.SD.replace("cpus=1", "cpus=2"), None, self.sd_adt)
 

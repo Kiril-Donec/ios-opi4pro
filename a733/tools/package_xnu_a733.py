@@ -34,11 +34,14 @@ DEFAULT_CMDLINE = "debug=0xc cpus=1 keepsyms=1 -v modem=0 wifi=0 sweetbattery=0 
 # Root on the microSD card through bsd/dev/a733_sdmmc.c (read-only PIO).
 # v22 showed that real Apple launchd needs unentitled_ios_sim_launch=1.
 SDROOT_ARGS = "rd=sdroot0 unentitled_ios_sim_launch=1"
+# Writable iOS root: the driver accepts root writes (sdrw=1) and XNU mounts
+# / read-write (rootrw=1); launchd's mount-phase-1 needs it (board test #3).
+SDRW_ARGS = "sdrw=1 rootrw=1"
 SDMMC_ADT_NODE = b"a733-sdmmc"
 
 
 def _validate_sdroot_args(cmdline: str, ramdisk: Path | None, adt_bytes: bytes) -> None:
-    """rd=sdroot0 needs the /a733-sdmmc ADT node, no RAM disk, a read-only root."""
+    """rd=sdroot0 needs the /a733-sdmmc ADT node, no RAM disk; rootrw=1 only with sdrw=1."""
     tokens = cmdline.split()
     rds = [t for t in tokens if t.startswith(("rd=", "rootdev="))]
     if "rd=sdroot0" not in rds:
@@ -49,8 +52,10 @@ def _validate_sdroot_args(cmdline: str, ramdisk: Path | None, adt_bytes: bytes) 
         raise ValueError("rd=sdroot0 boots from the card; do not add a RAM disk")
     if SDMMC_ADT_NODE not in adt_bytes:
         raise ValueError("rd=sdroot0 requires an ADT built with mkadt_a733.py --sdmmc")
-    if any(t.startswith("rootrw=") and t != "rootrw=0" for t in tokens):
-        raise ValueError("the A733 microSD driver is read-only; rootrw must stay off")
+    rootrw = any(t.startswith("rootrw=") and t != "rootrw=0" for t in tokens)
+    sdrw = any(t.startswith("sdrw=") and t != "sdrw=0" for t in tokens)
+    if rootrw != sdrw or (sdrw and "sdrw=1" not in tokens):
+        raise ValueError("a writable root needs both sdrw=1 (driver) and rootrw=1 (mount), or neither")
     if "cpus=1" not in tokens:
         raise ValueError("A733 bring-up stays on one Cortex-A76: cpus=1 is required")
 
@@ -125,12 +130,18 @@ def main() -> None:
     ap.add_argument("--ramdisk", type=Path, help="4..16 MiB HFS+ test image; sets rd=md0 if no --cmdline")
     ap.add_argument("--sdroot", action="store_true",
                     help=f"root on the microSD card partition (adds '{SDROOT_ARGS}')")
+    ap.add_argument("--sdrw", action="store_true",
+                    help=f"with --sdroot: writable iOS root (adds '{SDRW_ARGS}')")
     args = ap.parse_args()
     cmdline = args.cmdline
     if args.sdroot:
         if args.ramdisk is not None:
             ap.exit(1, "REFUSED: --sdroot and --ramdisk are exclusive\n")
         cmdline += " " + SDROOT_ARGS
+        if args.sdrw:
+            cmdline += " " + SDRW_ARGS
+    elif args.sdrw:
+        ap.exit(1, "REFUSED: --sdrw needs --sdroot\n")
     if args.ramdisk is not None and not any(
         t.startswith(("rd=", "rootdev=")) for t in cmdline.split()
     ):
@@ -150,7 +161,8 @@ def main() -> None:
     if args.ramdisk:
         root = "HFS+ RAM disk /dev/md0 (NO launchd/userland included)"
     elif "rd=sdroot0" in cmdline.split():
-        root = "microSD partition via SMHC0 PIO driver, rd=sdroot0 (read-only; card NOT verified)"
+        mode = "READ-WRITE" if "sdrw=1" in cmdline.split() else "read-only"
+        root = f"microSD partition via SMHC0 PIO driver, rd=sdroot0 ({mode})"
     else:
         root = "no root volume supplied"
     print("Root:", root)

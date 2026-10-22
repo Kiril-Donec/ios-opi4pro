@@ -259,6 +259,8 @@ jobs:
           if sd not in kernel:
               raise SystemExit("FAIL: A733 microSD overlay was SKIPPED; refusing to package rd=sdroot0 kernel")
           print("PASS: A733 SMHC0 microSD driver marker found in compiled XNU Mach-O")
+          if b"A733 SD: sdroot0 ready, READ-WRITE PIO (sdrw=1)" not in kernel:
+              raise SystemExit("FAIL: microSD root write support (sdrw=1) missing from the compiled kernel")
           if b"A733 LOG: console saved to A733LOG.TXT" not in kernel:
               raise SystemExit("FAIL: microSD console log code missing from the compiled kernel")
           print("PASS: A733 microSD console log code found in compiled XNU Mach-O")
@@ -426,7 +428,7 @@ jobs:
         run: |
           python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
-            a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot
+            a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot --sdrw
           a733/build/test_real_xnu_payload a733/build/a733-xnu-sdroot.payload
           python3 - <<'PY'
           import sys, struct
@@ -443,7 +445,7 @@ jobs:
           chosen = next(n for n in tree.children if n.name == 'chosen')
           mmap = next(n for n in chosen.children if n.name == 'memory-map')
           assert mmap.prop('RAMDisk') is None, 'sdroot payload must not carry a RAM disk'
-          assert b'rd=sdroot0' in p and b'cpus=1' in p
+          assert b'rd=sdroot0' in p and b'cpus=1' in p and b'sdrw=1 rootrw=1' in p
           print(f'PASS microSD-root payload: {len(p)} bytes, /a733-sdmmc node, no RAM disk')
           PY
 

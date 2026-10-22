@@ -131,22 +131,41 @@ class SdmmcPatch(unittest.TestCase):
         src = self.source
         self.assertTrue(src.startswith("/*"))
         self.assertIn("#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_SD_HOST_TEST)", src)
-        # The root disk stays read-only: every BSD write entry point refuses.
-        self.assertIn("return (flags & FWRITE) ? EROFS : 0;", src)
-        self.assertIn("error = EROFS;", src)
+        # Root writes only with sdrw=1: every BSD write entry point checks it.
+        self.assertIn("return ((flags & FWRITE) && !sd.writable) ? EROFS : 0;", src)
+        self.assertIn("if (!rd && !sd.writable) {\n\t\terror = EROFS;", src)
+        self.assertIn("\tif (!sd.writable) {\n\t\treturn EROFS;\n\t}\n\treturn physio(a733_sd_strategy, NULL, dev, B_WRITE", src)
+        self.assertIn('PE_parse_boot_argn("sdrw", &rw, sizeof(rw));', src)
+        self.assertIn("sd.writable = (rw == 1);", src)
+        # No erase, switch-function or other state-changing commands.
         self.assertIsNone(re.search(r"\b(?:smhc_cmd|smhc_xfer)\((?:38|32|33|6, 0x8)", src))
-        # The one write command site is inside sd_write_log(), whose first
-        # statement after the declarations bounds the sectors to the log file.
-        writes = [m.start() for m in re.finditer(r"smhc_xfer\([^;]*\btrue\)", src)]
-        self.assertEqual(len(writes), 1)
-        func = src.rindex("\nsd_write_log(", 0, writes[0])
-        self.assertNotIn("\n}\n", src[func:writes[0]])
-        self.assertIn("lba < sdlog.first ||\n\t    lba + nblk > sdlog.first + sdlog.sectors", src[func:writes[0]])
-        self.assertIn("return EPERM;", src[func:writes[0]])
-        callers = re.findall(r"(\w+)\(sdlog\.first[^;]*sdlog_buf\)", src)
-        self.assertEqual(callers, ["sd_write_log", "sd_write_log"])
+        # The one write command site is sd_write_sectors(); it refuses sector 0
+        # (MBR) and anything past the card.
         code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-        self.assertEqual(len(re.findall(r"\bsd_write_log\(", code)), 3)  # definition + 2 calls
+        writes = [m.start() for m in re.finditer(r"smhc_xfer\([^;]*\btrue\)", code)]
+        self.assertEqual(len(writes), 1)
+        func = code.rindex("\nsd_write_sectors(", 0, writes[0])
+        self.assertNotIn("\n}\n", code[func:writes[0]])
+        self.assertIn("lba == 0 || lba + nblk > sd.card_sectors) {\n\t\treturn EPERM;", code[func:writes[0]])
+        # Only the two bounded wrappers call it (definition + 2 calls).
+        self.assertEqual(len(re.findall(r"\bsd_write_sectors\(", code)), 3)
+        for wrapper, bound in (("sd_write_log", "lba < sdlog.first || lba + nblk > sdlog.first + sdlog.sectors"),
+                               ("sd_write_root", "!sd.writable || lba < sd.part.start || "
+                                                 "lba + nblk > sd.part.start + sd.part.count")):
+            body = code[code.index("\n" + wrapper + "("):]
+            body = body[:body.index("\n}\n")]
+            self.assertIn(bound, body, wrapper)
+            self.assertIn("return EPERM;", body)
+            self.assertIn("return sd_write_sectors(lba, nblk, src);", body)
+        root_body = code[code.index("\nsd_write_root("):]
+        self.assertIn("sdlog.first < lba + nblk", root_body[:root_body.index("\n}\n")])  # never over the log
+        callers = re.findall(r"(\w+)\(sdlog\.first[^;]*sdlog_buf\)", code)
+        self.assertEqual(callers, ["sd_write_log", "sd_write_log"])
+        self.assertEqual(len(re.findall(r"\bsd_write_log\(", code)), 3)     # definition + 2 calls
+        self.assertEqual(len(re.findall(r"\bsd_write_root\(", code)), 3)    # definition + 2 calls in strategy
+        strategy = code[code.index("\na733_sd_strategy("):]
+        strategy = strategy[:strategy.index("\n}\n")]
+        self.assertEqual(len(re.findall(r"\bsd_write_root\(", strategy)), 2)
         # The log file must be contiguous and must not overlap the root.
         self.assertIn("is fragmented at cluster", src)
         self.assertIn("overlaps the log file", src)
@@ -158,6 +177,7 @@ class SdmmcPatch(unittest.TestCase):
         self.assertIn("smhc_wr(SMHC_DMAC, 0);", src)
         self.assertIn("v |= GCTRL_ACCESS_BY_AHB;", src)
         self.assertIn('"A733 SD: sdroot0 ready, read-only PIO\\n"', src)
+        self.assertIn('"A733 SD: sdroot0 ready, READ-WRITE PIO (sdrw=1)\\n"', src)
         # Boot partition is never the default root.
         self.assertIn("uint32_t idx = 2,", src)
 

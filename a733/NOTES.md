@@ -170,3 +170,13 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   **SD writes (CMD24/25, log file only) work on the real board.**
 - **2026-10-22 11:53, `hfs-journal off` on the real card** (owner confirmed): sectors 196610 and 33751038,
   attributes 0x80002100 -> 0x80000100, read-back verified, old headers saved locally. Board test #3 pending.
+- **2026-10-22 board test #3 (log read from the card, 16769 bytes): the iOS 16 root mounts and Apple
+  launchd runs.** `hfs: mounted iOSRoot on device b(1, 0)`, `exec launchd`, libignition
+  ("hello from launchd.1"; preboot lookup failed 25, continued), the dyld shared cache segments map
+  (`not in trust cache` notices only), `com.apple.xpc.launchd ... Darwin Bootstrapper Version 7.0.0`,
+  `entering ondemand mode`, boot task fsck skipped, then mount-phase-1: `mount_hfs: Read-only file
+  system`, `mount: / failed with 1`, bindfs lookup of /private/preboot/<hash>/usr/standalone/firmware
+  failed (2), `pid 3 exited ... exit 1`. The root must be writable.
+- Driver: root writes with boot-arg `sdrw=1` (`sd_write_root`, bounded to partition 2 and never over the
+  log file; all CMD24/25 still go through `sd_write_sectors`, which also refuses sector 0).
+  `package_xnu_a733.py --sdroot --sdrw` adds `sdrw=1 rootrw=1`; CI packs the sdroot payload that way.

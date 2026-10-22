@@ -182,14 +182,15 @@ Boot-args: `sdpart=N` (раздел, по умолчанию 2), `sdforce=1`, `s
 cd C:\Users\Kiril\Desktop\ios-a733\ios-opi4pro
 python a733\tools\a733_sdcard_layout.py plan
 python a733\tools\a733_sdcard_layout.py apply --backup-dir C:\Users\Kiril\Desktop\ios-a733\backups
-python a733\tools\a733_sdcard_layout.py write-ios D:\путь\к\ios16-gui-first.img
+python a733\tools\a733_sdcard_layout.py write-ios "C:\Users\Kiril\Downloads\ios16-gui-first.img"
 ```
 
 - `plan` — пробный прогон: проверки, текущая и будущая таблица, **ничего не пишет**.
 - `write-ios IMAGE` — после `apply`: пишет сырой HFS+ том (сигнатура `H+`/`HX`
   на смещении 1024, размер ≤ 16 GiB) в раздел 2 и проверяет SHA-256 обратным
-  чтением. Образ (16 GiB) сейчас на сервере; на диске C: для него нет места —
-  нужен внешний диск или запись образа на карту с Linux (`dd` в раздел 2).
+  чтением. Образ на этом ПК: `C:\Users\Kiril\Downloads\ios16-gui-first.img`
+  (HFSX v5, 4096 x 4194304 = ровно 16 GiB = размер раздела 2, проверено 2026-10-22).
+  Запись и проверка обратным чтением через USB-картридер — порядка 15–30 минут.
 - `restore-mbr BACKUP.bin` — вернуть прежний сектор 0 из копии `apply`
   (отказывается, если копия от другой карты).
 

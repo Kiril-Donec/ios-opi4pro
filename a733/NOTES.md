@@ -243,3 +243,5 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   Repacked from the CI 39783367967 kernel (CI ADT reproduces its 2cpu payload 34983a0d... byte for byte):
   partition 1 v6 `card1-part1-sdroot-v6-product-2cpu-20261022.img` 576dbdfb...3150 (cpus=2) and
   `-1cpu-` 12603bde...c408 (cpus=1).
+- **2026-10-22 16:24, partition 1 v6 (v5 + iPhone X /product, cpus=2) written to the real card** (owner
+  confirmed): 576dbdfb...3150, read-back verified; previous v5 (d0140d68...) saved locally. Board test #6 pending.

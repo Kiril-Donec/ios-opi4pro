@@ -37,6 +37,16 @@ SDROOT_ARGS = "rd=sdroot0 unentitled_ios_sim_launch=1"
 # Writable iOS root: the driver accepts root writes (sdrw=1) and XNU mounts
 # / read-write (rootrw=1); launchd's mount-phase-1 needs it (board test #3).
 SDRW_ARGS = "sdrw=1 rootrw=1"
+# iOS userland on the writable root, as the upstream ios-sweet phone boots it:
+# launchd_unsecure_cache=1 lets launchd_cache_loader skip the signature check
+# and the AppleMobileFileIntegrity IOService ("abort: Unable to find AMFI",
+# board test #4); ignition_level=1, wdt_test=no_user_checkin and wdt=-1
+# as in the upstream boot-args.
+USERLAND_ARGS = "launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1"
+# The PID 1 kprintf traces of v14-v17 print several lines per copyinstr of
+# launchd and slow the framebuffer console down; printf output (A733 SD,
+# A733 TRACE, launchd via /dev/console) and the log file are unaffected.
+NO_KPRINTF_SPAM = "-enable_kprintf_spam"
 SDMMC_ADT_NODE = b"a733-sdmmc"
 
 
@@ -131,7 +141,7 @@ def main() -> None:
     ap.add_argument("--sdroot", action="store_true",
                     help=f"root on the microSD card partition (adds '{SDROOT_ARGS}')")
     ap.add_argument("--sdrw", action="store_true",
-                    help=f"with --sdroot: writable iOS root (adds '{SDRW_ARGS}')")
+                    help=f"with --sdroot: writable iOS root for launchd (adds '{SDRW_ARGS} {USERLAND_ARGS}', drops {NO_KPRINTF_SPAM})")
     args = ap.parse_args()
     cmdline = args.cmdline
     if args.sdroot:
@@ -139,7 +149,8 @@ def main() -> None:
             ap.exit(1, "REFUSED: --sdroot and --ramdisk are exclusive\n")
         cmdline += " " + SDROOT_ARGS
         if args.sdrw:
-            cmdline += " " + SDRW_ARGS
+            cmdline += " " + SDRW_ARGS + " " + USERLAND_ARGS
+            cmdline = " ".join(t for t in cmdline.split() if t != NO_KPRINTF_SPAM)
     elif args.sdrw:
         ap.exit(1, "REFUSED: --sdrw needs --sdroot\n")
     if args.ramdisk is not None and not any(

@@ -445,7 +445,7 @@ jobs:
           chosen = next(n for n in tree.children if n.name == 'chosen')
           mmap = next(n for n in chosen.children if n.name == 'memory-map')
           assert mmap.prop('RAMDisk') is None, 'sdroot payload must not carry a RAM disk'
-          assert b'rd=sdroot0' in p and b'cpus=1' in p and b'sdrw=1 rootrw=1' in p
+          assert b'rd=sdroot0' in p and b'cpus=1' in p and b'sdrw=1 rootrw=1 launchd_unsecure_cache=1' in p
           print(f'PASS microSD-root payload: {len(p)} bytes, /a733-sdmmc node, no RAM disk')
           PY
 

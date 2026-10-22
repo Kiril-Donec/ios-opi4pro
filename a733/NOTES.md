@@ -184,3 +184,14 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   39771632443 (commit afd11f8, kernel sha256 6fda4d2d...f790, payload 2dd5f990...2896 with
   `sdrw=1 rootrw=1`, ADT without `interrupts`), v22 stage0 40605aeb...; image 8491aa0b...eab1,
   read-back verified; previous v2 (93309c82...) saved locally. Board test #4 pending.
+- **2026-10-22 board test #4 (photo): the writable root works and launchd runs its boot tasks**
+  (`prng_seedctl`: Doing boot task ...), then `launchd_cache_loader[22]`: `abort: Unable to find AMFI`
+  -> launchd panic `exited -- exit reason namespace 7 subcode 0x1`. Same wall as upstream ios-sweet
+  (root NOTES.md, boot 0038e/0039u): `launchd_unsecure_cache=1` skips the launchd.plist signature and
+  AMFI checks and lets all boot tasks pass. The screen was flooded by the v14-v17 PID 1 kprintf traces.
+- `package_xnu_a733.py --sdroot --sdrw` now also adds the upstream userland boot-args
+  `launchd_unsecure_cache=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1` and drops
+  `-enable_kprintf_spam` (printf, A733 lines, launchd output and the card log are unaffected).
+  Repacked locally from the CI 39771632443 kernel/ADT: the CI cmdline reproduces its payload
+  byte for byte (2dd5f990...); the new payload 91c1fa88...92e6 differs only in the cmdline field.
+  Partition 1 v4 `card1-part1-sdroot-v4-userland-20261022.img` sha256 b708f443...0ba5.

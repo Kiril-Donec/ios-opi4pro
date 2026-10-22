@@ -97,6 +97,9 @@ def main() -> None:
     assert [int.from_bytes(c.prop("cpu-id"), "little") for c in cpus] == list(range(8))
     assert [c.name for c in cpus] == [f"cpu{i}" for i in range(8)]
     assert all(c.prop("state").rstrip(b"\0") == b"waiting" for c in cpus[1:])
+    # every core must match SweetCPU's IONameMatch 'arm,cortex-a76' (board test #9)
+    assert all(b"arm,cortex-a76" in c.prop("compatible").split(b"\0") for c in cpus)
+    assert all(c.prop("compatible").startswith(b"arm,cortex-a55\0") for c in cpus[2:])
     assert len({c.prop("cluster-type") for c in cpus}) == 1 and len({c.prop("cluster-id") for c in cpus}) == 1
     try:
         hw.build(sdmmc=True, a55=True)

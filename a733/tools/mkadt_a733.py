@@ -198,7 +198,12 @@ def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = Fa
         for i, mpidr in enumerate(A55_MPIDRS):
             cpu_nodes.append(Node(f"cpu{2 + i}", [
                 ("device_type", cstr("cpu")),
-                ("compatible", cstr("arm,cortex-a55") + cstr("ARM,v8")),
+                # SweetCPU's personality is IONameMatch 'arm,cortex-a76'
+                # (KernelConfigTables.cpp); without that entry IOKit never
+                # matches the A55 nubs (board test #9: "cpu=2..7 NOT
+                # registered (IOKit matching timeout)"). SweetCPU tells the
+                # core type from the MPIDR.
+                ("compatible", cstr("arm,cortex-a55") + cstr("arm,cortex-a76") + cstr("ARM,v8")),
                 ("reg", u32(mpidr)),
                 ("cpu-id", u32(2 + i)),
                 ("cluster-id", u32(0)),

@@ -148,7 +148,7 @@ class Build(unittest.TestCase):
         self.stage0 = self.tmp / "stage0.uimg"
         self.stage0.write_bytes(stage0_image())
         self.payload = self.tmp / "payload"
-        self.payload.write_bytes(b"\0" * 4096 + b" ".join(bp.PAYLOAD_MARKERS) + b"\0" * 100000)
+        self.payload.write_bytes(b"\0" * 4096 + b" ".join(bp.PAYLOAD_MARKERS) + b" cpus=2 " + b"\0" * 100000)
         self.cmd = self.tmp / "boot.cmd.new"
         self.cmd.write_bytes(b"echo SDROOT\r\nbootm 0x42000000 - 0x43000000\r\n")
 

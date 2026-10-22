@@ -44,7 +44,9 @@ from uimage_format import script_image, validate  # noqa: E402
 
 PART_BYTES = lay.BOOT.count * lay.SECTOR
 EXT_MAGIC_OFFSET = 1024 + 56
-PAYLOAD_MARKERS = (b"rd=sdroot0", b"A733 SD: sdroot0 ready, read-only PIO", b"cpus=1")
+PAYLOAD_MARKERS = (b"rd=sdroot0", b"A733 SD: sdroot0 ready, read-only PIO")
+# Cortex-A76 cores only: cpus=1, or cpus=2 with the second A76 (mkadt --a76-pair).
+CPU_MARKERS = (b" cpus=1 ", b" cpus=2 ")
 SCRIPT_NAME = "ios-a733 XNU SDROOT"
 KEEP_SCR, KEEP_CMD = "/boot-uefi-v59.scr", "/boot-uefi-v59.cmd"
 
@@ -92,6 +94,8 @@ def dump(image: Path, path: str, work: Path) -> bytes:
 def check_inputs(stage0: bytes, payload: bytes) -> None:
     validate(stage0, 2)
     missing = [m.decode() for m in PAYLOAD_MARKERS if m not in payload]
+    if not any(m in payload for m in CPU_MARKERS):
+        missing.append("cpus=1 or cpus=2")
     if missing:
         raise BootPartError(f"payload is not an rd=sdroot0 kernel (missing {missing})")
 

@@ -123,3 +123,17 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   Windows now lists partition 2 (offset 96 MiB, 16 GiB, MbrType 175 = 0xAF) and partition 3 (E:, FAT32,
   label A733LOG, Healthy) with `A733LOG.TXT` 67108864 bytes, first line "prepared ... not written yet".
   Partition 1 (D:, 32 MiB) unchanged. iOS image not yet written; board not yet booted with this card.
+- **2026-10-22, iOS root written by the owner** (`write-ios`, Disk 1): `ios16-gui-first.img` (16 GiB) in
+  partition 2, read-back sha256 4b44e310...906fd.
+- Partition 1 of the real card (read from the 10:06 backup, sectors 65536-131071, sha256 a5c418d3...b001)
+  is **not** an XNU card: it autostarts **UEFI v59.2** (`/boot.scr` -> `/uefi_stage0.uimg`, 8 MiB), with no
+  `/ios-a733`. Booting it does not run the sdroot kernel.
+- New tool `a733/tools/a733_bootpart.py` (+ `tests/test_bootpart.py`, 10 tests, WSL Debian):
+  `build` edits a copy of partition 1 with debugfs (adds `/ios-a733/stage0.uimg` and `a733-xnu.payload`,
+  keeps the UEFI script as `/boot-uefi-v59.scr|.cmd`, installs `tools/sd-boot-xnu-sdroot.cmd` = the
+  hardware-proven v22 script with new labels), reads every file back, `e2fsck -fn`; `write` (Windows admin)
+  rewrites only partition 1 and only if the card's current partition 1 hashes to `--expect-current`.
+- Prepared image `part1-sdroot.img` (local, not in git): sha256 26a5b6c6...1726; payload = CI run
+  39738424472 (commit a59ab73) artifact `a733-SDROOT-EXPERIMENTAL-readonly-PIO`, sha256 eccb3d03...bd03;
+  stage0 = v22's hardware-proven `stage0.uimg` (sha256 40605aeb...3ef3; stage0 sources unchanged since
+  7f0ad30). `uefi_stage0.uimg` and the DTB are byte-identical to the card. **Not yet written to the card.**

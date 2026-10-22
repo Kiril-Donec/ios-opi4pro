@@ -213,6 +213,38 @@ python a733\tools\a733_sdcard_layout.py write-ios "C:\Users\Kiril\Downloads\ios1
   «ready», меняются только байты 463–492.
 - **На настоящую карту скрипт ещё ничего не записывал.**
 
+## Загрузочный раздел (этап 5): скрипт [a733_bootpart.py](tools/a733_bootpart.py)
+
+На настоящей карте раздел 1 сейчас запускает **UEFI v59.2** (`/boot.scr` → `/uefi_stage0.uimg`),
+каталога `/ios-a733` нет — ядро с `rd=sdroot0` с такой карты не стартует. Скрипт меняет только раздел 1:
+
+1. `build` (WSL/Linux, `debugfs`/`e2fsck`, диск не открывает): из копии текущего раздела 1 делает новый
+   образ — добавляет `/ios-a733/stage0.uimg` и `/ios-a733/a733-xnu.payload`, старые `boot.scr`/`boot.cmd`
+   сохраняет как `/boot-uefi-v59.scr|.cmd`, ставит `boot.scr` из
+   [sd-boot-xnu-sdroot.cmd](tools/sd-boot-xnu-sdroot.cmd) (скрипт v22, проверенный на плате, с новыми
+   надписями). Каждый файл читается обратно, затем `e2fsck -fn`. `uefi_stage0.uimg` и DTB не меняются.
+2. `write` (Windows, администратор): переписывает раздел 1 **только если** его текущее содержимое на
+   карте имеет хеш `--expect-current` (то есть ровно тот образ, из которого собран новый). Перед записью
+   сохраняет текущий раздел 1 в `--backup-dir`, после записи проверяет обратным чтением. MBR,
+   загрузчик в секторе 16 и разделы 2/3 не пишутся. Те же проверки диска и ввод `DISK 1 <серийный>`.
+
+```
+# WSL: раздел 1 из резервной копии apply (смещение 32 MiB, длина 32 MiB) и новый образ
+dd if=card1-first64MiB-before-sdlayout-20261022-100638.bin of=part1-current.img bs=1M skip=32 count=32
+python3 a733/tools/a733_bootpart.py build part1-current.img part1-sdroot.img \
+  --stage0 v22-stage0.uimg --payload a733-xnu-sdroot.payload
+# Windows, терминал администратора
+python a733\tools\a733_bootpart.py write part1-sdroot.img --expect-current <sha256 part1-current.img> `
+  --backup-dir C:\Users\Kiril\Desktop\ios-a733\backups
+# Откат к UEFI v59.2
+python a733\tools\a733_bootpart.py write part1-current.img --expect-current <sha256 part1-sdroot.img>
+```
+
+Проверки (2026-10-22, WSL Debian): `tests/test_bootpart.py` — `build` на настоящем ext4 (`mkfs.ext4`),
+отказ при существующем выходе, повторной сборке и payload без драйвера SD; `write` на разреженном образе
+всей карты меняет только раздел 1, откат возвращает исходные байты, неверный хеш или отказ от
+подтверждения — ничего не записано, чужой раздел 1 — отказ.
+
 ## Что ожидать на HDMI при первом тесте
 
 ```

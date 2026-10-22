@@ -273,3 +273,11 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - **🎉 2026-10-22 board test #7 (owner report): the display's USB touch screen works in iOS** with partition 1
   v7 (patch 9999p, default orientation, no axis boot-args). Card log not read yet (which USB 2.0 port,
   direct or behind a hub).
+- Test #7 card log (current boot = first 6884 lines; the rest of the 64 MiB file is older text; local
+  copy only): touch path `USB1 OHCI -> hub 1a40:0101 (4 ports, the black USB 2.0 pair) -> port 3 ->
+  1a86:e5e3`, 150 touches delivered, default orientation correct. Problems: (1) the root was mounted
+  **dirty and non-journaled** (test #6 was powered off by pulling power) and the kernel reported 703x
+  `hfs_mark_inconsistent` (BlockMarkFreeInternal frees unallocated blocks) + `MapFileBlockC` - the
+  volume needs fsck.hfsplus, and power-off without a journal or a clean shutdown keeps damaging it;
+  (2) SpringBoard crash loop during Setup: 7x SIGSEGV pc 0x0, same lr 0x1deba058c (slide 0x4a068000),
+  first one right after a tap - to re-check after fsck. SD: 0 errors; 2/2 CPUs; SWEET FB 3000 swaps.

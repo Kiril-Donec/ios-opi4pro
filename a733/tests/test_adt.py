@@ -87,7 +87,43 @@ def main() -> None:
     assert cpus[0].prop("state").rstrip(b"\0") == b"running"
     assert cpus[1].prop("state").rstrip(b"\0") == b"waiting"
     assert cpus[1].prop("cluster-type") == cpus[0].prop("cluster-type")
+    check_product()
     print("A733 ADT round-trip: PASS")
+
+
+def raw_node(props, children=b"", nchildren=0) -> bytes:
+    """ADT node bytes; props = (name, value, placeholder flag)."""
+    out = struct.pack("<II", len(props), nchildren)
+    for name, value, flag in props:
+        out += name.encode().ljust(32, b"\0") + struct.pack("<I", len(value) | (flag << 31))
+        out += value + bytes((-len(value)) & 3)
+    return out + children
+
+
+def check_product() -> None:
+    import tempfile
+    product = raw_node([("name", b"product\0", 0), ("AAPL,phandle", b"\x01\0\0\0", 0),
+                        ("artwork-device-subtype", struct.pack("<I", 2436), 0),
+                        ("artwork-scale-factor", struct.pack("<I", 3), 0),
+                        ("cover-glass", b"syscfg/CGSp\0", 1)])
+    tree = raw_node([("name", b"device-tree\0", 0), ("compatible", b"D22AP\0iPhone10,3\0", 0)],
+                    raw_node([("name", b"chosen\0", 0)]) + product, 2)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "d22ap.adt")
+        path.write_bytes(tree)
+        props = hw.read_product(path)
+        assert [n for n, _ in props] == ["artwork-device-subtype", "artwork-scale-factor"], props
+        root, _ = parse(hw.build(sdmmc=True, product=props).serialize())
+        node = next(n for n in root.children if n.name == "product")
+        assert int.from_bytes(node.prop("artwork-device-subtype"), "little") == 2436
+        assert not any(n.name == "product" for n in parse(hw.build().serialize())[0].children)
+        path.write_bytes(tree.replace(b"D22AP\0", b"D201AP"))
+        try:
+            hw.read_product(path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a non-D22AP tree must be refused")
 
 
 def check_interrupt_parents(node, ancestors, variant) -> None:

@@ -74,7 +74,47 @@ class Node:
         return bytes(out)
 
 
-def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = False) -> Node:
+def read_product(path: Path) -> list[tuple[str, bytes]]:
+    """
+    /product properties of the real iPhone X (D22AP) device tree, which
+    MobileGestalt uses for the device class and per-model artwork (SpringBoard
+    aborted on the missing BoundingPathBitmap-1125x2436 asset without it,
+    board test #5). The tree is an Apple artifact, kept out of git: extract
+    Firmware/all_flash/DeviceTree.d22ap.im4p from the IPSW (tools/remotezip.py)
+    and LZFSE-decode its payload. Drops iBoot placeholders (size bit 31, e.g.
+    syscfg/...) and node bookkeeping, as upstream tools/mkadt.py does.
+    """
+    buf = path.read_bytes()
+
+    def walk(off):
+        nprops, nchildren = struct.unpack_from("<II", buf, off)
+        off += 8
+        props = []
+        for _ in range(nprops):
+            name = buf[off:off + 32].split(b"\0")[0].decode()
+            size = struct.unpack_from("<I", buf, off + 32)[0]
+            length = size & 0x7fffffff
+            props.append((name, size >> 31, buf[off + 36:off + 36 + length]))
+            off += 36 + ((length + 3) & ~3)
+        children = []
+        for _ in range(nchildren):
+            child, off = walk(off)
+            children.append(child)
+        return (props, children), off
+
+    (root_props, children), end = walk(0)
+    if end != len(buf):
+        raise ValueError(f"{path}: trailing data after the device tree")
+    if not dict((n, v) for n, _, v in root_props).get("compatible", b"").startswith(b"D22AP\0"):
+        raise ValueError(f"{path}: not the D22AP (iPhone X) device tree")
+    for props, _ in children:
+        if dict((n, v) for n, _, v in props).get("name") == b"product\0":
+            return [(n, v) for n, flag, v in props if not flag and n not in ("name", "AAPL,phandle")]
+    raise ValueError(f"{path}: no /product node")
+
+
+def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = False,
+          product: list[tuple[str, bytes]] | None = None) -> Node:
     # Opt-in ONLY: never expose an iOS display nub to the legacy Qualcomm
     # AppleCLCD driver unless the A733 CPU scanout overlay is installed.
     chosen = Node("chosen", [
@@ -205,6 +245,7 @@ def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = Fa
             ("opposed-power-vol-buttons", u32(1)),
         ]),
         *extra,
+        *([Node("product", product)] if product else []),
     ])
 
 
@@ -213,16 +254,21 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--ios-display", action="store_true",
                         help="opt in to experimental AppleCLCD A733 HDMI path")
+    parser.add_argument("--product-adt", type=Path,
+                        help="real D22AP device tree (LZFSE-decoded DeviceTree.d22ap.im4p): copy its /product")
     parser.add_argument("--a76-pair", action="store_true",
                         help="add the second Cortex-A76 (MPIDR 0x700); used only with boot-arg cpus=2")
     parser.add_argument("--sdmmc", action="store_true",
                         help="add /a733-sdmmc for the SMHC0 microSD root driver (rd=sdroot0)")
     args = parser.parse_args()
-    data = build(ios_display=args.ios_display, sdmmc=args.sdmmc, a76_pair=args.a76_pair).serialize()
+    product = read_product(args.product_adt) if args.product_adt else None
+    data = build(ios_display=args.ios_display, sdmmc=args.sdmmc, a76_pair=args.a76_pair,
+                 product=product).serialize()
     args.output.write_bytes(data)
     print(f"A733 early ADT: {len(data)} bytes -> {args.output}")
     print("MPIDR 0x600 / GICD 0x03400000 / GICR 0x03460000 / vtimer 27")
     print("iOS AppleCLCD display nub:", "ENABLED (A733 overlay required)" if args.ios_display else "OFF (v19 safe)")
+    print("/product (iPhone X):", f"{len(product)} properties from {args.product_adt}" if product else "OFF")
     print("Second Cortex-A76 (0x700):", "IN ADT (cpus=2 to use)" if args.a76_pair else "OFF")
     print("microSD SMHC0 node:", "ENABLED (/a733-sdmmc, rd=sdroot0)" if args.sdmmc else "OFF")
     print("EXPERIMENTAL: A76 PSCI verified; A733 XNU source rebuild still required")

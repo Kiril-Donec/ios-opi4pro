@@ -234,3 +234,12 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - **2026-10-22 16:2x, partition 1 v5 (2x A76 cpus=2, SD High Speed, console fix) written to the real card**
   (owner confirmed): CI run 39783367967 (commit d169786), image d0140d68...9a2d, read-back verified;
   previous v4 (b708f443...) saved locally. A cpus=1 twin (d0498bcd...) is ready as fallback. Board test #6 pending.
+- **/product from the real iPhone X device tree:** `Firmware/all_flash/DeviceTree.d22ap.im4p` (33719 bytes,
+  CRC ok) fetched alone by range request (tools/remotezip.py) from Apple's
+  `iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw` (updates.cdn-apple.com), IM4P payload LZFSE-decoded
+  (Debian lzfse) to d22ap.adt (186084 bytes, sha256 9e670987...dbf1; Apple artifact, local only, NOT in git).
+  `mkadt_a733.py --product-adt d22ap.adt` copies its /product (61 properties, e.g. artwork-device-subtype 2436,
+  artwork-scale-factor 3, artwork-display-gamut P3; iBoot syscfg placeholders and phandle dropped, as upstream).
+  Repacked from the CI 39783367967 kernel (CI ADT reproduces its 2cpu payload 34983a0d... byte for byte):
+  partition 1 v6 `card1-part1-sdroot-v6-product-2cpu-20261022.img` 576dbdfb...3150 (cpus=2) and
+  `-1cpu-` 12603bde...c408 (cpus=1).

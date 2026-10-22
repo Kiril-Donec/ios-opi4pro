@@ -153,3 +153,5 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   reproduces the card payload byte for byte (eccb3d03...bd03); the fixed ADT gives payload 2bd3a5aa...4128
   (differs only inside the ADT: the renamed property and the per-build random-seed). New partition 1 image
   `card1-part1-sdroot-v2-noirq-20261022.img` sha256 93309c82...58f1 (same boot.cmd, stage0 and UEFI files).
+- **2026-10-22 11:17, v2 partition 1 written to the real card** (`a733_bootpart.py write`, owner
+  confirmed): 93309c82...58f1, read-back verified; previous (v1, 26a5b6c6...) saved locally. Board test #2 pending.

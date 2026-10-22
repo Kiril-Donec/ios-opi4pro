@@ -266,3 +266,7 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   HID descriptor and feeds `sweet_hid_touch()` after Stage0's portrait rotation (raw origin = portrait
   top-right) and the 1125x2436 -> 473x1024 letterbox. Boot-args `a733touch_swap/flipx/flipy=1` fix the
   raw axes, `a733usb=0` turns it off. Log lines start with `A733 TOUCH:`. Not tested on the board yet.
+- **2026-10-22 19:32, partition 1 v7 (v6 + USB touch screen, cpus=2) written to the real card** (owner
+  confirmed): kernel CI 39794332437 (commit 415dd69; CI ADT reproduces its 2cpu payload 63516538...
+  byte for byte), ADT v6 + /a733-usb, image 7d3035ef...9b33, read-back verified; previous v6
+  (576dbdfb...) saved locally. cpus=1 twin 62d9851f...3088 ready as fallback. Board test #7 pending.

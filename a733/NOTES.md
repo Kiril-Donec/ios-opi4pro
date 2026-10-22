@@ -320,3 +320,13 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   0x000 stays last in the ADT and is not used. **23:3x, partition 1 v8c-olds0 (old Stage0, cpus=7:
   2x A76 + A55 0x100-0x500) written** (owner confirmed): 5658cea6...fd81. Board test #13 pending.
   The 8th core would need Stage0 to park 0x000 on a mailbox XNU can release (spin table), not CPU_OFF.
+- **Board test #13 (v8c-olds0, cpus=7) card log (local copy):** all 7 cores up (`7/7 CPUs initialized`;
+  A55 0x100-0x500 rc=0). **CPU clocks: A76 and A55 PLLs both 936 MHz, DSU 720 MHz** (`A733 CPU:`; timed
+  loop ~506 iterations/us on the A76) - U-Boot's boot clock, while the vendor OPP table
+  (sun60iw2p1-cpu-vf.dtsi) allows A76 1200 MHz / A55 1008 MHz at 800 mV for every chip bin and A76
+  1608 MHz at <= 950 mV (DCDC3 = A76, DCDC5 = A55 + DSU; AXP8191 0x14 / 0x16, 0.5 V + 10 mV/code).
+  Journal recreated on mount (`hfs: Initializing the journal`), volume clean, no SpringBoard crashes,
+  datamigrator ran (no LastSystemVersion -> "iOS updated" screen). Power button works on AXP8191 (AXP515
+  does not answer): side button and the volume-up chord reach SpringBoard, the slider appears, but no
+  shutdown ever reached the kernel (no reboot/halt lines) - the slide did not complete; the owner used
+  the PMIC 6 s hard-off.

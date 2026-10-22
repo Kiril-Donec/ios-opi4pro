@@ -256,3 +256,13 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   (`4-bit bus, High Speed 50000000 Hz`, 1409 MiB read / 30 MiB written, 0 retried errors).
   SpringBoard exec'd once and stayed up; `SWEET FB: 19000 swaps`; only driverkitd and PosterBoard
   crashed once; no panic.
+- **USB touch screen (patch 9999p, `xnu-a733-usbtouch.patch`, ADT `--usb-touch`):** the HDMI display's
+  touch is `wch.cn USB2IIC_CTP_CONTROL` 1a86:e5e3 (full speed, HID, interrupt IN 0x82, 64 bytes): report
+  ID 1, 6 finger slots of tip/contact-id/X/Y(0..2048)/width, then scan time and contact count (descriptor
+  and reports read on a PC, 2026-10-22). X runs along the 1024-pixel side. `bsd/dev/a733_usbtouch.c`
+  powers USB1 (vendor sun60iw2 open_clock + passby, PHY tuning skipped), runs its OHCI polled with
+  HCCA/ED/TD/buffers in the ADT `dma-reg` window 0x60000000 (OHCI DMA is 32-bit, XNU RAM is above
+  4 GiB), enumerates root port 1 directly or behind one hub, re-enumerates after a replug, parses the
+  HID descriptor and feeds `sweet_hid_touch()` after Stage0's portrait rotation (raw origin = portrait
+  top-right) and the 1125x2436 -> 473x1024 letterbox. Boot-args `a733touch_swap/flipx/flipy=1` fix the
+  raw axes, `a733usb=0` turns it off. Log lines start with `A733 TOUCH:`. Not tested on the board yet.

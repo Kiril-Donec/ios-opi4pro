@@ -75,7 +75,8 @@ def main() -> None:
     # parents (IODTMapOneInterrupt). Without an "interrupt-controller" on
     # the way it loops forever printing "unexpected IODeviceTreeSupport.cpp:579"
     # (board test 2026-10-22, /a733-sdmmc had interrupts = 161).
-    for variant in ({}, {"ios_display": True}, {"sdmmc": True}, {"ios_display": True, "sdmmc": True}):
+    for variant in ({}, {"ios_display": True}, {"sdmmc": True}, {"ios_display": True, "sdmmc": True},
+                    {"sdmmc": True, "usb_touch": True}):
         tree, _ = parse(hw.build(**variant).serialize())
         check_interrupt_parents(tree, [], variant)
     # Second A76 only on request; XNU needs a non-running state for secondaries.
@@ -88,6 +89,18 @@ def main() -> None:
     assert cpus[1].prop("state").rstrip(b"\0") == b"waiting"
     assert cpus[1].prop("cluster-type") == cpus[0].prop("cluster-type")
     check_product()
+    assert not any(n.name == "a733-usb" for n in sd_root.children)
+    usb_root, _ = parse(hw.build(sdmmc=True, usb_touch=True).serialize())
+    usb = next(n for n in usb_root.children if n.name == "a733-usb")
+    assert struct.unpack("<2Q", usb.prop("reg")) == (0x04200000, 0x1000)
+    assert struct.unpack("<2Q", usb.prop("ccu-reg")) == (0x02002000, 0x2000)
+    dma = struct.unpack("<2Q", usb.prop("dma-reg"))
+    # 32-bit OHCI DMA, page aligned, clear of BL31 (0x48000000-0x49000000),
+    # the payload (0x52000000) and the framebuffer, and below XNU's RAM.
+    assert dma == (0x60000000, 0x10000), dma
+    assert dma[0] % 4096 == 0 and dma[0] + dma[1] <= 0x100000000
+    assert dma[0] + dma[1] <= hw.FRAMEBUFFER and dma[0] >= 0x58000000
+    assert usb.prop("interrupts") is None
     print("A733 ADT round-trip: PASS")
 
 

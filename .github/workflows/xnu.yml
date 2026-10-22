@@ -35,6 +35,10 @@ on:
       - "a733/xnu-a733-sdmmc.patch"
       - "a733/xnu-a733-console-graphics.patch"
       - "a733/xnu-a733-smp-a76.patch"
+      - "a733/xnu-a733-usbtouch.patch"
+      - "a733/tests/test_usbtouch_patch.py"
+      - "a733/tests/test_usbtouch_logic.c"
+      - "a733/tests/usbtouch_kernel_stubs.h"
       - "a733/tests/test_smp_a76_patch.py"
       - "a733/tests/test_console_graphics_patch.py"
       - "a733/tests/test_fbcon_logic.c"
@@ -120,6 +124,8 @@ jobs:
           cp a733/xnu-a733-console-graphics.patch dxb/patches/9999n-a733-console-graphics.patch
           # SweetCPU accepts the second Cortex-A76 (MPIDR 0x700) for cpus=2.
           cp a733/xnu-a733-smp-a76.patch dxb/patches/9999o-a733-smp-a76.patch
+          # Polled USB1 OHCI driver for the HDMI display's touch screen (needs 9999m).
+          cp a733/xnu-a733-usbtouch.patch dxb/patches/9999p-a733-usbtouch.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -276,6 +282,9 @@ jobs:
           if b"a733fb_console" not in kernel:
               raise SystemExit("FAIL: A733 console/graphics overlay was SKIPPED")
           print("PASS: A733 console/graphics overlay found in compiled XNU Mach-O")
+          if b"A733 TOUCH: polling touches" not in kernel:
+              raise SystemExit("FAIL: A733 USB touch screen overlay was SKIPPED")
+          print("PASS: A733 USB touch screen driver found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)
@@ -438,7 +447,7 @@ jobs:
       # payload stays small and kernel updates never rewrite the iOS partition.
       - name: Build experimental microSD-root (rd=sdroot0) payload
         run: |
-          python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc --a76-pair
+          python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc --a76-pair --usb-touch
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
             a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot --sdrw
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
@@ -457,6 +466,8 @@ jobs:
           sd = next(n for n in tree.children if n.name == 'a733-sdmmc')
           assert struct.unpack('<2Q', sd.prop('reg')) == (0x04020000, 0x1000)
           assert struct.unpack('<2Q', sd.prop('ccu-reg')) == (0x02002000, 0x2000)
+          usb = next(n for n in tree.children if n.name == 'a733-usb')
+          assert struct.unpack('<2Q', usb.prop('dma-reg')) == (0x60000000, 0x10000)
           chosen = next(n for n in tree.children if n.name == 'chosen')
           mmap = next(n for n in chosen.children if n.name == 'memory-map')
           assert mmap.prop('RAMDisk') is None, 'sdroot payload must not carry a RAM disk'

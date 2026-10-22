@@ -40,6 +40,17 @@ SMHC0_SPI = 161
 CCU_BASE = 0x02002000
 CCU_SIZE = 0x2000
 
+# USB1 host block (sun60iw2p1.dtsi: ehci1@4200000, ohci1@4200400, the
+# sunxi glue/PHY registers at +0x800). bsd/dev/a733_usbtouch.c drives its
+# OHCI for the HDMI display's USB touch screen. OHCI DMA is 32-bit and
+# XNU's RAM starts at 4 GiB, so the driver gets a low-memory window that
+# XNU never uses as RAM: above BL31 (0x48000000-0x49000000) and the boot
+# payload (loaded at 0x52000000, dead after the jump), below the framebuffer.
+USB1_BASE = 0x04200000
+USB1_SIZE = 0x1000
+USB_DMA_BASE = 0x60000000
+USB_DMA_SIZE = 0x10000
+
 
 def u32(*values: int) -> bytes:
     return struct.pack("<" + "I" * len(values), *values)
@@ -114,7 +125,7 @@ def read_product(path: Path) -> list[tuple[str, bytes]]:
 
 
 def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = False,
-          product: list[tuple[str, bytes]] | None = None) -> Node:
+          usb_touch: bool = False, product: list[tuple[str, bytes]] | None = None) -> Node:
     # Opt-in ONLY: never expose an iOS display nub to the legacy Qualcomm
     # AppleCLCD driver unless the A733 CPU scanout overlay is installed.
     chosen = Node("chosen", [
@@ -219,6 +230,14 @@ def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = Fa
             ("gic-spi", u32(SMHC0_SPI)),       # informational only
             ("bus-width", u32(4)),
         ]))
+    if usb_touch:
+        # Polled too: no "interrupts" for the same reason as /a733-sdmmc.
+        extra.append(Node("a733-usb", [
+            ("compatible", cstr("allwinner,sunxi-ohci")),
+            ("reg", u64(USB1_BASE, USB1_SIZE)),
+            ("ccu-reg", u64(CCU_BASE, CCU_SIZE)),
+            ("dma-reg", u64(USB_DMA_BASE, USB_DMA_SIZE)),
+        ]))
 
     return Node("device-tree", [
         ("compatible", cstr("D22AP") + cstr("iPhone10,3") +
@@ -260,10 +279,12 @@ def main() -> None:
                         help="add the second Cortex-A76 (MPIDR 0x700); used only with boot-arg cpus=2")
     parser.add_argument("--sdmmc", action="store_true",
                         help="add /a733-sdmmc for the SMHC0 microSD root driver (rd=sdroot0)")
+    parser.add_argument("--usb-touch", action="store_true",
+                        help="add /a733-usb for the USB1 OHCI touch screen driver")
     args = parser.parse_args()
     product = read_product(args.product_adt) if args.product_adt else None
     data = build(ios_display=args.ios_display, sdmmc=args.sdmmc, a76_pair=args.a76_pair,
-                 product=product).serialize()
+                 usb_touch=args.usb_touch, product=product).serialize()
     args.output.write_bytes(data)
     print(f"A733 early ADT: {len(data)} bytes -> {args.output}")
     print("MPIDR 0x600 / GICD 0x03400000 / GICR 0x03460000 / vtimer 27")
@@ -271,6 +292,7 @@ def main() -> None:
     print("/product (iPhone X):", f"{len(product)} properties from {args.product_adt}" if product else "OFF")
     print("Second Cortex-A76 (0x700):", "IN ADT (cpus=2 to use)" if args.a76_pair else "OFF")
     print("microSD SMHC0 node:", "ENABLED (/a733-sdmmc, rd=sdroot0)" if args.sdmmc else "OFF")
+    print("USB1 touch screen node:", "ENABLED (/a733-usb)" if args.usb_touch else "OFF")
     print("EXPERIMENTAL: A76 PSCI verified; A733 XNU source rebuild still required")
 
 

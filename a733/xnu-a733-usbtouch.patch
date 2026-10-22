@@ -1,0 +1,1058 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b67565c..4b26392 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@ bsd/dev/random/randomdev.c		standard
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a733_sdmmc.c			standard
++bsd/dev/a733_usbtouch.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a733_usbtouch.c b/bsd/dev/a733_usbtouch.c
+new file mode 100644
+index 0000000..9361add
+--- /dev/null
++++ b/bsd/dev/a733_usbtouch.c
+@@ -0,0 +1,1024 @@
++/*
++ * Allwinner A733 USB touchscreen input (USB1 OHCI, polled).
++ *
++ * The Orange Pi 4 Pro test display (10.1-inch 1024x600 HDMI) reports touches
++ * over USB: wch.cn USB2IIC_CTP_CONTROL (1a86:e5e3), full speed, one HID
++ * interface, interrupt IN endpoint, a multi-touch digitizer report. This
++ * driver brings up the USB1 host block itself (U-Boot stops USB before
++ * bootm): CCU gates and resets of USB1 OHCI and its PHY, PHY SIDDQ off and
++ * the AHB "passby" bits, as the Orange Pi vendor kernel does
++ * (bsp/drivers/usb/host/sunxi-hci.c open_clock / __usb_passby for
++ * CONFIG_ARCH_SUN60IW2). EHCI stays off, so the port belongs to OHCI.
++ *
++ * OHCI is a 32-bit DMA master and XNU's RAM is above 4 GiB, so the HCCA,
++ * EDs, TDs and buffers live in a small low-memory window from the ADT
++ * ("dma-reg", unused by XNU), mapped uncached. The touch screen is taken
++ * from root port 1, directly or behind one hub, and re-enumerated after a
++ * replug; its HID report descriptor is parsed for the finger collections
++ * and every report becomes sweet_hid_touch() calls in the panel
++ * coordinates SweetHIDTouch expects, after the same clockwise portrait
++ * rotation and 1125x2436 letterboxing the display uses.
++ *
++ * Boot-args: a733usb=0 (off), a733touch_swap=1 / a733touch_flipx=1 /
++ * a733touch_flipy=1 (raw axis fixes, applied before the rotation).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_USBTOUCH_HOST_TEST)
++
++#ifndef A733_USBTOUCH_HOST_TEST
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++#else
++#include <errno.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#endif
++
++/* ------------------------------------------------------------------ pure */
++
++#define UT_MAX_FINGERS          10
++
++struct ut_field {
++	uint16_t bit;           /* bit offset after the report ID byte */
++	uint8_t size;           /* bits; 0 = absent */
++	int32_t lmax;           /* logical maximum */
++};
++
++struct ut_finger {
++	struct ut_field tip, id, x, y;
++};
++
++struct ut_layout {
++	uint8_t report_id;      /* 0 = reports carry no ID byte */
++	uint8_t fingers;
++	uint16_t report_bits;   /* input bits after the ID byte */
++	struct ut_finger finger[UT_MAX_FINGERS];
++	struct ut_field count;
++};
++
++static uint32_t
++ut_item_value(const uint8_t *p, unsigned size)
++{
++	uint32_t v = 0;
++	for (unsigned i = 0; i < size; i++) {
++		v |= (uint32_t)p[i] << (8 * i);
++	}
++	return v;
++}
++
++static int32_t
++ut_item_signed(const uint8_t *p, unsigned size)
++{
++	uint32_t v = ut_item_value(p, size);
++	if (size == 1) {
++		return (int8_t)v;
++	}
++	if (size == 2) {
++		return (int16_t)v;
++	}
++	return (int32_t)v;
++}
++
++/*
++ * Parse a HID report descriptor for a touch screen: the input report that
++ * holds finger collections (Digitizer page 0x0D, usage Finger 0x22) with
++ * Tip Switch (0x42), Contact Identifier (0x51), X/Y (Generic Desktop 0x30/0x31)
++ * and the Contact Count (0x54). Returns 0 or EINVAL.
++ */
++static int
++ut_parse_report_descriptor(const uint8_t *d, unsigned len, struct ut_layout *out)
++{
++	uint32_t usage_page = 0, report_size = 0, report_count = 0, report_id = 0;
++	int32_t lmax = 0;
++	uint32_t usages[16];
++	unsigned nusages = 0;
++	uint16_t bits[256] = { 0 };     /* input bit offset per report ID */
++	int finger = -1;
++	unsigned depth = 0, finger_depth = 0;
++	bool finger_report_set = false;
++
++	memset(out, 0, sizeof(*out));
++	for (unsigned i = 0; i < len;) {
++		uint8_t pfx = d[i];
++		if (pfx == 0xfe) {              /* long item */
++			if (i + 2 >= len) {
++				return EINVAL;
++			}
++			i += 3u + d[i + 1];
++			continue;
++		}
++		unsigned size = (pfx & 3) == 3 ? 4 : (pfx & 3);
++		if (i + 1 + size > len) {
++			return EINVAL;
++		}
++		const uint8_t *v = d + i + 1;
++		uint8_t tag = pfx & 0xfc;
++		i += 1 + size;
++		switch (tag) {
++		case 0x04: usage_page = ut_item_value(v, size); break;
++		case 0x24: lmax = ut_item_signed(v, size); break;
++		case 0x74: report_size = ut_item_value(v, size); break;
++		case 0x84: report_id = ut_item_value(v, size) & 0xff; break;
++		case 0x94: report_count = ut_item_value(v, size); break;
++		case 0x08: {
++			uint32_t u = ut_item_value(v, size);
++			if (size < 4) {
++				u |= usage_page << 16;
++			}
++			if (nusages < 16) {
++				usages[nusages++] = u;
++			}
++			break;
++		}
++		case 0xa0: {                    /* Collection */
++			depth++;
++			uint32_t u = nusages ? usages[nusages - 1] : 0;
++			if (u == 0x000d0022 && finger < UT_MAX_FINGERS - 1) {
++				finger++;
++				finger_depth = depth;
++			}
++			nusages = 0;
++			break;
++		}
++		case 0xc0:                      /* End Collection */
++			if (depth == finger_depth) {
++				finger_depth = 0;
++			}
++			if (depth) {
++				depth--;
++			}
++			nusages = 0;
++			break;
++		case 0x80: {                    /* Input */
++			uint16_t *b = &bits[report_id];
++			bool constant = size && (v[0] & 1);
++			for (uint32_t k = 0; k < report_count; k++) {
++				uint32_t u = nusages ? usages[k < nusages ? k : nusages - 1] : 0;
++				struct ut_field f = { *b, (uint8_t)(report_size > 32 ? 32 : report_size), lmax };
++				if (!constant) {
++					struct ut_finger *fg = finger >= 0 && finger_depth ? &out->finger[finger] : NULL;
++					if (fg && u == 0x000d0042 && !fg->tip.size) {
++						fg->tip = f;
++					} else if (fg && u == 0x000d0051 && !fg->id.size) {
++						fg->id = f;
++					} else if (fg && u == 0x00010030 && !fg->x.size) {
++						fg->x = f;
++					} else if (fg && u == 0x00010031 && !fg->y.size) {
++						fg->y = f;
++					} else if (u == 0x000d0054 && !out->count.size) {
++						out->count = f;
++					}
++					if (fg && !finger_report_set) {
++						out->report_id = (uint8_t)report_id;
++						finger_report_set = true;
++					}
++				}
++				*b = (uint16_t)(*b + report_size);
++			}
++			nusages = 0;
++			break;
++		}
++		case 0x90: case 0xb0:           /* Output / Feature */
++			nusages = 0;
++			break;
++		default:
++			break;
++		}
++	}
++	unsigned n = 0;
++	for (unsigned f = 0; f < UT_MAX_FINGERS; f++) {
++		const struct ut_finger *fg = &out->finger[f];
++		if (fg->tip.size && fg->x.size && fg->y.size && fg->x.lmax > 0 && fg->y.lmax > 0) {
++			n = f + 1;
++		}
++	}
++	if (!finger_report_set || n == 0) {
++		return EINVAL;
++	}
++	out->fingers = (uint8_t)n;
++	out->report_bits = bits[out->report_id];
++	return 0;
++}
++
++static uint32_t
++ut_get_bits(const uint8_t *r, unsigned rlen, struct ut_field f)
++{
++	uint32_t v = 0;
++	for (unsigned i = 0; i < f.size; i++) {
++		unsigned bit = f.bit + i;
++		if (bit / 8 >= rlen) {
++			break;
++		}
++		v |= (uint32_t)((r[bit / 8] >> (bit % 8)) & 1) << i;
++	}
++	return v;
++}
++
++struct ut_contact {
++	bool down;
++	uint32_t id, x, y;
++};
++
++/*
++ * Decode one input report (as received: with the ID byte if report_id != 0).
++ * Returns the number of slots filled (== layout fingers), or -1 for another
++ * report or a short packet.
++ */
++static int
++ut_decode(const struct ut_layout *l, const uint8_t *report, unsigned len, struct ut_contact *c)
++{
++	const uint8_t *body = report;
++	unsigned blen = len;
++	if (l->report_id) {
++		if (len < 1 || report[0] != l->report_id) {
++			return -1;
++		}
++		body++;
++		blen--;
++	}
++	if (blen * 8 < l->report_bits) {
++		return -1;
++	}
++	for (unsigned f = 0; f < l->fingers; f++) {
++		const struct ut_finger *fg = &l->finger[f];
++		c[f].down = ut_get_bits(body, blen, fg->tip) != 0;
++		c[f].id = fg->id.size ? ut_get_bits(body, blen, fg->id) : f;
++		c[f].x = ut_get_bits(body, blen, fg->x);
++		c[f].y = ut_get_bits(body, blen, fg->y);
++	}
++	return l->fingers;
++}
++
++/* Display geometry, as a733_cpu_present() draws it (SweetFramebuffer.cpp). */
++#define UT_PHYS_W       1024u           /* HDMI timing, landscape */
++#define UT_PHYS_H       600u
++#define UT_PORT_W       600u            /* portrait */
++#define UT_PORT_H       1024u
++#define UT_CANVAS_W     1125u           /* iPhone X canvas */
++#define UT_CANVAS_H     2436u
++#define UT_PANEL_OFFX   20              /* SweetHIDTouch: ((1125 - 1080) / 2) & ~3 */
++#define UT_PANEL_OFFY   18              /* (2436 - 2400) / 2 */
++
++struct ut_orient {
++	bool swap, flipx, flipy;
++};
++
++/*
++ * Raw touch (0..xmax, 0..ymax) -> SweetHIDTouch panel pixels (0..1079,
++ * 0..2399). The touch axes follow the native landscape panel (X along the
++ * 1024-pixel side). The portrait transform is Stage0's: portrait (px, py)
++ * is drawn at physical row 599 - px, column py; the 1125x2436 canvas is
++ * scaled to 1024 portrait rows and centred horizontally.
++ */
++static void
++ut_map(uint32_t rx, uint32_t ry, int32_t xmax, int32_t ymax, struct ut_orient o, int *panel_x, int *panel_y)
++{
++	uint64_t nx = xmax > 0 ? ((uint64_t)(rx > (uint32_t)xmax ? (uint32_t)xmax : rx) << 16) / (uint32_t)xmax : 0;
++	uint64_t ny = ymax > 0 ? ((uint64_t)(ry > (uint32_t)ymax ? (uint32_t)ymax : ry) << 16) / (uint32_t)ymax : 0;
++	if (o.swap) {
++		uint64_t t = nx;
++		nx = ny;
++		ny = t;
++	}
++	if (o.flipx) {
++		nx = 65536 - nx;
++	}
++	if (o.flipy) {
++		ny = 65536 - ny;
++	}
++	uint32_t col = (uint32_t)((nx * (UT_PHYS_W - 1) + 32768) >> 16);
++	uint32_t row = (uint32_t)((ny * (UT_PHYS_H - 1) + 32768) >> 16);
++	int px = (int)(UT_PHYS_H - 1 - row);            /* portrait x, 0..599 */
++	int py = (int)col;                              /* portrait y, 0..1023 */
++	const int view_w = (int)((UT_PORT_H * UT_CANVAS_W + UT_CANVAS_H / 2) / UT_CANVAS_H);
++	const int left = ((int)UT_PORT_W - view_w) / 2;
++	int vx = px - left;
++	vx = vx < 0 ? 0 : (vx > view_w - 1 ? view_w - 1 : vx);
++	/* Centre of the canvas area that a733_cpu_present() shows in this pixel. */
++	int cx = (int)(((int64_t)(2 * vx + 1) * (int)UT_CANVAS_W) / (2 * view_w));
++	int cy = (int)(((int64_t)(2 * py + 1) * (int)UT_CANVAS_H) / (2 * (int)UT_PORT_H));
++	*panel_x = cx - UT_PANEL_OFFX;
++	*panel_y = cy - UT_PANEL_OFFY;
++}
++
++#ifndef A733_USBTOUCH_HOST_TEST
++/* ---------------------------------------------------------------- kernel */
++
++/* CCU (sun60iw2, bsp ccu-sun60iw2.c) */
++#define CCU_MSI_LITE2           0x05a4          /* bit 0 */
++#define CCU_AHB_MASTER          0x05c0          /* bit 9 usb-sys-ahb, written with the key */
++#define CCU_AHB_MASTER_KEY      0x010000ffu
++#define CCU_USB1                0x1308          /* bit 31 usb1 (OHCI) clock, bit 30 PHY reset */
++#define CCU_USB1_BGR            0x130c          /* bit 0 OHCI gate, bit 16 OHCI reset */
++#define CCU_USB_REF             0x1340          /* bit 31 gate, [26:24] mux 0 = sys24M */
++
++/* USB1 HCI block: EHCI at +0, OHCI at +0x400, glue at +0x800 */
++#define HCI_OHCI                0x400
++#define HCI_PASSBY              0x800           /* SUNXI_USB_PMU_IRQ_ENABLE */
++#define HCI_PHY_CTRL            0x810           /* bit 3 SIDDQ */
++#define HCI_PASSBY_BITS         ((1u << 15) | (1u << 11) | (1u << 9) | (1u << 8) | (1u << 0))
++
++/* OHCI */
++#define OHCI_REVISION           0x00
++#define OHCI_CONTROL            0x04
++#define OHCI_CMDSTATUS          0x08
++#define OHCI_INTRSTATUS         0x0c
++#define OHCI_INTRDISABLE        0x14
++#define OHCI_HCCA               0x18
++#define OHCI_CTRLHEAD           0x20
++#define OHCI_CTRLCUR            0x24
++#define OHCI_BULKHEAD           0x28
++#define OHCI_FMINTERVAL         0x34
++#define OHCI_PERIODICSTART      0x40
++#define OHCI_RHDESCA            0x48
++#define OHCI_RHSTATUS           0x50
++#define OHCI_RHPORT1            0x54
++
++#define CTRL_PLE                (1u << 2)
++#define CTRL_CLE                (1u << 4)
++#define CTRL_HCFS_OPER          (2u << 6)
++#define CMD_HCR                 (1u << 0)
++#define CMD_CLF                 (1u << 1)
++#define RHA_NPS                 (1u << 9)
++#define RHS_LPSC                (1u << 16)
++#define PORT_CCS                (1u << 0)
++#define PORT_PES                (1u << 1)
++#define PORT_PRS                (1u << 4)
++#define PORT_PPS                (1u << 8)
++#define PORT_LSDA               (1u << 9)
++#define PORT_PRSC               (1u << 20)
++#define PORT_CHANGES            (0x1fu << 16)
++
++/* DMA window layout (offsets) */
++#define DMA_SIZE                0x10000
++#define D_HCCA                  0x0000          /* 256-byte aligned */
++#define D_CTRL_ED               0x0100
++#define D_INTR_ED               0x0110
++#define D_CTRL_TD               0x0200          /* 4 TDs: setup, data, status, dummy */
++#define D_INTR_TD               0x0300          /* 2 TDs: active, dummy */
++#define D_SETUP                 0x0400
++#define D_CTRL_BUF              0x0800          /* 1 KiB */
++#define D_INTR_BUF              0x1000          /* 64 bytes */
++
++#define TD_R                    (1u << 18)
++#define TD_DP_SETUP             (0u << 19)
++#define TD_DP_OUT               (1u << 19)
++#define TD_DP_IN                (2u << 19)
++#define TD_DI_NONE              (7u << 21)
++#define TD_T_DATA0              (2u << 24)
++#define TD_T_DATA1              (3u << 24)
++#define TD_T_ED                 (0u << 24)
++#define TD_CC_NOTACC            (0xfu << 28)
++
++#define ED_SKIP                 (1u << 14)
++#define ED_LOW_SPEED            (1u << 13)
++
++/* EHCI1 gate and reset in CCU_USB1_BGR; CONFIGFLAG routes the port to EHCI. */
++#define CCU_EHCI1_ON            ((1u << 4) | (1u << 20))
++#define EHCI_CONFIGFLAG         0x40            /* operational register */
++
++#define USB_CLASS_HUB           9
++
++struct ut_dev {
++	uint32_t addr, mps0;
++	bool low_speed;
++};
++
++static struct {
++	vm_offset_t ccu, hci, ohci, dma;
++	uint32_t dma_pa;
++	struct ut_dev dev;              /* the touch controller */
++	uint32_t ep_in, ep_mps;
++	struct ut_layout layout;
++	struct ut_orient orient;
++	bool down[UT_MAX_FINGERS];
++	int lastx[UT_MAX_FINGERS], lasty[UT_MAX_FINGERS];
++	uint32_t reports, logged, ctl_errors;
++} ut;
++
++static uint8_t ut_buf[1024];
++
++static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++
++static uint64_t
++ut_deadline_ms(uint32_t ms)
++{
++	uint64_t interval;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &interval);
++	return mach_absolute_time() + interval;
++}
++
++static void
++ut_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline((event_t)&ut, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++ut_clocks_on(void)
++{
++	wr32(ut.ccu, CCU_MSI_LITE2, rd32(ut.ccu, CCU_MSI_LITE2) | 1u);
++	wr32(ut.ccu, CCU_AHB_MASTER, rd32(ut.ccu, CCU_AHB_MASTER) | (1u << 9) | CCU_AHB_MASTER_KEY);
++	wr32(ut.ccu, CCU_USB_REF, (rd32(ut.ccu, CCU_USB_REF) & ~(7u << 24)) | (1u << 31));
++	wr32(ut.ccu, CCU_USB1_BGR, rd32(ut.ccu, CCU_USB1_BGR) | (1u << 16));   /* OHCI reset off */
++	wr32(ut.ccu, CCU_USB1_BGR, rd32(ut.ccu, CCU_USB1_BGR) | (1u << 0));    /* OHCI gate */
++	wr32(ut.ccu, CCU_USB1, rd32(ut.ccu, CCU_USB1) | (1u << 31));           /* usb1 clock */
++	delay(10);
++	wr32(ut.hci, HCI_PHY_CTRL, rd32(ut.hci, HCI_PHY_CTRL) & ~(1u << 3));   /* SIDDQ off */
++	wr32(ut.ccu, CCU_USB1, rd32(ut.ccu, CCU_USB1) | (1u << 30));           /* PHY reset off */
++	delay(10);
++	wr32(ut.hci, HCI_PASSBY, rd32(ut.hci, HCI_PASSBY) | HCI_PASSBY_BITS);
++	/* If U-Boot left EHCI1 running and owning the port, hand the port to OHCI. */
++	if ((rd32(ut.ccu, CCU_USB1_BGR) & CCU_EHCI1_ON) == CCU_EHCI1_ON) {
++		uint32_t caplen = rd32(ut.hci, 0) & 0xff;
++		if (caplen >= 0x10 && caplen <= 0x40 && rd32(ut.hci, caplen + EHCI_CONFIGFLAG)) {
++			printf("A733 TOUCH: EHCI1 owned the port, routing it to OHCI\n");
++			wr32(ut.hci, caplen + EHCI_CONFIGFLAG, 0);
++			delay(1000);
++		}
++	}
++}
++
++static void
++ut_td(uint32_t off, uint32_t flags, uint32_t buf_off, uint32_t len, uint32_t next_off)
++{
++	wr32(ut.dma, off + 0, flags | TD_DI_NONE | TD_CC_NOTACC);
++	wr32(ut.dma, off + 4, len ? ut.dma_pa + buf_off : 0);
++	wr32(ut.dma, off + 8, ut.dma_pa + next_off);
++	wr32(ut.dma, off + 12, len ? ut.dma_pa + buf_off + len - 1 : 0);
++}
++
++/*
++ * One control transfer on endpoint 0 of device d. IN data lands at
++ * D_CTRL_BUF; returns the byte count, or a negative errno.
++ */
++static int
++ut_control(const struct ut_dev *d, uint8_t bmrt, uint8_t req, uint16_t value, uint16_t index, uint16_t length)
++{
++	bool in = (bmrt & 0x80) != 0;
++	uint32_t td_setup = D_CTRL_TD, td_data = D_CTRL_TD + 16, td_status = D_CTRL_TD + 32, td_dummy = D_CTRL_TD + 48;
++
++	if (length > sizeof(ut_buf)) {
++		return -EINVAL;
++	}
++	wr32(ut.dma, D_SETUP, (uint32_t)bmrt | (uint32_t)req << 8 | (uint32_t)value << 16);
++	wr32(ut.dma, D_SETUP + 4, (uint32_t)index | (uint32_t)length << 16);
++	ut_td(td_setup, TD_DP_SETUP | TD_T_DATA0, D_SETUP, 8, length ? td_data : td_status);
++	if (length) {
++		ut_td(td_data, (in ? TD_DP_IN : TD_DP_OUT) | TD_T_DATA1 | TD_R, D_CTRL_BUF, length, td_status);
++	}
++	ut_td(td_status, ((in && length) ? TD_DP_OUT : TD_DP_IN) | TD_T_DATA1, 0, 0, td_dummy);
++	wr32(ut.dma, td_dummy + 0, 0);
++	wr32(ut.dma, td_dummy + 8, 0);
++	wr32(ut.dma, D_CTRL_ED + 0, (d->addr & 0x7f) | (d->low_speed ? ED_LOW_SPEED : 0) | (d->mps0 << 16));
++	wr32(ut.dma, D_CTRL_ED + 4, ut.dma_pa + td_dummy);
++	wr32(ut.dma, D_CTRL_ED + 12, 0);
++	__builtin_arm_dsb(0xf);
++	wr32(ut.dma, D_CTRL_ED + 8, ut.dma_pa + td_setup);
++	__builtin_arm_dsb(0xf);
++	wr32(ut.ohci, OHCI_CMDSTATUS, CMD_CLF);
++
++	uint64_t deadline = ut_deadline_ms(500);
++	for (;;) {
++		uint32_t head = rd32(ut.dma, D_CTRL_ED + 8);
++		if ((head & 1) || (head & ~0xfu) == ut.dma_pa + td_dummy) {
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			/* Park the ED empty so the next request starts clean. */
++			wr32(ut.dma, D_CTRL_ED + 8, ut.dma_pa + td_dummy);
++			return -ETIMEDOUT;
++		}
++		delay(50);
++	}
++	wr32(ut.ohci, OHCI_INTRSTATUS, 0xffffffffu);
++	uint32_t tds[3] = { td_setup, length ? td_data : 0, td_status };
++	for (unsigned i = 0; i < 3; i++) {
++		if (!tds[i]) {
++			continue;
++		}
++		uint32_t cc = rd32(ut.dma, tds[i]) >> 28;
++		if (cc != 0) {
++			if (ut.ctl_errors++ < 24) {
++				printf("A733 TOUCH: addr %u request 0x%02x/0x%02x: TD %u CC %u\n", d->addr, bmrt, req, i, cc);
++			}
++			return -EIO;
++		}
++	}
++	if (!length) {
++		return 0;
++	}
++	uint32_t cbp = rd32(ut.dma, td_data + 4);
++	return cbp ? (int)(cbp - (ut.dma_pa + D_CTRL_BUF)) : (int)length;
++}
++
++static void
++ut_read_buf(uint32_t off, uint8_t *dst, unsigned len)
++{
++	for (unsigned i = 0; i < len; i += 4) {
++		uint32_t w = rd32(ut.dma, off + i);
++		for (unsigned k = 0; k < 4 && i + k < len; k++) {
++			dst[i + k] = (uint8_t)(w >> (8 * k));
++		}
++	}
++}
++
++/* Control IN into ut_buf; returns the byte count or a negative errno. */
++static int
++ut_control_in(const struct ut_dev *d, uint8_t bmrt, uint8_t req, uint16_t value, uint16_t index, uint16_t length)
++{
++	int n = ut_control(d, bmrt, req, value, index, length);
++	if (n > 0) {
++		ut_read_buf(D_CTRL_BUF, ut_buf, (unsigned)n);
++	}
++	return n;
++}
++
++static int
++ut_root_reset(bool *low_speed)
++{
++	wr32(ut.ohci, OHCI_RHPORT1, PORT_PRS);
++	uint64_t deadline = ut_deadline_ms(200);
++	while (!(rd32(ut.ohci, OHCI_RHPORT1) & PORT_PRSC)) {
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(100);
++	}
++	wr32(ut.ohci, OHCI_RHPORT1, PORT_CHANGES);
++	ut_sleep_ms(20);
++	uint32_t ps = rd32(ut.ohci, OHCI_RHPORT1);
++	*low_speed = (ps & PORT_LSDA) != 0;
++	return (ps & PORT_PES) ? 0 : EIO;
++}
++
++static int
++ut_hub_port_reset(const struct ut_dev *hub, uint16_t port, bool *low_speed)
++{
++	if (ut_control(hub, 0x23, 3, 4, port, 0) < 0) {         /* SET_FEATURE(PORT_RESET) */
++		return EIO;
++	}
++	for (unsigned i = 0; i < 50; i++) {
++		ut_sleep_ms(10);
++		if (ut_control_in(hub, 0xa3, 0, 0, port, 4) != 4) {  /* GET_STATUS(port) */
++			return EIO;
++		}
++		uint16_t status = (uint16_t)(ut_buf[0] | ut_buf[1] << 8);
++		uint16_t change = (uint16_t)(ut_buf[2] | ut_buf[3] << 8);
++		if (change & (1u << 4)) {                            /* C_PORT_RESET */
++			(void)ut_control(hub, 0x23, 1, 20, port, 0);
++			(void)ut_control(hub, 0x23, 1, 16, port, 0); /* C_PORT_CONNECTION */
++			ut_sleep_ms(20);
++			*low_speed = (status & (1u << 9)) != 0;
++			return (status & 3) == 3 ? 0 : EIO;         /* connected and enabled */
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/*
++ * Give the device that answers on address 0 (its port just reset) the
++ * address addr. Returns its device class, or a negative errno.
++ */
++static int
++ut_address_device(struct ut_dev *d, uint32_t addr, bool low_speed, bool root_port)
++{
++	struct ut_dev d0 = { 0, 8, low_speed };
++	int n = ut_control_in(&d0, 0x80, 6, 0x0100, 0, 8);     /* device descriptor, 8 bytes */
++	if (n < 8) {
++		printf("A733 TOUCH: no device descriptor on address 0 (%d)\n", n);
++		return -EIO;
++	}
++	d0.mps0 = ut_buf[7] == 16 || ut_buf[7] == 32 || ut_buf[7] == 64 ? ut_buf[7] : 8;
++	if (root_port) {
++		bool ls;
++		if (ut_root_reset(&ls) != 0) {
++			return -EIO;
++		}
++	}
++	if ((n = ut_control(&d0, 0x00, 5, (uint16_t)addr, 0, 0)) < 0) {        /* SET_ADDRESS */
++		printf("A733 TOUCH: SET_ADDRESS %u failed %d\n", addr, n);
++		return -EIO;
++	}
++	ut_sleep_ms(5);
++	d->addr = addr;
++	d->mps0 = d0.mps0;
++	d->low_speed = low_speed;
++	n = ut_control_in(d, 0x80, 6, 0x0100, 0, 18);
++	if (n < 18) {
++		printf("A733 TOUCH: device descriptor on address %u failed %d\n", addr, n);
++		return -EIO;
++	}
++	printf("A733 TOUCH: address %u: device %04x:%04x class %u, EP0 %u bytes, %s speed\n", addr,
++	    ut_buf[8] | ut_buf[9] << 8, ut_buf[10] | ut_buf[11] << 8, ut_buf[4], d->mps0,
++	    low_speed ? "low" : "full");
++	return ut_buf[4];
++}
++
++/* Configuration descriptor (all of it) into ut_buf; returns its length or < 0. */
++static int
++ut_read_config(const struct ut_dev *d, uint8_t *config)
++{
++	int n = ut_control_in(d, 0x80, 6, 0x0200, 0, 9);
++	if (n < 9) {
++		return -EIO;
++	}
++	uint16_t total = (uint16_t)(ut_buf[2] | ut_buf[3] << 8);
++	*config = ut_buf[5];
++	if (total > sizeof(ut_buf)) {
++		total = sizeof(ut_buf);
++	}
++	n = ut_control_in(d, 0x80, 6, 0x0200, 0, total);
++	return n < 9 ? -EIO : n;
++}
++
++/* A HID touch screen on d: configure it and parse its report descriptor. */
++static int
++ut_setup_hid(const struct ut_dev *d)
++{
++	uint8_t config, iface = 0xff;
++	uint16_t rdlen = 0;
++	uint32_t ep_in = 0, ep_mps = 0;
++	int n = ut_read_config(d, &config);
++	if (n < 0) {
++		return EIO;
++	}
++	/* First HID interface: its HID descriptor and interrupt IN endpoint. */
++	for (int i = 0; i + 1 < n && ut_buf[i] >= 2;) {
++		uint8_t dl = ut_buf[i], dt = ut_buf[i + 1];
++		if (i + dl > n) {
++			break;
++		}
++		if (dt == 4 && dl >= 9 && iface == 0xff && ut_buf[i + 5] == 3) {
++			iface = ut_buf[i + 2];
++		} else if (dt == 0x21 && dl >= 9 && iface != 0xff && !rdlen) {
++			rdlen = (uint16_t)(ut_buf[i + 7] | ut_buf[i + 8] << 8);
++		} else if (dt == 5 && dl >= 7 && iface != 0xff && !ep_in &&
++		    (ut_buf[i + 2] & 0x80) && (ut_buf[i + 3] & 3) == 3) {
++			ep_in = ut_buf[i + 2] & 0x0f;
++			ep_mps = (uint32_t)(ut_buf[i + 4] | ut_buf[i + 5] << 8) & 0x7ff;
++		}
++		i += dl;
++	}
++	if (iface == 0xff || !rdlen || !ep_in || !ep_mps) {
++		printf("A733 TOUCH: address %u has no HID interface with an interrupt IN endpoint\n", d->addr);
++		return ENXIO;
++	}
++	if ((n = ut_control(d, 0x00, 9, config, 0, 0)) < 0) {   /* SET_CONFIGURATION */
++		printf("A733 TOUCH: SET_CONFIGURATION failed %d\n", n);
++		return EIO;
++	}
++	(void)ut_control(d, 0x21, 0x0a, 0, iface, 0);          /* SET_IDLE 0 (may be stalled) */
++	if (rdlen > sizeof(ut_buf)) {
++		rdlen = sizeof(ut_buf);
++	}
++	n = ut_control_in(d, 0x81, 6, 0x2200, iface, rdlen);   /* HID report descriptor */
++	if (n <= 0) {
++		printf("A733 TOUCH: report descriptor failed %d\n", n);
++		return EIO;
++	}
++	if (ut_parse_report_descriptor(ut_buf, (unsigned)n, &ut.layout) != 0) {
++		printf("A733 TOUCH: address %u: report descriptor (%d bytes) has no touch fingers\n", d->addr, n);
++		return ENXIO;
++	}
++	ut.dev = *d;
++	ut.ep_in = ep_in;
++	ut.ep_mps = ep_mps > 64 ? 64 : ep_mps;
++	printf("A733 TOUCH: interface %u EP 0x%x (%u bytes): report %u, %u fingers, X 0..%d Y 0..%d\n",
++	    iface, 0x80 | ep_in, ut.ep_mps, ut.layout.report_id, ut.layout.fingers,
++	    ut.layout.finger[0].x.lmax, ut.layout.finger[0].y.lmax);
++	return 0;
++}
++
++/*
++ * The board (or a cable) put a hub on the root port: power its ports and
++ * take the first touch screen behind it (one hub level). ENODEV = none yet.
++ */
++static int
++ut_setup_hub(const struct ut_dev *hub)
++{
++	uint8_t config;
++	if (ut_read_config(hub, &config) < 0 || ut_control(hub, 0x00, 9, config, 0, 0) < 0) {
++		return EIO;
++	}
++	if (ut_control_in(hub, 0xa0, 6, 0x2900, 0, 9) < 7) {   /* hub descriptor */
++		return EIO;
++	}
++	unsigned ports = ut_buf[2] > 15 ? 15 : ut_buf[2];
++	unsigned power_good = ut_buf[5] * 2u;
++	printf("A733 TOUCH: hub with %u ports\n", ports);
++	for (unsigned p = 1; p <= ports; p++) {
++		(void)ut_control(hub, 0x23, 3, 8, (uint16_t)p, 0); /* SET_FEATURE(PORT_POWER) */
++	}
++	ut_sleep_ms(power_good + 200);
++	for (unsigned p = 1; p <= ports; p++) {
++		if (ut_control_in(hub, 0xa3, 0, 0, (uint16_t)p, 4) != 4 || !(ut_buf[0] & 1)) {
++			continue;
++		}
++		struct ut_dev d;
++		bool ls;
++		if (ut_hub_port_reset(hub, (uint16_t)p, &ls) != 0) {
++			printf("A733 TOUCH: hub port %u reset failed\n", p);
++			continue;
++		}
++		int cls = ut_address_device(&d, 1 + p, ls, false);
++		if (cls < 0 || cls == USB_CLASS_HUB) {
++			if (cls == USB_CLASS_HUB) {
++				printf("A733 TOUCH: hub port %u has another hub; plug the touch cable in closer to the board\n", p);
++			}
++			continue;
++		}
++		if (ut_setup_hid(&d) == 0) {
++			printf("A733 TOUCH: touch screen on hub port %u\n", p);
++			return 0;
++		}
++	}
++	return ENODEV;
++}
++
++static int
++ut_attach(void)
++{
++	struct ut_dev d;
++	bool ls;
++	if (ut_root_reset(&ls) != 0) {
++		printf("A733 TOUCH: root port reset failed (0x%08x)\n", rd32(ut.ohci, OHCI_RHPORT1));
++		return EIO;
++	}
++	int cls = ut_address_device(&d, 1, ls, true);
++	if (cls < 0) {
++		return EIO;
++	}
++	return cls == USB_CLASS_HUB ? ut_setup_hub(&d) : ut_setup_hid(&d);
++}
++
++static void
++ut_arm_interrupt(void)
++{
++	uint32_t td = D_INTR_TD, dummy = D_INTR_TD + 16;
++	ut_td(td, TD_DP_IN | TD_T_ED | TD_R, D_INTR_BUF, ut.ep_mps, dummy);
++	wr32(ut.dma, dummy + 0, 0);
++	wr32(ut.dma, dummy + 8, 0);
++	uint32_t carry = rd32(ut.dma, D_INTR_ED + 8) & 2u;      /* keep the data toggle */
++	__builtin_arm_dsb(0xf);
++	wr32(ut.dma, D_INTR_ED + 8, (ut.dma_pa + td) | carry);
++}
++
++static void
++ut_release_all(void)
++{
++	for (unsigned s = 0; s < UT_MAX_FINGERS; s++) {
++		if (ut.down[s]) {
++			ut.down[s] = false;
++			sweet_hid_touch((int)s, 0, ut.lastx[s], ut.lasty[s]);
++		}
++	}
++}
++
++static void
++ut_report(const uint8_t *r, unsigned len)
++{
++	struct ut_contact c[UT_MAX_FINGERS];
++	int n = ut_decode(&ut.layout, r, len, c);
++	if (n < 0) {
++		return;
++	}
++	ut.reports++;
++	bool seen[UT_MAX_FINGERS] = { false };
++	for (int i = 0; i < n; i++) {
++		if (!c[i].down) {
++			continue;
++		}
++		unsigned slot = c[i].id % UT_MAX_FINGERS;
++		int x, y;
++		ut_map(c[i].x, c[i].y, ut.layout.finger[i].x.lmax, ut.layout.finger[i].y.lmax, ut.orient, &x, &y);
++		if (!ut.down[slot] && ut.logged < 16) {
++			ut.logged++;
++			printf("A733 TOUCH: down id %u raw %u,%u -> panel %d,%d\n", c[i].id, c[i].x, c[i].y, x, y);
++		}
++		seen[slot] = true;
++		ut.down[slot] = true;
++		ut.lastx[slot] = x;
++		ut.lasty[slot] = y;
++		sweet_hid_touch((int)slot, 1, x, y);
++	}
++	for (unsigned s = 0; s < UT_MAX_FINGERS; s++) {
++		if (ut.down[s] && !seen[s]) {
++			ut.down[s] = false;
++			sweet_hid_touch((int)s, 0, ut.lastx[s], ut.lasty[s]);
++		}
++	}
++}
++
++/* Poll the touch screen's interrupt endpoint until it goes away. */
++static void
++ut_poll(void)
++{
++	static uint8_t rep[64];
++	uint32_t errors = 0, logged_errors = 0;
++	uint32_t ed0 = ut.dev.addr | (ut.ep_in << 7) | (ut.dev.low_speed ? ED_LOW_SPEED : 0) | (ut.ep_mps << 16);
++
++	/* Queue the first TD while the ED is still skipped, then let the HC see it. */
++	wr32(ut.dma, D_INTR_ED + 0, ed0 | ED_SKIP);
++	ut_sleep_ms(2);
++	wr32(ut.dma, D_INTR_ED + 4, ut.dma_pa + D_INTR_TD + 16);
++	wr32(ut.dma, D_INTR_ED + 8, 0);
++	ut_arm_interrupt();
++	__builtin_arm_dsb(0xf);
++	wr32(ut.dma, D_INTR_ED + 0, ed0);
++	printf("A733 TOUCH: polling touches (orientation swap %d flipx %d flipy %d)\n",
++	    ut.orient.swap, ut.orient.flipx, ut.orient.flipy);
++
++	for (;;) {
++		ut_sleep_ms(4);
++		if (!(rd32(ut.ohci, OHCI_RHPORT1) & PORT_CCS)) {
++			printf("A733 TOUCH: unplugged after %u reports\n", ut.reports);
++			break;
++		}
++		uint32_t head = rd32(ut.dma, D_INTR_ED + 8);
++		if (!(head & 1) && (head & ~0xfu) != ut.dma_pa + D_INTR_TD + 16) {
++			continue;                       /* still pending (NAKed) */
++		}
++		uint32_t cc = rd32(ut.dma, D_INTR_TD) >> 28;
++		if (cc == 0) {
++			uint32_t cbp = rd32(ut.dma, D_INTR_TD + 4);
++			unsigned len = cbp ? cbp - (ut.dma_pa + D_INTR_BUF) : ut.ep_mps;
++			ut_read_buf(D_INTR_BUF, rep, len);
++			ut_report(rep, len);
++			errors = 0;
++		} else {
++			if (logged_errors++ < 8) {
++				printf("A733 TOUCH: interrupt TD CC %u (ED head 0x%x)\n", cc, head);
++			}
++			if (++errors >= 25) {
++				printf("A733 TOUCH: touch screen stopped answering; enumerating again\n");
++				break;
++			}
++		}
++		wr32(ut.ohci, OHCI_INTRSTATUS, 0xffffffffu);
++		ut_arm_interrupt();
++	}
++	wr32(ut.dma, D_INTR_ED + 0, ed0 | ED_SKIP);
++	ut_release_all();
++}
++
++static bool
++ut_controller_init(void)
++{
++	uint32_t rev = rd32(ut.ohci, OHCI_REVISION) & 0xff;
++	printf("A733 TOUCH: OHCI revision 0x%x, control 0x%08x, port 0x%08x\n", rev,
++	    rd32(ut.ohci, OHCI_CONTROL), rd32(ut.ohci, OHCI_RHPORT1));
++	if (rev != 0x10) {
++		printf("A733 TOUCH: OHCI not responding after the clock setup; giving up\n");
++		return false;
++	}
++	/* Reset and set up the controller: frames running, control + periodic lists. */
++	uint32_t fmi = rd32(ut.ohci, OHCI_FMINTERVAL) & 0x3fff;
++	wr32(ut.ohci, OHCI_INTRDISABLE, 0xffffffffu);
++	wr32(ut.ohci, OHCI_CMDSTATUS, CMD_HCR);
++	uint64_t deadline = ut_deadline_ms(20);
++	while (rd32(ut.ohci, OHCI_CMDSTATUS) & CMD_HCR) {
++		if (mach_absolute_time() > deadline) {
++			printf("A733 TOUCH: OHCI reset timed out\n");
++			return false;
++		}
++		delay(10);
++	}
++	if (fmi == 0) {
++		fmi = 11999;
++	}
++	for (unsigned i = 0; i < 0x400; i += 4) {
++		wr32(ut.dma, i, 0);
++	}
++	wr32(ut.dma, D_INTR_ED + 0, ED_SKIP);           /* until a touch screen is found */
++	for (unsigned i = 0; i < 32; i++) {
++		wr32(ut.dma, D_HCCA + 4 * i, ut.dma_pa + D_INTR_ED);
++	}
++	__builtin_arm_dsb(0xf);
++	wr32(ut.ohci, OHCI_HCCA, ut.dma_pa + D_HCCA);
++	wr32(ut.ohci, OHCI_CTRLHEAD, ut.dma_pa + D_CTRL_ED);
++	wr32(ut.ohci, OHCI_BULKHEAD, 0);
++	wr32(ut.ohci, OHCI_FMINTERVAL, (1u << 31) | (((fmi - 210) * 6 / 7) << 16) | fmi);
++	wr32(ut.ohci, OHCI_PERIODICSTART, fmi * 9 / 10);
++	wr32(ut.ohci, OHCI_CONTROL, CTRL_HCFS_OPER | CTRL_CLE | CTRL_PLE | 3u);
++	wr32(ut.ohci, OHCI_RHDESCA, (rd32(ut.ohci, OHCI_RHDESCA) | RHA_NPS) & ~(1u << 8));
++	wr32(ut.ohci, OHCI_RHSTATUS, RHS_LPSC);
++	wr32(ut.ohci, OHCI_RHPORT1, PORT_PPS);
++	ut_sleep_ms(100);
++	return true;
++}
++
++static void
++ut_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t last = PORT_CCS;
++	unsigned failures = 0;
++
++	if (!ut_controller_init()) {
++		return;
++	}
++	/* Hot-plug loop: the cable may be moved between ports at any time. */
++	for (;;) {
++		uint32_t ps = rd32(ut.ohci, OHCI_RHPORT1);
++		wr32(ut.ohci, OHCI_RHPORT1, ps & PORT_CHANGES);
++		if (!(ps & PORT_CCS)) {
++			if (last & PORT_CCS) {
++				printf("A733 TOUCH: nothing on USB1 root port 1 (0x%08x); waiting "
++				    "(try the other USB 2.0 port if the touch cable is plugged in)\n", ps);
++			}
++			last = ps;
++			failures = 0;
++			ut_sleep_ms(500);
++			continue;
++		}
++		if (!(last & PORT_CCS) || failures == 0) {
++			printf("A733 TOUCH: device on root port 1 (status 0x%08x)\n", ps);
++		}
++		last = ps;
++		ut_sleep_ms(100);
++		int err = ut_attach();
++		if (err == 0) {
++			ut_poll();
++			failures = 0;
++			continue;
++		}
++		if (err == ENODEV) {
++			ut_sleep_ms(2000);              /* hub without a touch screen (yet) */
++			continue;
++		}
++		if (++failures >= 5) {
++			printf("A733 TOUCH: enumeration failed %u times; replug the touch cable to retry\n", failures);
++			while (rd32(ut.ohci, OHCI_RHPORT1) & PORT_CCS) {
++				ut_sleep_ms(500);
++			}
++			continue;
++		}
++		ut_sleep_ms(1000);
++	}
++}
++
++/* Called from IOFindBSDRoot; returns at once, the work runs in a thread. */
++void a733_usbtouch_start(void);
++
++void
++a733_usbtouch_start(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL, *ccu = NULL, *dma = NULL;
++	unsigned int size = 0, ccu_size = 0, dma_size = 0;
++	uint32_t on = 1, v = 0;
++	thread_t thread;
++	static bool started;
++
++	PE_parse_boot_argn("a733usb", &on, sizeof(on));
++	if (started || !on || SecureDTLookupEntry(NULL, "/a733-usb", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 2 * sizeof(uintptr_t) ||
++	    SecureDTGetProperty(node, "ccu-reg", (void const **)&ccu, &ccu_size) != kSuccess ||
++	    ccu_size < 2 * sizeof(uintptr_t) ||
++	    SecureDTGetProperty(node, "dma-reg", (void const **)&dma, &dma_size) != kSuccess ||
++	    dma_size < 2 * sizeof(uintptr_t)) {
++		return;
++	}
++	if (reg[1] < 0x1000 || ccu[1] < 0x2000 || dma[1] < DMA_SIZE || dma[0] + DMA_SIZE > 0x100000000ull ||
++	    (dma[0] & 0xfff)) {
++		printf("A733 TOUCH: bad /a733-usb windows\n");
++		return;
++	}
++	ut.orient.swap = PE_parse_boot_argn("a733touch_swap", &v, sizeof(v)) && v;
++	v = 0;
++	ut.orient.flipx = PE_parse_boot_argn("a733touch_flipx", &v, sizeof(v)) && v;
++	v = 0;
++	ut.orient.flipy = PE_parse_boot_argn("a733touch_flipy", &v, sizeof(v)) && v;
++	ut.hci = ml_io_map(reg[0], 0x1000);
++	ut.ccu = ml_io_map(ccu[0], 0x2000);
++	ut.dma = ml_io_map(dma[0], DMA_SIZE);
++	if (!ut.hci || !ut.ccu || !ut.dma) {
++		return;
++	}
++	started = true;
++	ut.ohci = ut.hci + HCI_OHCI;
++	ut.dma_pa = (uint32_t)dma[0];
++	printf("A733 TOUCH: USB1 at 0x%lx, DMA window 0x%x; enabling clocks\n", (unsigned long)reg[0], ut.dma_pa);
++	ut_clocks_on();
++	if (kernel_thread_start(ut_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* !A733_USBTOUCH_HOST_TEST */
++#endif /* ARM64_BOARD_CONFIG_SWEET || A733_USBTOUCH_HOST_TEST */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 95a12da..0f9c64b 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -773,6 +773,11 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ //
+ //	A733: root on a partition of the microSD card in SMHC0 (bsd/dev/a733_sdmmc.c)
+ //
++	{
++		/* USB touch screen of the HDMI display (bsd/dev/a733_usbtouch.c), own thread. */
++		extern void a733_usbtouch_start(void);
++		a733_usbtouch_start();
++	}
+ 	{
+ 		uint32_t sdlog = 0;
+ 		if (strcmp(rdBootVar, "sdroot0") != 0 &&

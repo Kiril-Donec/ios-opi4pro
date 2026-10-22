@@ -100,12 +100,19 @@ class SdrootArgsTests(unittest.TestCase):
         _validate_sdroot_args(self.SD + " sdrw=1 rootrw=1", None, self.sd_adt)
         with self.assertRaisesRegex(ValueError, "--a76-pair"):
             _validate_sdroot_args(self.SD.replace("cpus=1", "cpus=2"), None, self.sd_adt)
-        for bad in ("cpus=3", "cpus=8", "cpus=0"):
-            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "cpus=1 or cpus=2"):
+        for bad in ("cpus=0", "cpus=9", "cpus=2 cpus=2"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "exactly one cpus=1..8"):
                 _validate_sdroot_args(self.SD.replace("cpus=1", bad), None, self.sd_adt)
         pair = build_adt(sdmmc=True, a76_pair=True).serialize()
         _validate_sdroot_args(self.SD.replace("cpus=1", "cpus=2"), None, pair)
         _validate_sdroot_args(self.SD, None, pair)                      # pair ADT, still one core
+        # The A55s (cpu2..cpu7) only with --a55; any count up to all eight.
+        for n in (3, 8):
+            with self.subTest(n=n), self.assertRaisesRegex(ValueError, "--a55"):
+                _validate_sdroot_args(self.SD.replace("cpus=1", f"cpus={n}"), None, pair)
+        all8 = build_adt(sdmmc=True, a76_pair=True, a55=True).serialize()
+        for n in range(1, 9):
+            _validate_sdroot_args(self.SD.replace("cpus=1", f"cpus={n}"), None, all8)
 
 
 if __name__ == "__main__":

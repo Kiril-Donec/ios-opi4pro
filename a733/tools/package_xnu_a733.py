@@ -67,12 +67,14 @@ def _validate_sdroot_args(cmdline: str, ramdisk: Path | None, adt_bytes: bytes) 
     if rootrw != sdrw or (sdrw and "sdrw=1" not in tokens):
         raise ValueError("a writable root needs both sdrw=1 (driver) and rootrw=1 (mount), or neither")
     cpus = [t for t in tokens if t.startswith("cpus=")]
-    if cpus == ["cpus=2"]:
-        # Only the two Cortex-A76 cores; the second must be in the ADT (--a76-pair).
-        if b"cpu1\x00" not in adt_bytes:
-            raise ValueError("cpus=2 requires an ADT built with mkadt_a733.py --a76-pair")
-    elif cpus != ["cpus=1"]:
-        raise ValueError("A733 runs on the Cortex-A76 cores only: exactly cpus=1 or cpus=2 is required")
+    if len(cpus) != 1 or cpus[0] not in {f"cpus={n}" for n in range(1, 9)}:
+        raise ValueError("exactly one cpus=1..8 is required")
+    n = int(cpus[0][5:])
+    # cpu1 = second A76 (--a76-pair), cpu2..cpu7 = the A55s (--a55).
+    if n >= 2 and b"cpu1\x00" not in adt_bytes:
+        raise ValueError("cpus=2 requires an ADT built with mkadt_a733.py --a76-pair")
+    if n >= 3 and f"cpu{n - 1}".encode() + b"\x00" not in adt_bytes:
+        raise ValueError(f"cpus={n} requires an ADT built with mkadt_a733.py --a76-pair --a55")
 
 
 def _validate_ramdisk_args(cmdline: str, ramdisk: Path | None) -> None:
@@ -145,8 +147,8 @@ def main() -> None:
     ap.add_argument("--ramdisk", type=Path, help="4..16 MiB HFS+ test image; sets rd=md0 if no --cmdline")
     ap.add_argument("--sdroot", action="store_true",
                     help=f"root on the microSD card partition (adds '{SDROOT_ARGS}')")
-    ap.add_argument("--cpus", type=int, choices=(1, 2), default=1,
-                    help="with --sdroot: Cortex-A76 cores to use (2 needs an ADT from mkadt_a733.py --a76-pair)")
+    ap.add_argument("--cpus", type=int, choices=range(1, 9), default=1,
+                    help="with --sdroot: cores to use: 1-2 A76, 3-8 adds A55s (ADT from --a76-pair [--a55])")
     ap.add_argument("--sdrw", action="store_true",
                     help=f"with --sdroot: writable iOS root for launchd (adds '{SDRW_ARGS} {USERLAND_ARGS}', drops {NO_KPRINTF_SPAM})")
     args = ap.parse_args()

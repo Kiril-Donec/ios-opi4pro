@@ -281,3 +281,18 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   volume needs fsck.hfsplus, and power-off without a journal or a clean shutdown keeps damaging it;
   (2) SpringBoard crash loop during Setup: 7x SIGSEGV pc 0x0, same lr 0x1deba058c (slide 0x4a068000),
   first one right after a tap - to re-check after fsck. SD: 0 errors; 2/2 CPUs; SWEET FB 3000 swaps.
+- **Test #8 log (second boot after test #7, local copy):** 4157x `hfs_mark_inconsistent`, SpringBoard
+  crash loop right at launch (26x SIGSEGV pc 0, same lr). Root cause of the damage: the HFS journal had
+  been switched off (`hfs-journal off`, needed while the driver was read-only) and the board is powered
+  off by pulling the plug. **2026-10-22: partition 2 restored from the clean `ios16-gui-first.img`
+  (sha256 4b44e310..., read-back verified; owner confirmed) with the journal flag left ON** - with
+  sdrw=1 XNU can now write the journal itself. Setup progress was lost with it.
+- **Patch 9999q (`xnu-a733-cores-fb-power.patch`):** SweetCPU accepts the six Cortex-A55s (MPIDR
+  0x000-0x500, ADT `--a55` after the A76 pair, so cpus=N takes A76s first; packager allows cpus=1..8);
+  `a733_cpu_present()` scales in physical row order with sequential 64-bit stores (host test: identical
+  pixels to the old loop) and presents at 30 Hz by default (`sweetfb_hz`); `bsd/dev/a733_power.c`
+  (ADT `--power`): the board's power button through the PMICs on R_TWI0 (AXP8191 0x36 IRQ_STATUS2 0x49
+  bits 5/6, AXP515 0x34 0x4b bits 5/4, polled 50 ms; short press = side button, hold 1.5 s adds volume
+  up = "slide to power off"), PE_halt_restart -> PSCI SYSTEM_OFF/RESET after the log flush, CPU PLL
+  report + timed loop. `serial=1` stays: XNU never uses the A733 UART; that boot-arg is the screen
+  console, which also feeds the card log.

@@ -76,7 +76,8 @@ def main() -> None:
     # the way it loops forever printing "unexpected IODeviceTreeSupport.cpp:579"
     # (board test 2026-10-22, /a733-sdmmc had interrupts = 161).
     for variant in ({}, {"ios_display": True}, {"sdmmc": True}, {"ios_display": True, "sdmmc": True},
-                    {"sdmmc": True, "usb_touch": True}):
+                    {"sdmmc": True, "usb_touch": True},
+                    {"sdmmc": True, "usb_touch": True, "a76_pair": True, "a55": True, "power": True}):
         tree, _ = parse(hw.build(**variant).serialize())
         check_interrupt_parents(tree, [], variant)
     # Second A76 only on request; XNU needs a non-running state for secondaries.
@@ -88,6 +89,28 @@ def main() -> None:
     assert cpus[0].prop("state").rstrip(b"\0") == b"running"
     assert cpus[1].prop("state").rstrip(b"\0") == b"waiting"
     assert cpus[1].prop("cluster-type") == cpus[0].prop("cluster-type")
+    # Six A55s after the A76 pair (cpus=N takes the A76s first), one XNU cluster.
+    all8, _ = parse(hw.build(sdmmc=True, a76_pair=True, a55=True).serialize())
+    cpus = next(n for n in all8.children if n.name == "cpus").children
+    assert [int.from_bytes(c.prop("reg"), "little") for c in cpus] == [0x600, 0x700, 0, 0x100, 0x200, 0x300,
+                                                                       0x400, 0x500]
+    assert [int.from_bytes(c.prop("cpu-id"), "little") for c in cpus] == list(range(8))
+    assert [c.name for c in cpus] == [f"cpu{i}" for i in range(8)]
+    assert all(c.prop("state").rstrip(b"\0") == b"waiting" for c in cpus[1:])
+    assert len({c.prop("cluster-type") for c in cpus}) == 1 and len({c.prop("cluster-id") for c in cpus}) == 1
+    try:
+        hw.build(sdmmc=True, a55=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("--a55 without the A76 pair must be refused")
+    # Power node: R_TWI0, R_CCU, CPU PLL; polled, no interrupts.
+    pw_root, _ = parse(hw.build(sdmmc=True, power=True).serialize())
+    pw = next(n for n in pw_root.children if n.name == "a733-power")
+    assert struct.unpack("<2Q", pw.prop("twi-reg")) == (0x07083000, 0x400)
+    assert struct.unpack("<2Q", pw.prop("rccu-reg")) == (0x07010000, 0x400)
+    assert struct.unpack("<2Q", pw.prop("cpupll-reg")) == (0x08870000, 0x4000)
+    assert pw.prop("interrupts") is None
     check_product()
     assert not any(n.name == "a733-usb" for n in sd_root.children)
     usb_root, _ = parse(hw.build(sdmmc=True, usb_touch=True).serialize())

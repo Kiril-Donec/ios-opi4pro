@@ -36,6 +36,11 @@ on:
       - "a733/xnu-a733-console-graphics.patch"
       - "a733/xnu-a733-smp-a76.patch"
       - "a733/xnu-a733-usbtouch.patch"
+      - "a733/xnu-a733-cores-fb-power.patch"
+      - "a733/tests/test_cores_fb_power_patch.py"
+      - "a733/tests/test_power_logic.c"
+      - "a733/tests/test_fb_scaler.cpp"
+      - "a733/tests/power_kernel_stubs.h"
       - "a733/tests/test_usbtouch_patch.py"
       - "a733/tests/test_usbtouch_logic.c"
       - "a733/tests/usbtouch_kernel_stubs.h"
@@ -126,6 +131,8 @@ jobs:
           cp a733/xnu-a733-smp-a76.patch dxb/patches/9999o-a733-smp-a76.patch
           # Polled USB1 OHCI driver for the HDMI display's touch screen (needs 9999m).
           cp a733/xnu-a733-usbtouch.patch dxb/patches/9999p-a733-usbtouch.patch
+          # Six Cortex-A55s, row-order 30 Hz scaler, power button + PSCI power-off (needs 9999n-p).
+          cp a733/xnu-a733-cores-fb-power.patch dxb/patches/9999q-a733-cores-fb-power.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -285,6 +292,11 @@ jobs:
           if b"A733 TOUCH: polling touches" not in kernel:
               raise SystemExit("FAIL: A733 USB touch screen overlay was SKIPPED")
           print("PASS: A733 USB touch screen driver found in compiled XNU Mach-O")
+          for m in (b"A733 POWER: power button ready", b"A733 POWER: halt/restart -> PSCI SYSTEM_OFF/SYSTEM_RESET",
+                    b"Cortex-A55"):
+              if m not in kernel:
+                  raise SystemExit(f"FAIL: A733 cores/fb/power overlay was SKIPPED (missing {m!r})")
+          print("PASS: A733 A55 / power button / PSCI power-off code found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)
@@ -447,7 +459,8 @@ jobs:
       # payload stays small and kernel updates never rewrite the iOS partition.
       - name: Build experimental microSD-root (rd=sdroot0) payload
         run: |
-          python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc --a76-pair --usb-touch
+          python3 a733/tools/mkadt_a733.py a733/build/a733-sdroot.adt --ios-display --sdmmc --a76-pair --usb-touch \
+            --a55 --power
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
             a733/build/a733-sdroot.adt a733/build/a733-xnu-sdroot.payload --sdroot --sdrw
           python3 a733/tools/package_xnu_a733.py kernel/kernel.development.sweet \
@@ -467,6 +480,8 @@ jobs:
           assert struct.unpack('<2Q', sd.prop('reg')) == (0x04020000, 0x1000)
           assert struct.unpack('<2Q', sd.prop('ccu-reg')) == (0x02002000, 0x2000)
           usb = next(n for n in tree.children if n.name == 'a733-usb')
+          assert next(n for n in tree.children if n.name == 'a733-power')
+          assert len(next(n for n in tree.children if n.name == 'cpus').children) == 8
           assert struct.unpack('<2Q', usb.prop('dma-reg')) == (0x60000000, 0x10000)
           chosen = next(n for n in tree.children if n.name == 'chosen')
           mmap = next(n for n in chosen.children if n.name == 'memory-map')
@@ -476,7 +491,7 @@ jobs:
           q = Path('a733/build/a733-xnu-sdroot-2cpu.payload').read_bytes()
           assert b' cpus=2 ' in q and b' cpus=1 ' not in q
           cpus = next(n for n in tree.children if n.name == 'cpus').children
-          assert [struct.unpack('<I', c.prop('reg'))[0] for c in cpus] == [0x600, 0x700]
+          assert [struct.unpack('<I', c.prop('reg'))[0] for c in cpus][:2] == [0x600, 0x700]
           print('PASS two-A76 payload: cpus=2, ADT cpus 0x600 + 0x700')
           PY
 

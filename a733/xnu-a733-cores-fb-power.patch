@@ -1,0 +1,1214 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4b26392..c0322dc 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a733_sdmmc.c			standard
+ bsd/dev/a733_usbtouch.c			standard
++bsd/dev/a733_power.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a733_power.c b/bsd/dev/a733_power.c
+new file mode 100644
+index 0000000..723cd34
+--- /dev/null
++++ b/bsd/dev/a733_power.c
+@@ -0,0 +1,471 @@
++/*
++ * Allwinner A733 / Orange Pi 4 Pro platform power: the board's power button
++ * as the iPhone side button, PSCI power-off/restart, and a CPU clock report.
++ *
++ * Button: the PMICs on R_TWI0 (s_twi0, 0x07083000): AXP8191 at 0x36 (main
++ * PMIC, IRQ_STATUS2 0x49: bit 5 PWRON falling = press, bit 6 rising =
++ * release) and AXP515 at 0x34 (charger, INTSTS4 0x4b: bit 5 press, bit 4
++ * release), as the vendor axp2101-pek.c reads them; both are watched, the
++ * board's button sits on one of them. A thread polls the TWI every 50 ms
++ * (the PMIC IRQ line goes through the R-domain NMI controller, unused here)
++ * and drives sweet_hid_key(): a short press is a side button press (lock /
++ * wake); held for PK_CHORD_MS it adds volume up, the iPhone X chord for
++ * "slide to power off". The PMIC's own 6 s hard power-off stays as the
++ * hardware fallback, and a press while the board is off powers it on.
++ *
++ * Power-off: PE_halt_restart -> PSCI SYSTEM_OFF / SYSTEM_RESET (BL31 talks
++ * to the PMIC, as on the vendor Linux), reached after XNU has unmounted the
++ * file systems; the microSD log is flushed first. Panic paths keep the old
++ * behaviour (nothing is powered off).
++ *
++ * CPU clock: the CPU PLL block (0x08870000) is only read and the result
++ * printed, with a timed loop on the boot A76 as a cross-check.
++ *
++ * Boot-args: a733pwrkey=0 turns the button thread off, a733psci_off=0 keeps
++ * the old "halt = spin" behaviour.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_POWER_HOST_TEST)
++
++#ifndef A733_POWER_HOST_TEST
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/cpu_number.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sweet_hid_key(int key, int down);
++extern int (*PE_halt_restart)(unsigned int type);
++extern void a733_sd_log_panic_flush(void);
++#else
++#include <stdbool.h>
++#include <stdint.h>
++#endif
++
++/* ------------------------------------------------------------------ pure */
++
++#define PK_POWER        0               /* sweet_hid_key: side button */
++#define PK_VOLUP        1               /* volume up */
++#define PK_CHORD_MS     1500
++
++struct pk_state {
++	bool down, chord;
++	uint64_t since_ms;
++};
++
++typedef void (*pk_key_fn)(int key, int down);
++
++/* One poll: press/release edges seen since the last poll, and the time. */
++static void
++pk_step(struct pk_state *s, bool press, bool release, uint64_t now_ms, pk_key_fn key)
++{
++	if (press && !s->down) {
++		s->down = true;
++		s->chord = false;
++		s->since_ms = now_ms;
++		key(PK_POWER, 1);
++	}
++	if (s->down && !s->chord && !release && now_ms - s->since_ms >= PK_CHORD_MS) {
++		s->chord = true;
++		key(PK_VOLUP, 1);
++	}
++	if (release && s->down) {
++		if (s->chord) {
++			key(PK_VOLUP, 0);
++		}
++		key(PK_POWER, 0);
++		s->down = false;
++		s->chord = false;
++	}
++}
++
++/*
++ * TWI clock: F_scl = F_in / (10 * (M + 1) * 2^N). Fastest setting not above
++ * max_hz; returns the CCR value (N in bits 2:0, M in bits 6:3).
++ */
++static uint32_t
++twi_ccr_for(uint32_t in_hz, uint32_t max_hz, uint32_t *out_hz)
++{
++	uint32_t best = 0x7u | (0xfu << 3), best_hz = in_hz / (10u * 16u * 128u);
++	for (uint32_t n = 0; n < 8; n++) {
++		for (uint32_t m = 0; m < 16; m++) {
++			uint32_t hz = in_hz / (10u * (m + 1) << n);
++			if (hz <= max_hz && hz > best_hz) {
++				best_hz = hz;
++				best = n | (m << 3);
++			}
++		}
++	}
++	*out_hz = best_hz;
++	return best;
++}
++
++/* R_APBS1 (R_CCU + 0x10): mux 26:24 (dcxo, rtc32k, iosc, pll-peri0-200m, pll-ref), M 4:0. */
++static uint32_t
++r_apbs1_hz(uint32_t reg)
++{
++	static const uint32_t parent[8] = { 24000000, 32768, 16000000, 200000000, 24000000, 24000000, 24000000, 24000000 };
++	return parent[(reg >> 24) & 7] / ((reg & 0x1f) + 1);
++}
++
++/* CPU PLL (nkmp, dcxo 24 MHz): N in bits 15:8; P (2^p) in bits 17:16 of the cpu_clk register. */
++static uint32_t
++cpu_pll_mhz(uint32_t pll, uint32_t clk)
++{
++	uint32_t n = (pll >> 8) & 0xff, p = (clk >> 16) & 3;
++	return (24u * n) >> p;
++}
++
++#ifndef A733_POWER_HOST_TEST
++/* ---------------------------------------------------------------- kernel */
++
++#define RCCU_TWI_BGR            0x019c          /* bit 0 R_TWI0 gate, bit 16 reset */
++#define RCCU_APBS1              0x0010
++
++#define TWI_DATA                0x08
++#define TWI_CNTR                0x0c
++#define TWI_STAT                0x10
++#define TWI_CCR                 0x14
++#define TWI_SRST                0x18
++#define TWI_EFR                 0x1c
++#define TWI_DRV_CTRL            0x200
++#define CNTR_A_ACK              (1u << 2)
++#define CNTR_INT_FLAG           (1u << 3)
++#define CNTR_M_STP              (1u << 4)
++#define CNTR_M_STA              (1u << 5)
++#define CNTR_BUS_EN             (1u << 6)
++
++#define AXP8191_ADDR            0x36
++#define AXP8191_IRQ_EN2         0x41
++#define AXP8191_IRQ_ST2         0x49
++#define AXP8191_PRESS           (1u << 5)
++#define AXP8191_RELEASE         (1u << 6)
++#define AXP515_ADDR             0x34
++#define AXP515_INTEN4           0x43
++#define AXP515_INTSTS4          0x4b
++#define AXP515_PRESS            (1u << 5)
++#define AXP515_RELEASE          (1u << 4)
++
++#define PSCI_SYSTEM_OFF         0x84000008u
++#define PSCI_SYSTEM_RESET       0x84000009u
++
++static struct {
++	vm_offset_t twi, rccu, cpupll;
++	struct pk_state pk;
++	uint32_t errors;
++	bool have[2];
++} pw;
++
++static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++
++static void
++pw_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline((event_t)&pw, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++pw_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* The vendor engine-mode helpers (twi-sunxi-core.c): INT_FLAG is write-1-to-clear. */
++static void
++twi_clear(void)
++{
++	uint32_t v = rd32(pw.twi, TWI_CNTR);
++	wr32(pw.twi, TWI_CNTR, (v | CNTR_INT_FLAG) & ~(CNTR_M_STA | CNTR_M_STP));
++}
++
++static void
++twi_set(uint32_t bits)
++{
++	uint32_t v = rd32(pw.twi, TWI_CNTR);
++	wr32(pw.twi, TWI_CNTR, (v | bits) & ~CNTR_INT_FLAG);
++}
++
++static int
++twi_wait(void)
++{
++	for (unsigned i = 0; i < 2000; i++) {
++		if (rd32(pw.twi, TWI_CNTR) & CNTR_INT_FLAG) {
++			return (int)(rd32(pw.twi, TWI_STAT) & 0xff);
++		}
++		delay(5);
++	}
++	return -1;
++}
++
++static void
++twi_stop(void)
++{
++	twi_set(CNTR_M_STP);
++	twi_clear();
++	for (unsigned i = 0; i < 200 && (rd32(pw.twi, TWI_CNTR) & CNTR_M_STP); i++) {
++		delay(5);
++	}
++}
++
++/* Send what the previous state asked for, then expect the next status. */
++static bool
++twi_expect(int want, const char *what)
++{
++	int st = twi_wait();
++	if (st == want) {
++		return true;
++	}
++	if (pw.errors++ < 8) {
++		printf("A733 POWER: TWI %s: status 0x%x (expected 0x%x)\n", what, st, want);
++	}
++	twi_stop();
++	return false;
++}
++
++static int
++twi_read(uint8_t addr, uint8_t reg, uint8_t *val)
++{
++	wr32(pw.twi, TWI_CNTR, (rd32(pw.twi, TWI_CNTR) | CNTR_BUS_EN) & ~(CNTR_A_ACK | CNTR_INT_FLAG));
++	twi_set(CNTR_M_STA);
++	if (!twi_expect(0x08, "start")) {
++		return EIO;
++	}
++	wr32(pw.twi, TWI_DATA, (uint32_t)addr << 1);
++	twi_clear();
++	if (!twi_expect(0x18, "address+W")) {
++		return ENXIO;
++	}
++	wr32(pw.twi, TWI_DATA, reg);
++	twi_clear();
++	if (!twi_expect(0x28, "register")) {
++		return EIO;
++	}
++	twi_set(CNTR_M_STA);
++	twi_clear();
++	if (!twi_expect(0x10, "restart")) {
++		return EIO;
++	}
++	wr32(pw.twi, TWI_DATA, ((uint32_t)addr << 1) | 1);
++	twi_clear();
++	if (!twi_expect(0x40, "address+R")) {
++		return EIO;
++	}
++	twi_clear();                            /* one byte: A_ACK stays off -> NACK */
++	if (!twi_expect(0x58, "data")) {
++		return EIO;
++	}
++	*val = (uint8_t)rd32(pw.twi, TWI_DATA);
++	twi_stop();
++	return 0;
++}
++
++static int
++twi_write(uint8_t addr, uint8_t reg, uint8_t val)
++{
++	wr32(pw.twi, TWI_CNTR, (rd32(pw.twi, TWI_CNTR) | CNTR_BUS_EN) & ~(CNTR_A_ACK | CNTR_INT_FLAG));
++	twi_set(CNTR_M_STA);
++	if (!twi_expect(0x08, "start")) {
++		return EIO;
++	}
++	wr32(pw.twi, TWI_DATA, (uint32_t)addr << 1);
++	twi_clear();
++	if (!twi_expect(0x18, "address+W")) {
++		return ENXIO;
++	}
++	wr32(pw.twi, TWI_DATA, reg);
++	twi_clear();
++	if (!twi_expect(0x28, "register")) {
++		return EIO;
++	}
++	wr32(pw.twi, TWI_DATA, val);
++	twi_clear();
++	if (!twi_expect(0x28, "value")) {
++		return EIO;
++	}
++	twi_stop();
++	return 0;
++}
++
++static void
++pw_key(int key, int down)
++{
++	if (pw.errors < 64) {
++		printf("A733 POWER: %s %s\n", key == PK_POWER ? "side button" : "volume up (power-off chord)",
++		    down ? "down" : "up");
++	}
++	sweet_hid_key(key, down);
++}
++
++static const struct {
++	uint8_t addr, en_reg, st_reg, press, release;
++	const char *name;
++} pk_chips[2] = {
++	{ AXP8191_ADDR, AXP8191_IRQ_EN2, AXP8191_IRQ_ST2, AXP8191_PRESS, AXP8191_RELEASE, "AXP8191" },
++	{ AXP515_ADDR, AXP515_INTEN4, AXP515_INTSTS4, AXP515_PRESS, AXP515_RELEASE, "AXP515" },
++};
++
++static bool
++pw_twi_init(void)
++{
++	wr32(pw.rccu, RCCU_TWI_BGR, rd32(pw.rccu, RCCU_TWI_BGR) | (1u << 16) | 1u);
++	delay(10);
++	wr32(pw.twi, TWI_DRV_CTRL, rd32(pw.twi, TWI_DRV_CTRL) & ~1u);   /* engine mode */
++	wr32(pw.twi, TWI_SRST, 1);
++	for (unsigned i = 0; i < 100 && (rd32(pw.twi, TWI_SRST) & 1); i++) {
++		delay(10);
++	}
++	wr32(pw.twi, TWI_EFR, 0);
++	uint32_t in_hz = r_apbs1_hz(rd32(pw.rccu, RCCU_APBS1)), scl;
++	uint32_t ccr = twi_ccr_for(in_hz, 100000, &scl);
++	wr32(pw.twi, TWI_CCR, ccr);
++	wr32(pw.twi, TWI_CNTR, CNTR_BUS_EN);
++	printf("A733 POWER: R_TWI0 in %u Hz, CCR 0x%x -> %u Hz\n", in_hz, ccr, scl);
++	return true;
++}
++
++static void
++pw_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	pw_twi_init();
++	for (unsigned c = 0; c < 2; c++) {
++		uint8_t en = 0;
++		if (twi_read(pk_chips[c].addr, pk_chips[c].en_reg, &en) != 0) {
++			printf("A733 POWER: %s (0x%x) not answering\n", pk_chips[c].name, pk_chips[c].addr);
++			continue;
++		}
++		pw.have[c] = true;
++		uint8_t want = en | pk_chips[c].press | pk_chips[c].release;
++		if (want != en) {
++			(void)twi_write(pk_chips[c].addr, pk_chips[c].en_reg, want);
++		}
++		/* Drop edges left over from power-on. */
++		(void)twi_write(pk_chips[c].addr, pk_chips[c].st_reg, pk_chips[c].press | pk_chips[c].release);
++		printf("A733 POWER: %s power key IRQ enable 0x%02x -> 0x%02x\n", pk_chips[c].name, en, want);
++	}
++	if (!pw.have[0] && !pw.have[1]) {
++		printf("A733 POWER: no PMIC on R_TWI0; power button off\n");
++		return;
++	}
++	printf("A733 POWER: power button ready (short press: lock/wake, hold %u ms: slide to power off)\n",
++	    PK_CHORD_MS);
++	for (;;) {
++		bool press = false, release = false;
++		for (unsigned c = 0; c < 2; c++) {
++			uint8_t st;
++			if (!pw.have[c] || twi_read(pk_chips[c].addr, pk_chips[c].st_reg, &st) != 0) {
++				continue;
++			}
++			uint8_t edges = st & (pk_chips[c].press | pk_chips[c].release);
++			if (edges) {
++				(void)twi_write(pk_chips[c].addr, pk_chips[c].st_reg, edges);
++				press |= (edges & pk_chips[c].press) != 0;
++				release |= (edges & pk_chips[c].release) != 0;
++			}
++		}
++		pk_step(&pw.pk, press, release, pw_now_ms(), pw_key);
++		pw_sleep_ms(50);
++	}
++}
++
++static int32_t
++pw_psci(uint32_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	__asm__ volatile("smc #0" : "+r"(x0) : :
++	    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	    "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++/* kPEHaltCPU 0, kPERestartCPU 1 (IOPlatformExpert.h); everything else as before. */
++static int
++a733_halt_restart(unsigned int type)
++{
++	if (type != 0 && type != 1) {
++		return -1;
++	}
++	printf("A733 POWER: %s via PSCI\n", type == 0 ? "power off" : "restart");
++	a733_sd_log_panic_flush();
++	int32_t rc = pw_psci(type == 0 ? PSCI_SYSTEM_OFF : PSCI_SYSTEM_RESET);
++	printf("A733 POWER: PSCI returned %d\n", rc);
++	return -1;
++}
++
++static void
++pw_cpu_report(void)
++{
++	static const struct {
++		uint32_t pll, clk;
++		const char *name;
++	} cl[3] = {
++		{ 0x1000, 0x101c, "A55 (cpu_l)" }, { 0x2000, 0x201c, "A76 (cpu_b)" }, { 0x3000, 0x301c, "DSU" },
++	};
++	static const char *const mux[8] = { "dcxo", "dcxo", "dcxo", "own PLL", "peri0-2x", "back PLL", "?", "?" };
++	uint32_t back = rd32(pw.cpupll, 0x0000);
++	uint32_t back_mhz = 24u * ((back >> 8) & 0xff) / ((back & 0xf) + 1);
++	for (unsigned i = 0; i < 3; i++) {
++		uint32_t pll = rd32(pw.cpupll, cl[i].pll), clk = rd32(pw.cpupll, cl[i].clk);
++		printf("A733 CPU: %s pll 0x%08x clk 0x%08x: source %s, PLL %u MHz (back PLL %u MHz)\n",
++		    cl[i].name, pll, clk, mux[(clk >> 24) & 7], cpu_pll_mhz(pll, clk), back_mhz);
++	}
++	/* Cross-check: one dependent subtract+branch per cycle on the boot A76. */
++	const uint64_t iters = 20000000;
++	uint64_t n = iters, t0 = mach_absolute_time();
++	__asm__ volatile("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(n) : : "cc");
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("A733 CPU: timed loop on cpu %d: about %llu MHz\n", cpu_number(), ns ? iters * 1000 / ns : 0);
++}
++
++/* Called from IOFindBSDRoot (once); the button runs in its own thread. */
++void a733_power_start(void);
++
++void
++a733_power_start(void)
++{
++	DTEntry node;
++	uintptr_t const *twi = NULL, *rccu = NULL, *cpupll = NULL;
++	unsigned int s1 = 0, s2 = 0, s3 = 0;
++	uint32_t on = 1, psci_off = 1;
++	thread_t thread;
++	static bool started;
++
++	if (started || SecureDTLookupEntry(NULL, "/a733-power", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "twi-reg", (void const **)&twi, &s1) != kSuccess || s1 < 2 * sizeof(uintptr_t) ||
++	    SecureDTGetProperty(node, "rccu-reg", (void const **)&rccu, &s2) != kSuccess || s2 < 2 * sizeof(uintptr_t) ||
++	    SecureDTGetProperty(node, "cpupll-reg", (void const **)&cpupll, &s3) != kSuccess ||
++	    s3 < 2 * sizeof(uintptr_t)) {
++		return;
++	}
++	started = true;
++	pw.twi = ml_io_map(twi[0], 0x1000);
++	pw.rccu = ml_io_map(rccu[0], 0x1000);
++	pw.cpupll = ml_io_map(cpupll[0], 0x4000);
++	if (pw.cpupll) {
++		pw_cpu_report();
++	}
++	PE_parse_boot_argn("a733psci_off", &psci_off, sizeof(psci_off));
++	if (psci_off) {
++		PE_halt_restart = a733_halt_restart;
++		printf("A733 POWER: halt/restart -> PSCI SYSTEM_OFF/SYSTEM_RESET\n");
++	}
++	PE_parse_boot_argn("a733pwrkey", &on, sizeof(on));
++	if (on && pw.twi && pw.rccu && kernel_thread_start(pw_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* !A733_POWER_HOST_TEST */
++#endif /* ARM64_BOARD_CONFIG_SWEET || A733_POWER_HOST_TEST */
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 41d51dc..09861ae 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,16 +73,19 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* A733: only the two Cortex-A76 cores (MPIDR 0x600 boots, 0x700 with cpus=2). */
+-	if ((cpu->phys_id != 0x600 && cpu->phys_id != 0x700) ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	/*
++	 * A733 (DynamIQ, one core per Aff1): Cortex-A55 0x000-0x500, Cortex-A76
++	 * 0x600 (boots) and 0x700. The ADT lists the A76s first, so cpus=N
++	 * takes them before the A55s.
++	 */
++	if ((cpu->phys_id & ~0x700u) != 0 || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Cortex-A76");
++	cpuName = OSSymbol::withCStringNoCopy(cpu->phys_id >= 0x600 ? "Cortex-A76" : "Cortex-A55");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index de7cc72..db90152 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -96,629 +96,656 @@ enum {
+ 	kSweetFBGetID                   = 7,
+ 	kSweetFBGetDisplaySize          = 8,
+ 	kSweetFBRequestPowerChange      = 12,
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_FADE_STEPS             30      /* ~0.5 s at 60 Hz */
+ #define SWEET_FB_MAX_NITS               500     /* IOMFBBrightnessLevel at panel DBV 0x7ff */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
+ 	volatile uint32_t *fVig0;
+ 	volatile uint32_t *fCtl0;
+ 	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
+ 	uint32_t      fIntfFrames;
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+ 	bool          directPresent(const uint8_t *rec);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* topaz fade: cached copy of the last frame and a contiguous output frame */
+ 	IOBufferMemoryDescriptor *fFadeOrig;
+ 	/* kernel-drawn frames (console, fade) are double buffered like iOS's:
+ 	 * built in the back buffer, then the MDP flips to it at vsync */
+ 	IOBufferMemoryDescriptor *fFlip[2];
+ 	uint64_t      fFlipPhys[2];
+ 	uint32_t      fFlipIdx;
+ 	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
+ 	void          flipFrom(const uint8_t *src, uint32_t srcStride);
+ 	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
+ 	void          flipBack(void);
+ 	IOBufferMemoryDescriptor *fCons;    /* console shadow frame (cached, contiguous) */
+ 	uint64_t      fConsPhys;
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+ 	uint32_t      fLastStride;
+ 	SweetSurface *fLastSurf;      /* keeps fLastVA alive */
+ 	SweetSurface *fPendHold[4], *fShowHold[4], *fRetireHold[4];   /* in-use holds */
+ 	void          fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
+ 	volatile uint8_t *fDsi;
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+ 	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
+ 	uint32_t      fBlSent;        /* last level sent to the panel */
+ 	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
+ 	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+ 	void          setPanelOn(bool on);
+ 	void          setPanelLevel(uint32_t level);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ };
+ 
+ /*
+  * CoreBrightness (-[CBDisplayContaineriOS findBacklight]) matches
+  * {IOPropertyMatch: {backlight-control: true}} and requires the class to
+  * conform to AppleARMBacklight; without it there is no display module and
+  * the brightness slider is dead. It then sets "brightness-nits" here
+  * (SetBLDriverNitsValue) and IOMFBBrightnessLevel on the framebuffer.
+  */
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+ public:
+ 	AppleCLCD *fFB;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ /*
+  * A733: actual IOSurface pixels, CPU transformed into the U-Boot HDMI
+  * framebuffer. XNU's AppleCLCD/IOCoreSurfaceRoot user clients are real.
+  * The Qualcomm MDP is NEVER touched when fPhys == 0xBBF11000.
+  *
+  * This is deliberately a slow first-frame path, not GPU acceleration.
+  * Logical display: iPhone X 1125x2436. HDMI: 1024x600 rotated portrait.
+  * In this first bring-up, source layers are sampled over their full image;
+  * crop rectangles and high-performance compositing still need porting.
+  */
+ extern "C" void a733_fbcon_overlay(void);
+ extern "C" uint32_t *a733_fbcon_band(uint32_t *y0);
+ extern "C" void a733_fbcon_graphics_frame(void);
+ 
+ static void
+ a733_cpu_present(AppleCLCD *fb, const uint8_t *rec)
+ {
+ 	const uint32_t physical_w = 1024, physical_h = 600;
+ 	const uint32_t portrait_w = 600, portrait_h = 1024;
+ 	const uint32_t canvas_w = 1125, canvas_h = 2436;
+ 	const uint32_t view_w = (portrait_h * canvas_w + canvas_h / 2) / canvas_h;
+ 	const uint32_t left = (portrait_w - view_w) / 2;
+ 	SweetSurface *layers[SWEET_FB_LAYERS] = {};
+ 	const uint8_t *pixels[SWEET_FB_LAYERS] = {};
+ 	uint32_t mask = 0;
+ 	memcpy(&mask, rec + 0x104, sizeof(mask));
+ 	bool have_pixels = false;
+ 
+ 	if (fb->fPhys != 0xBBF11000ULL || fb->fWidth != physical_w ||
+ 	    fb->fHeight != physical_h || fb->fRowBytes != physical_w * 4 ||
+ 	    fb->fPixels == 0) {
+ 		return;
+ 	}
+ 	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
+ 		uint32_t id = 0;
+ 		memcpy(&id, rec + 0x54 + i * 4, sizeof(id));
+ 		if (!(mask & (1u << i)) || id == 0) {
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
+ 		if (s == NULL) {
+ 			continue;
+ 		}
+ 		/* Never read outside an IOSurface's actual backing allocation. */
+ 		uint64_t end = (uint64_t)s->offset;
+ 		if (s->width == 0 || s->height == 0 || s->bytesPerElement != 4 ||
+ 		    s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->bytesPerRow < (uint64_t)s->width * 4 || s->memory == NULL) {
+ 			s->release();
+ 			continue;
+ 		}
+ 		end += (uint64_t)(s->height - 1) * s->bytesPerRow +
+ 		    (uint64_t)s->width * 4;
+ 		uintptr_t va = s->kernelAddress();
+ 		if (va == 0 || end > s->memory->getLength()) {
+ 			s->release();
+ 			continue;
+ 		}
+ 		layers[i] = s;
+ 		pixels[i] = (const uint8_t *)va + s->offset;
+ 		have_pixels = true;
+ 	}
+ 	if (!have_pixels) {
+ 		return; /* preserve serial diagnostics until an actual iOS frame */
+ 	}
+ 
+ 	volatile uint32_t *dst = (volatile uint32_t *)fb->fPixels;
+ 	const uint32_t stride = fb->fRowBytes / 4;
+ 	/* The console's log band is composited from these saved frame pixels. */
+ 	uint32_t band_y0 = portrait_h;
+ 	uint32_t *band = a733_fbcon_band(&band_y0);
+-	for (uint32_t y = 0; y < portrait_h; y++) {
+-		/* CPU scaling: nearest neighbor, one single Cortex-A76 core. */
+-		for (uint32_t x = 0; x < portrait_w; x++) {
+-			uint32_t color = 0xff000000u;
+-			if (x >= left && x < left + view_w) {
+-				uint32_t vx = x - left;
+-				for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
+-					const SweetSurface *s = layers[l];
+-					if (s == NULL) {
+-						continue;
+-					}
+-					uint32_t sx = (uint64_t)vx * s->width / view_w;
+-					uint32_t sy = (uint64_t)y * s->height / portrait_h;
+-					uint32_t src = 0;
+-					memcpy(&src, pixels[l] + (uint64_t)sy * s->bytesPerRow +
+-					    (uint64_t)sx * 4, sizeof(src));
++	/*
++	 * CPU scaling, nearest neighbour. Written row by row in PHYSICAL order so
++	 * the write-combined framebuffer gets sequential 64-bit stores (portrait
++	 * order jumped 4 KiB between neighbouring pixels), with the source row
++	 * offsets (a function of the portrait y only) computed once per frame.
++	 * Stage0's clockwise portrait transform: physical row r shows portrait
++	 * column x = 599 - r, physical column c shows portrait row y = c.
++	 */
++	static uint64_t sy_off[SWEET_FB_LAYERS][1024];
++	const uint8_t *src_px[SWEET_FB_LAYERS];
++	uint32_t nactive = 0;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		const SweetSurface *s = layers[l];
++		if (s == NULL) {
++			continue;
++		}
++		for (uint32_t y = 0; y < portrait_h; y++) {
++			sy_off[nactive][y] = (uint64_t)((uint64_t)y * s->height / portrait_h) * s->bytesPerRow;
++		}
++		src_px[nactive++] = pixels[l];
++	}
++	for (uint32_t row = 0; row < physical_h; row++) {
++		const uint32_t x = physical_h - 1u - row;
++		volatile uint64_t *drow = (volatile uint64_t *)(dst + (uint64_t)row * stride);
++		const bool inside = x >= left && x < left + view_w;
++		const uint8_t *col[SWEET_FB_LAYERS] = {};
++		if (inside) {
++			uint32_t vx = x - left;
++			for (uint32_t i = 0, l = 0; l < SWEET_FB_LAYERS; l++) {
++				if (layers[l] != NULL) {
++					col[i] = src_px[i] + (uint64_t)vx * layers[l]->width / view_w * 4;
++					i++;
++				}
++			}
++		}
++		for (uint32_t y = 0; y < portrait_h; y += 2) {
++			uint32_t pair[2];
++			for (uint32_t k = 0; k < 2; k++) {
++				uint32_t color = 0xff000000u;
++				for (uint32_t i = 0; inside && i < nactive; i++) {
++					uint32_t src;
++					memcpy(&src, col[i] + sy_off[i][y + k], sizeof(src));
+ 					unsigned a = src >> 24;
+ 					if (a == 255) {
+ 						color = src;
+ 					} else if (a != 0) {
+ 						unsigned rb = (((src & 0xffu) * a +
+ 						    (color & 0xffu) * (255 - a) + 127) / 255);
+ 						unsigned g = ((((src >> 8) & 0xffu) * a +
+ 						    ((color >> 8) & 0xffu) * (255 - a) + 127) / 255);
+ 						unsigned r = ((((src >> 16) & 0xffu) * a +
+ 						    ((color >> 16) & 0xffu) * (255 - a) + 127) / 255);
+ 						color = 0xff000000u | (r << 16) | (g << 8) | rb;
+ 					}
+ 				}
++				pair[k] = color;
++				if (y + k >= band_y0) {
++					band[(y + k - band_y0) * portrait_w + x] = color;
++				}
+ 			}
+-			/* Stage0's proven clockwise portrait transform. */
+-			dst[(physical_h - 1u - x) * stride + y] = color;
+-			if (y >= band_y0) {
+-				band[(y - band_y0) * portrait_w + x] = color;
+-			}
++			drow[y / 2] = (uint64_t)pair[1] << 32 | pair[0];
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	/* From now on console text no longer paints over the iOS frames. */
+ 	a733_fbcon_graphics_frame();
+ 	/* Real IOSurface pixels first; debug text composited on top. */
+ 	static int show_logs = -1;
+ 	if (show_logs < 0) {
+ 		show_logs = 1;
+ 		PE_parse_boot_argn("a733fb_logs", &show_logs, sizeof(show_logs));
+ 	}
+ 	if (show_logs) {
+ 		a733_fbcon_overlay();
+ 	}
+ 	/* Mapped as framebuffer device/write-combine memory by SweetSurface. */
+ 	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
+ 		OSSafeReleaseNULL(layers[i]);
+ 	}
+ }
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+ public:
+ 	AppleCLCD          *fFB;
+ 	task_t              fTask;
+ 	mach_port_t         fPort;
+ 	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
+ 	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
+ 
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
+ 	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	void notify(uint32_t type, const uint64_t *values, uint32_t count);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+ 	PE_Video video;
+ 
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	/* Qualcomm modem bootstrap belongs to topaz, never the A733. */
+ 	if (fPhys != 0xBBF11000ULL) {
+ 		topaz_modem_init();
+ 	}
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+ 	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
+ 	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+ 	/* A733: register the real iOS graphics ABI; bypass all topaz MMIO. */
+ 	if (fPhys == 0xBBF11000ULL) {
+ 		fVig0 = NULL;
+ 		fCtl0 = NULL;
+ 		fIntf1 = NULL;
+ 		fDsi = NULL;
+ 		fFlip[0] = NULL;
+ 		fFlip[1] = NULL;
+ 		fCons = NULL;
+ 		fFadeOrig = NULL;
+ 		fPowerOff = false;
+ 		fConsShown = false;
+ 		fFlushTicks = 1;
+ 		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 		setProperty("external", false);
+ 		setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 		registerService();
+ 		IOLog("A733 FB: AppleCLCD IOSurface HDMI CPU path READY %ux%u -> %ux%u\n",
+ 		    fLogicalW, fLogicalH, fWidth, fHeight);
+ 		return true;
+ 	}
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 		/*
+ 		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
+ 		 * runs digital dimming, a colour filter over every frame, which the
+ 		 * CPU renderer cannot afford (the UI dropped to under 1 fps).
+ 		 */
+ 		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+ 			bl->setProperty("backlight-control", true);
+ 			bl->setProperty("brightness-nits", (unsigned long long)200, 32);
+ 			bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
+ 			if (bl->attach(this)) {
+ 				bl->registerService();
+ 				IOLog("SWEET FB: AppleARMBacklight published\n");
+ 			}
+ 		}
+ 		OSSafeReleaseNULL(bl);
+ 	}
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+ 		IOLog("SWEET INTF1: te_en %#x config %#x hsync %#x vsync_period %#x hctl %#x active_hctl %#x vstart %#x vend %#x fmt %#x cmd_trig %#x\n",
+ 		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
+ 		    r[0x01c / 4], r[0x024 / 4], r[0x090 / 4], r[0x084 / 4]);
+ 	}
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
+ 		fScanPhys = fBootSrc;
+ 		fScanStride = fBootStride;
+ 		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+ 		for (int i = 0; i < 2; i++) {
+ 			fFlip[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 		}
+ 		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+ 		fCons = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
+ 			OSSafeReleaseNULL(fFlip[0]);
+ 			OSSafeReleaseNULL(fFlip[1]);
+ 			OSSafeReleaseNULL(fFadeOrig);
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+ 		if (fCons != NULL) {
+ 			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
+ 			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
+ 			sweet_dcache_clean((vm_offset_t)(uintptr_t)c, (unsigned)fsz);   /* for panics */
+ 			fConsPhys = fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 			sweet_cons_fb = this;
+ 			sweet_console_show_hook = sweet_cons_show;
+ 			sweet_console_retarget((vm_offset_t)c);
+ 			fConsShown = true;
+ 			flipFrom(c, fRowBytes);
+ 			IOLog("SWEET FB: console double buffered (shadow %#llx)\n", fConsPhys);
+ 		} else {
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+ 	}
+-	uint32_t hz = 10;
++	/* A733: the row-order scaler keeps up with 30 Hz on the A76 (Qualcomm path: 10). */
++	uint32_t hz = fPhys == 0xBBF11000ULL ? 30 : 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+ 		0, 0,
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+ 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
+ 		IOMobileFramebufferUserClient *client =
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fIntf1 != NULL && (count % 300) == 0) {
+ 		uint32_t frames = fb->fIntf1[(0x800 + 0x0ac) / 4];
+ 		IOLog("SWEET INTF1: %u frames in 5 s (line %u, te_en %#x)\n",
+ 		    frames - fb->fIntfFrames, fb->fIntf1[(0x800 + 0x0b0) / 4], fb->fIntf1[0x800 / 4]);
+ 		fb->fIntfFrames = frames;
+ 	}
+ 	if (fb->fPowerOff) {
+ 		/*
+ 		 * topaz: fade in cached memory and flip whole frames to the MDP.
+ 		 * Fading the uncached boot framebuffer in place crawled down the panel.
+ 		 */
+ 		if (fb->fDsi != NULL) {
+ 			/* the panel is dark (DCS 0x51 0); keep the last frame */
+ 			IOLockUnlock(fb->fLock);
+ 			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 			return;
+ 		}
+ 		if (fb->fFadeOrig != NULL) {
+ 			uint32_t step = fb->fFadeStep;
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+ 				fb->fFadeStep = step + 1;
+ 			}
+ 			bool front = fb->fFlip[0] != NULL && fb->fScanPhys == fb->fFlipPhys[fb->fFlipIdx];
+ 			const uint8_t *src = front ? (const uint8_t *)fb->fFlip[fb->fFlipIdx]->getBytesNoCopy() :
+ 			    fb->fLastVA ? fb->fLastVA :
+ 			    fb->fConsShown ?
+ 			    (const uint8_t *)fb->fCons->getBytesNoCopy() : (const uint8_t *)fb->fPixels;
+ 			uint32_t srcStride = (!front && fb->fLastVA) ? fb->fLastStride : fb->fRowBytes;
+ 			IOLockUnlock(fb->fLock);
+ 			if (step <= SWEET_FB_FADE_STEPS) {
+ 				fb->fadeStep(src, srcStride, step);
+ 			}
+ 			sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 			return;
+ 		}
+ 		if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+ 			fb->scanFrom(fb->fBootSrc, fb->fBootStride);
+ 		}
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+ 	SweetSurface *taken[4] = {};
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
+ 			memcpy(taken, fb->fPendHold, sizeof(taken));
+ 			bzero(fb->fPendHold, sizeof(fb->fPendHold));
+ 		}
+ 	}
+ 	/* frames replaced at the previous vsync have been latched by now */
+ 	SweetSurface *retire[4];
+ 	memcpy(retire, fb->fRetireHold, sizeof(retire));
+ 	bzero(fb->fRetireHold, sizeof(fb->fRetireHold));
+ 	IOLockUnlock(fb->fLock);
+ 	sweet_hold_set(retire, false);
+ 	if (fb->fConsShown && sweet_console_copy_dirty(fb->backBuffer())) {
+ 		fb->flipBack();
+ 	}
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		IOLockLock(fb->fLock);
+ 		memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+ 		memcpy(fb->fShowHold, taken, sizeof(taken));
+ 		IOLockUnlock(fb->fLock);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+ 	IOLockLock(fLock);
+ 	fClients->setObject(client);
+ 	IOLockUnlock(fLock);
+ }
+ 
+ void
+ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+ {
+ 	IOLockLock(fLock);
+ 	unsigned int i = fClients->getNextIndexOfObject(client, 0);
+ 	if (i != (unsigned int)-1) {
+ 		fClients->removeObject(i);
+ 	}
+ 	IOLockUnlock(fLock);
+ }
+ 
+ static uint32_t
+ get32(const uint8_t *p, uint32_t off)
+ {
+ 	uint32_t v;
+ 	memcpy(&v, p + off, 4);
+ 	return v;
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+  * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	SweetSurface *held[4] = {};
+ 	uint32_t mask = get32(rec, 0x104);
+ 	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
+ 		uint32_t sid = get32(rec, 0x54 + 4 * i);
+ 		if ((mask & (1u << i)) && sid != 0 && (held[i] = sweet_surface_copy(sid)) != NULL) {
+ 			sweet_hold(held[i], true);
+ 		}
+ 	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	SweetSurface *dropped[4];
+ 	memcpy(dropped, fPendHold, sizeof(dropped));      /* replaced before shown */
+ 	memcpy(fPendHold, held, sizeof(held));
+ 	IOLockUnlock(fLock);
+ 	sweet_hold_set(dropped, false);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+ }
+ 
+ void
+ AppleCLCD::scanFrom(uint64_t pa, uint32_t stride)
+ {
+ 	fVig0[0x14 / 4] = (uint32_t)pa;
+ 	fVig0[0x24 / 4] = stride;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fCtl0[0x18 / 4] = 0x20001;      /* flush VIG0 + CTL: latched at the next vsync */
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	fScanPhys = pa;
+ 	fScanStride = stride;
+ }
+ 
+ /*
+  * DCS long write through the DSI command DMA path (topaz-woa: the TPG FIFO
+  * path is a no-op on this DSI 2.4.1). The packet lives in a contiguous
+  * buffer below 4 GiB; header = word count, data type 0x39, flags last|long.
+  */
+ static inline uint32_t dsi_rd(volatile uint8_t *b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+ static inline void dsi_wr(volatile uint8_t *b, uint32_t o, uint32_t v)
+ {
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 0f9c64b..dd0fd5c 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -777,6 +777,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		/* USB touch screen of the HDMI display (bsd/dev/a733_usbtouch.c), own thread. */
+ 		extern void a733_usbtouch_start(void);
+ 		a733_usbtouch_start();
++		/* Power button, PSCI power-off, CPU clock report (bsd/dev/a733_power.c). */
++		extern void a733_power_start(void);
++		a733_power_start();
+ 	}
+ 	{
+ 		uint32_t sdlog = 0;

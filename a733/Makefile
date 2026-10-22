@@ -73,6 +73,7 @@ test: build/test_display
 	python3 -m unittest discover -s tests -p test_smp_a76_patch.py -v
 	python3 -m unittest discover -s tests -p test_bootpart.py -v
 	python3 -m unittest discover -s tests -p test_usbtouch_patch.py -v
+	python3 -m unittest discover -s tests -p test_cores_fb_power_patch.py -v
 
 test-boot: all
 	python3 tests/test_boot_image.py

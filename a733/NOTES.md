@@ -203,3 +203,16 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   sysstatuscheck, prng_seedctl, then launchd_cache_loader ("Using default cache paths") -> AMFI abort.
 - **2026-10-22 15:30, partition 1 v4 written to the real card** (owner confirmed): b708f443...0ba5,
   read-back verified; previous v3 (8491aa0b...) saved locally. Board test #5 pending.
+- **2026-10-22 board test #5 (photos, still booting): iOS daemons run and the first real iOS frame shows.**
+  With `launchd_unsecure_cache=1` launchd starts LaunchDaemons: lockdownd, configd, IOMFB_FDR_Loader,
+  UserEventAgent, **backboardd**, locationd, runningboardd, powerd, tccd, identityservicesd, ... and the
+  owner saw the **Apple logo on HDMI** (first iOS frame through AppleCLCD/IOSurface -> CPU path).
+  Root writes work: `A733 SD: 640 MiB read from / 36 MiB written to the card, 0 retried errors`.
+  Problems: console text painted over the iOS frame (fbcon draws directly into the scanned framebuffer and
+  clears whole rows) and wrapped to the top instead of scrolling.
+- `a733/xnu-a733-console-graphics.patch` (CI 9999n): the fbcon keeps a text copy and scrolls (newest line at
+  the bottom); after the first real iOS frame (`a733_fbcon_graphics_frame` from a733_cpu_present) text is no
+  longer drawn into the frame, only the 8-line log band is composited over its bottom from saved frame pixels
+  (no damage, no accumulated darkening); a panic redraws the full text console; `a733fb_console=1` keeps the
+  old full console over graphics. Host test `tests/test_console_graphics_patch.py` rebuilds the patched
+  console code: scroll order, frame untouched above the band, band = darkened frame + text, panic text.

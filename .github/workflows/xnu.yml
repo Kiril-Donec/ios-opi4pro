@@ -33,6 +33,9 @@ on:
       - "a733/xnu-a733-pid1-v17-usercopy.patch"
       - "a733/xnu-a733-ios-framebuffer.patch"
       - "a733/xnu-a733-sdmmc.patch"
+      - "a733/xnu-a733-console-graphics.patch"
+      - "a733/tests/test_console_graphics_patch.py"
+      - "a733/tests/test_fbcon_logic.c"
       - "a733/tests/test_sdmmc_patch.py"
       - "a733/tests/test_sdmmc_logic.c"
       - "a733/tests/sdmmc_kernel_stubs.h"
@@ -111,6 +114,8 @@ jobs:
           cp a733/xnu-a733-ios-framebuffer.patch dxb/patches/9999l-a733-ios-framebuffer.patch
           # Read-only PIO microSD (SMHC0) root device, rd=sdroot0.
           cp a733/xnu-a733-sdmmc.patch dxb/patches/9999m-a733-sdmmc.patch
+          # Console scrolls; after the first iOS frame only a log band over the frame.
+          cp a733/xnu-a733-console-graphics.patch dxb/patches/9999n-a733-console-graphics.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -264,6 +269,9 @@ jobs:
           if b"A733 LOG: console saved to A733LOG.TXT" not in kernel:
               raise SystemExit("FAIL: microSD console log code missing from the compiled kernel")
           print("PASS: A733 microSD console log code found in compiled XNU Mach-O")
+          if b"a733fb_console" not in kernel:
+              raise SystemExit("FAIL: A733 console/graphics overlay was SKIPPED")
+          print("PASS: A733 console/graphics overlay found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)

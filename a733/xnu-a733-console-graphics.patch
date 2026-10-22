@@ -1,0 +1,1158 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 91ed912..de7cc72 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -36,490 +36,500 @@
+  */
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+ /*
+  * topaz: a surface the MDP may still be fetching counts as in use, so
+  * CoreAnimation does not render into it. IOSurfaceClientIsInUse (iOS 16.7)
+  * reads the u64 at +0x18 of the shared state page; held from SwapEnd until
+  * one vsync after the next frame replaced it on the panel.
+  */
+ static void
+ sweet_hold(SweetSurface *s, bool on)
+ {
+ 	OSAddAtomic64(on ? 1 : -1, (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + 0x18));
+ }
+ 
+ static void
+ sweet_hold_set(SweetSurface **set, bool on)
+ {
+ 	for (uint32_t i = 0; i < 4; i++) {
+ 		if (set[i] != NULL && !on) {
+ 			sweet_hold(set[i], false);
+ 			set[i]->release();
+ 			set[i] = NULL;
+ 		}
+ 	}
+ }
+ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
+ static void sweet_cons_show(void);
+ class OSDictionary;
+ static void sweet_bl_log(const char *who, OSDictionary *d);
+ extern "C" void sweet_dcache_clean(vm_offset_t addr, unsigned length);  /* osfmk/arm/caches.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <kern/thread_call.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+ 	kSweetFBSwapEnd                 = 5,
+ 	kSweetFBSwapWait                = 6,
+ 	kSweetFBGetID                   = 7,
+ 	kSweetFBGetDisplaySize          = 8,
+ 	kSweetFBRequestPowerChange      = 12,
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_FADE_STEPS             30      /* ~0.5 s at 60 Hz */
+ #define SWEET_FB_MAX_NITS               500     /* IOMFBBrightnessLevel at panel DBV 0x7ff */
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+ 	OSDeclareDefaultStructors(AppleCLCD);
+ 
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+ 	OSArray      *fClients;
+ 	uint32_t      fSwapID;
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
+ 	/* topaz direct MDP scanout (VIG0 / CTL0 from TopazGpuW disp.c) */
+ 	volatile uint32_t *fVig0;
+ 	volatile uint32_t *fCtl0;
+ 	volatile uint32_t *fIntf1;      /* INTF_1 (DSI0) timing engine: refresh diagnostics */
+ 	uint32_t      fIntfFrames;
+ 	uint64_t      fScanPhys;      /* what VIG0 currently fetches */
+ 	uint32_t      fScanStride;
+ 	uint32_t      fBootSrc, fBootStride;
+ 	bool          directPresent(const uint8_t *rec);
+ 	void          scanFrom(uint64_t pa, uint32_t stride);
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* topaz fade: cached copy of the last frame and a contiguous output frame */
+ 	IOBufferMemoryDescriptor *fFadeOrig;
+ 	/* kernel-drawn frames (console, fade) are double buffered like iOS's:
+ 	 * built in the back buffer, then the MDP flips to it at vsync */
+ 	IOBufferMemoryDescriptor *fFlip[2];
+ 	uint64_t      fFlipPhys[2];
+ 	uint32_t      fFlipIdx;
+ 	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
+ 	void          flipFrom(const uint8_t *src, uint32_t srcStride);
+ 	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
+ 	void          flipBack(void);
+ 	IOBufferMemoryDescriptor *fCons;    /* console shadow frame (cached, contiguous) */
+ 	uint64_t      fConsPhys;
+ 	const uint8_t *fLastVA;       /* last directly scanned frame (panel window) */
+ 	uint32_t      fLastStride;
+ 	SweetSurface *fLastSurf;      /* keeps fLastVA alive */
+ 	SweetSurface *fPendHold[4], *fShowHold[4], *fRetireHold[4];   /* in-use holds */
+ 	void          fadeStep(const uint8_t *src, uint32_t srcStride, uint32_t step);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
+ 	volatile uint8_t *fDsi;
+ 	IOBufferMemoryDescriptor *fDsiBuf;
+ 	uint64_t      fDsiBufPhys;
+ 	IOLock       *fBlLock;
+ 	uint32_t      fBlLevel;       /* panel DBV 1..0x7ff, kept while the display is off */
+ 	uint32_t      fBlSent;        /* last level sent to the panel */
+ 	thread_call_t fBlCall;        /* sends the latest level off backboardd's thread */
+ 	static void   blWork(thread_call_param_t p0, thread_call_param_t p1);
+ 	bool          dsiDcsLong(const uint8_t *payload, uint32_t len);
+ 	bool          dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len);
+ 	void          setPanelOn(bool on);
+ 	void          setPanelLevel(uint32_t level);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ };
+ 
+ /*
+  * CoreBrightness (-[CBDisplayContaineriOS findBacklight]) matches
+  * {IOPropertyMatch: {backlight-control: true}} and requires the class to
+  * conform to AppleARMBacklight; without it there is no display module and
+  * the brightness slider is dead. It then sets "brightness-nits" here
+  * (SetBLDriverNitsValue) and IOMFBBrightnessLevel on the framebuffer.
+  */
+ class AppleARMBacklight : public IOService {
+ 	OSDeclareDefaultStructors(AppleARMBacklight);
+ public:
+ 	AppleCLCD *fFB;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ /*
+  * A733: actual IOSurface pixels, CPU transformed into the U-Boot HDMI
+  * framebuffer. XNU's AppleCLCD/IOCoreSurfaceRoot user clients are real.
+  * The Qualcomm MDP is NEVER touched when fPhys == 0xBBF11000.
+  *
+  * This is deliberately a slow first-frame path, not GPU acceleration.
+  * Logical display: iPhone X 1125x2436. HDMI: 1024x600 rotated portrait.
+  * In this first bring-up, source layers are sampled over their full image;
+  * crop rectangles and high-performance compositing still need porting.
+  */
+ extern "C" void a733_fbcon_overlay(void);
++extern "C" uint32_t *a733_fbcon_band(uint32_t *y0);
++extern "C" void a733_fbcon_graphics_frame(void);
+ 
+ static void
+ a733_cpu_present(AppleCLCD *fb, const uint8_t *rec)
+ {
+ 	const uint32_t physical_w = 1024, physical_h = 600;
+ 	const uint32_t portrait_w = 600, portrait_h = 1024;
+ 	const uint32_t canvas_w = 1125, canvas_h = 2436;
+ 	const uint32_t view_w = (portrait_h * canvas_w + canvas_h / 2) / canvas_h;
+ 	const uint32_t left = (portrait_w - view_w) / 2;
+ 	SweetSurface *layers[SWEET_FB_LAYERS] = {};
+ 	const uint8_t *pixels[SWEET_FB_LAYERS] = {};
+ 	uint32_t mask = 0;
+ 	memcpy(&mask, rec + 0x104, sizeof(mask));
+ 	bool have_pixels = false;
+ 
+ 	if (fb->fPhys != 0xBBF11000ULL || fb->fWidth != physical_w ||
+ 	    fb->fHeight != physical_h || fb->fRowBytes != physical_w * 4 ||
+ 	    fb->fPixels == 0) {
+ 		return;
+ 	}
+ 	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
+ 		uint32_t id = 0;
+ 		memcpy(&id, rec + 0x54 + i * 4, sizeof(id));
+ 		if (!(mask & (1u << i)) || id == 0) {
+ 			continue;
+ 		}
+ 		SweetSurface *s = sweet_surface_copy(id);
+ 		if (s == NULL) {
+ 			continue;
+ 		}
+ 		/* Never read outside an IOSurface's actual backing allocation. */
+ 		uint64_t end = (uint64_t)s->offset;
+ 		if (s->width == 0 || s->height == 0 || s->bytesPerElement != 4 ||
+ 		    s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->bytesPerRow < (uint64_t)s->width * 4 || s->memory == NULL) {
+ 			s->release();
+ 			continue;
+ 		}
+ 		end += (uint64_t)(s->height - 1) * s->bytesPerRow +
+ 		    (uint64_t)s->width * 4;
+ 		uintptr_t va = s->kernelAddress();
+ 		if (va == 0 || end > s->memory->getLength()) {
+ 			s->release();
+ 			continue;
+ 		}
+ 		layers[i] = s;
+ 		pixels[i] = (const uint8_t *)va + s->offset;
+ 		have_pixels = true;
+ 	}
+ 	if (!have_pixels) {
+ 		return; /* preserve serial diagnostics until an actual iOS frame */
+ 	}
+ 
+ 	volatile uint32_t *dst = (volatile uint32_t *)fb->fPixels;
+ 	const uint32_t stride = fb->fRowBytes / 4;
++	/* The console's log band is composited from these saved frame pixels. */
++	uint32_t band_y0 = portrait_h;
++	uint32_t *band = a733_fbcon_band(&band_y0);
+ 	for (uint32_t y = 0; y < portrait_h; y++) {
+ 		/* CPU scaling: nearest neighbor, one single Cortex-A76 core. */
+ 		for (uint32_t x = 0; x < portrait_w; x++) {
+ 			uint32_t color = 0xff000000u;
+ 			if (x >= left && x < left + view_w) {
+ 				uint32_t vx = x - left;
+ 				for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
+ 					const SweetSurface *s = layers[l];
+ 					if (s == NULL) {
+ 						continue;
+ 					}
+ 					uint32_t sx = (uint64_t)vx * s->width / view_w;
+ 					uint32_t sy = (uint64_t)y * s->height / portrait_h;
+ 					uint32_t src = 0;
+ 					memcpy(&src, pixels[l] + (uint64_t)sy * s->bytesPerRow +
+ 					    (uint64_t)sx * 4, sizeof(src));
+ 					unsigned a = src >> 24;
+ 					if (a == 255) {
+ 						color = src;
+ 					} else if (a != 0) {
+ 						unsigned rb = (((src & 0xffu) * a +
+ 						    (color & 0xffu) * (255 - a) + 127) / 255);
+ 						unsigned g = ((((src >> 8) & 0xffu) * a +
+ 						    ((color >> 8) & 0xffu) * (255 - a) + 127) / 255);
+ 						unsigned r = ((((src >> 16) & 0xffu) * a +
+ 						    ((color >> 16) & 0xffu) * (255 - a) + 127) / 255);
+ 						color = 0xff000000u | (r << 16) | (g << 8) | rb;
+ 					}
+ 				}
+ 			}
+ 			/* Stage0's proven clockwise portrait transform. */
+ 			dst[(physical_h - 1u - x) * stride + y] = color;
++			if (y >= band_y0) {
++				band[(y - band_y0) * portrait_w + x] = color;
++			}
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	/* From now on console text no longer paints over the iOS frames. */
++	a733_fbcon_graphics_frame();
+ 	/* Real IOSurface pixels first; debug text composited on top. */
+ 	static int show_logs = -1;
+ 	if (show_logs < 0) {
+ 		show_logs = 1;
+ 		PE_parse_boot_argn("a733fb_logs", &show_logs, sizeof(show_logs));
+ 	}
+ 	if (show_logs) {
+ 		a733_fbcon_overlay();
+ 	}
+ 	/* Mapped as framebuffer device/write-combine memory by SweetSurface. */
+ 	for (uint32_t i = 0; i < SWEET_FB_LAYERS; i++) {
+ 		OSSafeReleaseNULL(layers[i]);
+ 	}
+ }
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+ public:
+ 	AppleCLCD          *fFB;
+ 	task_t              fTask;
+ 	mach_port_t         fPort;
+ 	io_user_reference_t fFunc[SWEET_FB_NOTIFY_TYPES];
+ 	io_user_reference_t fRefcon[SWEET_FB_NOTIFY_TYPES];
+ 
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
+ 	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	void notify(uint32_t type, const uint64_t *values, uint32_t count);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+ 	PE_Video video;
+ 
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	/* Qualcomm modem bootstrap belongs to topaz, never the A733. */
+ 	if (fPhys != 0xBBF11000ULL) {
+ 		topaz_modem_init();
+ 	}
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
+ 	/* x rounded down to 4 pixels: the panel window must start 16-byte aligned (MDP fetch) */
+ 	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+ 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+ 	/* A733: register the real iOS graphics ABI; bypass all topaz MMIO. */
+ 	if (fPhys == 0xBBF11000ULL) {
+ 		fVig0 = NULL;
+ 		fCtl0 = NULL;
+ 		fIntf1 = NULL;
+ 		fDsi = NULL;
+ 		fFlip[0] = NULL;
+ 		fFlip[1] = NULL;
+ 		fCons = NULL;
+ 		fFadeOrig = NULL;
+ 		fPowerOff = false;
+ 		fConsShown = false;
+ 		fFlushTicks = 1;
+ 		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 		setProperty("external", false);
+ 		setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 		registerService();
+ 		IOLog("A733 FB: AppleCLCD IOSurface HDMI CPU path READY %ux%u -> %ux%u\n",
+ 		    fLogicalW, fLogicalH, fWidth, fHeight);
+ 		return true;
+ 	}
+ 	fVig0 = (volatile uint32_t *)ml_io_map(0x05e05000, 0x1000);
+ 	fCtl0 = (volatile uint32_t *)ml_io_map(0x05e02000, 0x1000);
+ 	fDsi = (volatile uint8_t *)ml_io_map(0x05e94000, 0x1000);
+ 	fDsiBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, page_size, 0x00000000fffff000ull);
+ 	fDsiBufPhys = fDsiBuf ? fDsiBuf->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 	fBlLock = IOLockAlloc();
+ 	fBlLevel = 0x133;                       /* panel init level (stock DT) */
+ 	fBlSent = ~0u;
+ 	fBlCall = thread_call_allocate(&AppleCLCD::blWork, this);
+ 	if (fDsi != NULL) {
+ 		IOLog("SWEET FB: DSI0 ctrl %#x, brightness via DCS 0x51\n", *(volatile uint32_t *)(fDsi + 0x004));
+ 		setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 		/*
+ 		 * Off unless sweetbl=1: with a backlight service CoreBrightness also
+ 		 * runs digital dimming, a colour filter over every frame, which the
+ 		 * CPU renderer cannot afford (the UI dropped to under 1 fps).
+ 		 */
+ 		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+ 			bl->setProperty("backlight-control", true);
+ 			bl->setProperty("brightness-nits", (unsigned long long)200, 32);
+ 			bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
+ 			if (bl->attach(this)) {
+ 				bl->registerService();
+ 				IOLog("SWEET FB: AppleARMBacklight published\n");
+ 			}
+ 		}
+ 		OSSafeReleaseNULL(bl);
+ 	}
+ 	/* dpu sm6115 catalog: intf_1 at mdp+0x6a800, mdp at 0x5e01000 */
+ 	fIntf1 = (volatile uint32_t *)ml_io_map(0x05e6b000, 0x1000);
+ 	if (fIntf1 != NULL) {
+ 		volatile uint32_t *r = fIntf1 + 0x800 / 4;
+ 		r[0x0a8 / 4] = 0x3;     /* FRAME_LINE_COUNT_EN */
+ 		IOLog("SWEET INTF1: te_en %#x config %#x hsync %#x vsync_period %#x hctl %#x active_hctl %#x vstart %#x vend %#x fmt %#x cmd_trig %#x\n",
+ 		    r[0x000 / 4], r[0x004 / 4], r[0x008 / 4], r[0x00c / 4], r[0x03c / 4], r[0x040 / 4],
+ 		    r[0x01c / 4], r[0x024 / 4], r[0x090 / 4], r[0x084 / 4]);
+ 	}
+ 	if (fVig0 != NULL && fCtl0 != NULL) {
+ 		fBootSrc = fVig0[0x14 / 4];
+ 		fBootStride = fVig0[0x24 / 4];
+ 		fScanPhys = fBootSrc;
+ 		fScanStride = fBootStride;
+ 		IOLog("SWEET FB: MDP VIG0 src %#x stride %u (boot), direct scanout ready\n",
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+ 		for (int i = 0; i < 2; i++) {
+ 			fFlip[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+ 		}
+ 		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+ 		fCons = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, fsz, 0x00000000fffff000ull);
+ 		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
+ 			OSSafeReleaseNULL(fFlip[0]);
+ 			OSSafeReleaseNULL(fFlip[1]);
+ 			OSSafeReleaseNULL(fFadeOrig);
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+ 		if (fCons != NULL) {
+ 			uint8_t *c = (uint8_t *)fCons->getBytesNoCopy();
+ 			memcpy(c, (const void *)fPixels, fsz);  /* keep what the console drew */
+ 			sweet_dcache_clean((vm_offset_t)(uintptr_t)c, (unsigned)fsz);   /* for panics */
+ 			fConsPhys = fCons->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+ 			sweet_cons_fb = this;
+ 			sweet_console_show_hook = sweet_cons_show;
+ 			sweet_console_retarget((vm_offset_t)c);
+ 			fConsShown = true;
+ 			flipFrom(c, fRowBytes);
+ 			IOLog("SWEET FB: console double buffered (shadow %#llx)\n", fConsPhys);
+ 		} else {
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index e858cc9..0b58aa4 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -510,529 +510,617 @@ pi3_uart_tr0(void)
+ 	return (unsigned int) BCM2837_GET32(BCM2837_AUX_MU_LSR_REG_V) & 0x20;
+ }
+ 
+ static void
+ pi3_uart_td0(uint8_t c)
+ {
+ 	BCM2837_PUT32(BCM2837_AUX_MU_IO_REG_V, (uint32_t) c);
+ }
+ 
+ static unsigned int
+ pi3_uart_rr0(void)
+ {
+ 	return (unsigned int) BCM2837_GET32(BCM2837_AUX_MU_LSR_REG_V) & 0x01;
+ }
+ 
+ static uint8_t
+ pi3_uart_rd0(void)
+ {
+ 	return (uint8_t) BCM2837_GET32(BCM2837_AUX_MU_IO_REG_V);
+ }
+ 
+ static void
+ pi3_uart_init(void)
+ {
+ 	// Scratch variable
+ 	uint32_t i;
+ 
+ 	// Reset mini uart registers
+ 	BCM2837_PUT32(BCM2837_AUX_ENABLES_V, 1);
+ 	BCM2837_PUT32(BCM2837_AUX_MU_CNTL_REG_V, 0);
+ 	BCM2837_PUT32(BCM2837_AUX_MU_LCR_REG_V, 3);
+ 	BCM2837_PUT32(BCM2837_AUX_MU_MCR_REG_V, 0);
+ 	BCM2837_PUT32(BCM2837_AUX_MU_IER_REG_V, 0);
+ 	BCM2837_PUT32(BCM2837_AUX_MU_IIR_REG_V, 0xC6);
+ 	BCM2837_PUT32(BCM2837_AUX_MU_BAUD_REG_V, 270);
+ 
+ 	i = (uint32_t)BCM2837_FSEL_REG(14);
+ 	// Configure GPIOs 14 & 15 for alternate function 5
+ 	i &= ~(BCM2837_FSEL_MASK(14));
+ 	i |= (BCM2837_FSEL_ALT5 << BCM2837_FSEL_OFFS(14));
+ 	i &= ~(BCM2837_FSEL_MASK(15));
+ 	i |= (BCM2837_FSEL_ALT5 << BCM2837_FSEL_OFFS(15));
+ 
+ 	BCM2837_PUT32(BCM2837_FSEL_REG(14), i);
+ 
+ 	BCM2837_PUT32(BCM2837_GPPUD_V, 0);
+ 
+ 	// Barrier before AP spinning for 150 cycles
+ 	__builtin_arm_isb(ISB_SY);
+ 
+ 	for (i = 0; i < 150; i++) {
+ 		asm volatile ("add x0, x0, xzr");
+ 	}
+ 
+ 	__builtin_arm_isb(ISB_SY);
+ 
+ 	BCM2837_PUT32(BCM2837_GPPUDCLK0_V, (1 << 14) | (1 << 15));
+ 
+ 	__builtin_arm_isb(ISB_SY);
+ 
+ 	for (i = 0; i < 150; i++) {
+ 		asm volatile ("add x0, x0, xzr");
+ 	}
+ 
+ 	__builtin_arm_isb(ISB_SY);
+ 
+ 	BCM2837_PUT32(BCM2837_GPPUDCLK0_V, 0);
+ 
+ 	BCM2837_PUT32(BCM2837_AUX_MU_CNTL_REG_V, 3);
+ }
+ 
+ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) pi3_uart_serial_functions =
+ {
+ 	.init = pi3_uart_init,
+ 	.transmit_ready = pi3_uart_tr0,
+ 	.transmit_data = pi3_uart_td0,
+ 	.receive_ready = pi3_uart_rr0,
+ 	.receive_data = pi3_uart_rd0,
+ 	.device = SERIAL_PI3_UART
+ };
+ 
+ #endif /* PI3_UART */
+ 
+ /*****************************************************************************/
+ 
+ #ifdef VMAPPLE_UART
+ 
+ static vm_offset_t vmapple_uart0_base_vaddr = 0;
+ 
+ #define PL011_LCR_WORD_LENGTH_8  0x60u
+ #define PL011_LCR_FIFO_DISABLE   0x00u
+ 
+ #define PL011_LCR_FIFO_ENABLE    0x10u
+ 
+ #define PL011_LCR_ONE_STOP_BIT   0x00u
+ #define PL011_LCR_PARITY_DISABLE 0x00u
+ #define PL011_LCR_BREAK_DISABLE  0x00u
+ #define PL011_IBRD_DIV_38400     0x27u
+ #define PL011_FBRD_DIV_38400     0x09u
+ #define PL011_ICR_CLR_ALL_IRQS   0x07ffu
+ #define PL011_CR_UART_ENABLE     0x01u
+ #define PL011_CR_TX_ENABLE       0x100u
+ #define PL011_CR_RX_ENABLE       0x200u
+ 
+ #define VMAPPLE_UART0_DR         *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x00))
+ #define VMAPPLE_UART0_ECR        *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x04))
+ #define VMAPPLE_UART0_FR         *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x18))
+ #define VMAPPLE_UART0_IBRD       *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x24))
+ #define VMAPPLE_UART0_FBRD       *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x28))
+ #define VMAPPLE_UART0_LCR_H      *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x2c))
+ #define VMAPPLE_UART0_CR         *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x30))
+ #define VMAPPLE_UART0_TIMSC      *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x38))
+ #define VMAPPLE_UART0_ICR        *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x44))
+ 
+ static unsigned int
+ vmapple_uart_transmit_ready(void)
+ {
+ 	return (unsigned int) !(VMAPPLE_UART0_FR & 0x20);
+ }
+ 
+ static void
+ vmapple_uart_transmit_data(uint8_t c)
+ {
+ 	VMAPPLE_UART0_DR = (uint32_t) c;
+ }
+ 
+ static unsigned int
+ vmapple_uart_receive_ready(void)
+ {
+ 	return (unsigned int) !(VMAPPLE_UART0_FR & 0x10);
+ }
+ 
+ static uint8_t
+ vmapple_uart_receive_data(void)
+ {
+ 	return (uint8_t) (VMAPPLE_UART0_DR & 0xff);
+ }
+ 
+ static void
+ vmapple_uart_init(void)
+ {
+ 	VMAPPLE_UART0_CR = 0x0;
+ 	VMAPPLE_UART0_ECR = 0x0;
+ 	VMAPPLE_UART0_LCR_H = (
+ 		PL011_LCR_WORD_LENGTH_8 |
+ 		PL011_LCR_FIFO_ENABLE |
+ 		PL011_LCR_ONE_STOP_BIT |
+ 		PL011_LCR_PARITY_DISABLE |
+ 		PL011_LCR_BREAK_DISABLE
+ 		);
+ 	VMAPPLE_UART0_IBRD = PL011_IBRD_DIV_38400;
+ 	VMAPPLE_UART0_FBRD = PL011_FBRD_DIV_38400;
+ 	VMAPPLE_UART0_TIMSC = 0x0;
+ 	VMAPPLE_UART0_ICR = PL011_ICR_CLR_ALL_IRQS;
+ 	VMAPPLE_UART0_CR = (
+ 		PL011_CR_UART_ENABLE |
+ 		PL011_CR_TX_ENABLE |
+ 		PL011_CR_RX_ENABLE
+ 		);
+ }
+ 
+ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) vmapple_uart_serial_functions =
+ {
+ 	.init = vmapple_uart_init,
+ 	.transmit_ready = vmapple_uart_transmit_ready,
+ 	.transmit_data = vmapple_uart_transmit_data,
+ 	.receive_ready = vmapple_uart_receive_ready,
+ 	.receive_data = vmapple_uart_receive_data,
+ 	.device = SERIAL_VMAPPLE_UART
+ };
+ 
+ #endif /* VMAPPLE_UART */
+ 
+ /*****************************************************************************/
+ 
+ /**
+  * Output @str onto every registered serial interface by polling.
+  *
+  * @param str The stringto output.
+  */
+ static void uart_sends_force_poll(
+ 	const char *str
+ 	);
+ 
+ static void
+ register_serial_functions(struct pe_serial_functions *fns)
+ {
+ 	fns->next = gPESF;
+ 	gPESF = fns;
+ }
+ 
+ /*****************************************************************************/
+ 
+ /*
+  * sweet: framebuffer "serial" for boards with no usable UART (the Redmi Note
+  * 10 Pro's debug UART engine runs in SPI mode). kprintf output is drawn onto
+  * the boot framebuffer described by the ADT node "sweet-fbcon":
+  *   reg    = <phys size>       absolute physical address, not arm-io relative
+  *   width, height              pixels
+  *   stride                     bytes per line, 32bpp
+- * Lines wrap back to the top instead of scrolling; the line after the cursor
+- * is kept blank so the newest output is easy to find.
++ * On A733 the console scrolls (newest line at the bottom), see below.
+  */
+ 
+ extern unsigned char iso_font[256 * 16];
++void a733_fbcon_overlay(void);
++uint32_t *a733_fbcon_band(uint32_t *y0);
++void a733_fbcon_graphics_frame(void);
+ 
+ #define FBCON_SCALE     1
+ #define FBCON_FG        0xffffffffu
+ #define FBCON_BG        0xff000000u
+ 
+ static volatile uint32_t *fbcon_base;
+ static uint32_t fbcon_width, fbcon_height, fbcon_stride;
+ static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
+ 
+-/* A733: keep recent kernel output as a debug layer over REAL iOS frames. */
++/*
++ * A733: the console scrolls (newest line at the bottom) and keeps a text
++ * copy of the screen. Once AppleCLCD presents the first real iOS frame
++ * (a733_fbcon_graphics_frame), text is no longer drawn into the frame:
++ * the last A733_LOG_ROWS lines are composited in a band over the bottom of
++ * the iOS frame instead, from the band's saved frame pixels, so the frame
++ * is never damaged. A panic switches back to the full text console.
++ * Boot-arg a733fb_console=1 keeps the full console over the graphics.
++ */
++#define FBCON_MAX_ROWS  64      /* 1024 / 16 */
++#define FBCON_MAX_COLS  75      /* 600 / 8 */
++static char fbcon_text[FBCON_MAX_ROWS][FBCON_MAX_COLS];
++static int a733_fbcon_graphics;
++
+ #define A733_LOG_ROWS 8
+ #define A733_LOG_COLS 72
++#define A733_BAND_Y0  (1024u - (A733_LOG_ROWS * 16u + 8u))
+ static char a733_log_lines[A733_LOG_ROWS][A733_LOG_COLS];
+ static uint32_t a733_log_row, a733_log_col;
++/* Frame pixels under the log band (portrait rows A733_BAND_Y0..1023). */
++static uint32_t a733_band_pixels[(1024u - A733_BAND_Y0) * 600u];
++static int a733_band_valid;
++
+ static void
+ a733_log_newline(void)
+ {
+ 	a733_log_col = 0;
+ 	a733_log_row = (a733_log_row + 1) % A733_LOG_ROWS;
+ 	for (uint32_t i = 0; i < A733_LOG_COLS; i++) {
+ 		a733_log_lines[a733_log_row][i] = 0;
+ 	}
+ }
+ 
+ /* A733 HDMI timing stays physical 1024x600; text coordinates are portrait
+  * 600x1024, rotated in software exactly like Stage0's display_pixel().
+  * Both frame dimensions and stride below are still physical ADT values. */
+ static void
+ fbcon_portrait_pixel(uint32_t x, uint32_t y, uint32_t color)
+ {
+     if (x >= fbcon_height || y >= fbcon_width) {
+         return;
+     }
+     fbcon_base[(fbcon_height - 1u - x) * (fbcon_stride / 4) + y] = color;
+ }
+ 
++/* One character cell, background included. */
+ static void
+-fbcon_clear_row(uint32_t row)
++fbcon_draw_cell(uint32_t row, uint32_t col, unsigned char c)
+ {
+-    for (uint32_t y = row * 16 * FBCON_SCALE; y < (row + 1) * 16 * FBCON_SCALE; y++) {
+-        for (uint32_t x = 0; x < fbcon_height; x++) {
+-            fbcon_portrait_pixel(x, y, FBCON_BG);
+-        }
+-    }
++	const unsigned char *glyph = iso_font + c * 16;
++	uint32_t x0 = col * 8 * FBCON_SCALE, y0 = row * 16 * FBCON_SCALE;
++	for (uint32_t gy = 0; gy < 16; gy++) {
++		for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
++			for (uint32_t gx = 0; gx < 8; gx++) {
++				uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
++				for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
++					fbcon_portrait_pixel(x0 + gx * FBCON_SCALE + sx,
++					    y0 + gy * FBCON_SCALE + sy, px);
++				}
++			}
++		}
++	}
++}
++
++static void
++fbcon_redraw(void)
++{
++	for (uint32_t r = 0; r < fbcon_rows; r++) {
++		for (uint32_t c = 0; c < fbcon_cols; c++) {
++			unsigned char ch = (unsigned char)fbcon_text[r][c];
++			fbcon_draw_cell(r, c, ch ? ch : ' ');
++		}
++	}
+ }
+ 
+ static void
+ fbcon_newline(void)
+ {
+ 	a733_log_newline();
+ 	fbcon_col = 0;
+-	fbcon_row = (fbcon_row + 1) % fbcon_rows;
+-	fbcon_clear_row(fbcon_row);
+-	fbcon_clear_row((fbcon_row + 1) % fbcon_rows);
++	if (fbcon_row + 1 < fbcon_rows) {
++		fbcon_row++;
++	} else {
++		/* Scroll: drop the top line, redraw the text (write-only, no FB reads). */
++		for (uint32_t r = 0; r + 1 < fbcon_rows; r++) {
++			for (uint32_t c = 0; c < FBCON_MAX_COLS; c++) {
++				fbcon_text[r][c] = fbcon_text[r + 1][c];
++			}
++		}
++		for (uint32_t c = 0; c < FBCON_MAX_COLS; c++) {
++			fbcon_text[fbcon_rows - 1][c] = 0;
++		}
++		if (!a733_fbcon_graphics) {
++			fbcon_redraw();
++		}
++	}
++	if (a733_fbcon_graphics) {
++		a733_fbcon_overlay();
++	}
+ }
+ 
+ static void
+ fbcon_init(void)
+ {
+-    fbcon_cols = fbcon_height / (8 * FBCON_SCALE);
+-    fbcon_rows = fbcon_width / (16 * FBCON_SCALE);
++	fbcon_cols = fbcon_height / (8 * FBCON_SCALE);
++	fbcon_rows = fbcon_width / (16 * FBCON_SCALE);
++	if (fbcon_cols > FBCON_MAX_COLS) {
++		fbcon_cols = FBCON_MAX_COLS;
++	}
++	if (fbcon_rows > FBCON_MAX_ROWS) {
++		fbcon_rows = FBCON_MAX_ROWS;
++	}
+ 	fbcon_col = fbcon_row = 0;
+-	for (uint32_t r = 0; r < fbcon_rows; r++) {
+-		fbcon_clear_row(r);
++	for (uint32_t r = 0; r < FBCON_MAX_ROWS; r++) {
++		for (uint32_t c = 0; c < FBCON_MAX_COLS; c++) {
++			fbcon_text[r][c] = 0;
++		}
+ 	}
++	fbcon_redraw();
+ }
+ 
+ static unsigned int
+ fbcon_transmit_ready(void)
+ {
+ 	return 1;
+ }
+ 
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++	if (a733_fbcon_graphics && panic_active()) {
++		/* Make the panic readable: back to the full text console. */
++		a733_fbcon_graphics = 0;
++		fbcon_redraw();
++	}
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+ 	}
+ 	if (c == '\n') {
+ 		fbcon_newline();
+ 		return;
+ 	}
+ 	if (fbcon_col >= fbcon_cols) {
+ 		fbcon_newline();
+ 	}
+ 	if (c >= 32 && c < 127) {
+ 		if (a733_log_col >= A733_LOG_COLS) {
+ 			a733_log_newline();
+ 		}
+ 		a733_log_lines[a733_log_row][a733_log_col++] = (char)c;
+ 	}
+-	const unsigned char *glyph = iso_font + c * 16;
+-	uint32_t x0 = fbcon_col * 8 * FBCON_SCALE, y0 = fbcon_row * 16 * FBCON_SCALE;
+-	for (uint32_t gy = 0; gy < 16; gy++) {
+-        for (uint32_t sy = 0; sy < FBCON_SCALE; sy++) {
+-            for (uint32_t gx = 0; gx < 8; gx++) {
+-                uint32_t px = (glyph[gy] & (1u << gx)) ? FBCON_FG : FBCON_BG;
+-                for (uint32_t sx = 0; sx < FBCON_SCALE; sx++) {
+-                    fbcon_portrait_pixel(x0 + gx * FBCON_SCALE + sx,
+-                        y0 + gy * FBCON_SCALE + sy, px);
+-                }
+-            }
+-        }
++	fbcon_text[fbcon_row][fbcon_col] = (char)((c >= 32 && c < 127) ? c : ' ');
++	if (!a733_fbcon_graphics) {
++		fbcon_draw_cell(fbcon_row, fbcon_col, c);
+ 	}
+ 	fbcon_col++;
+ }
+ 
++/*
++ * AppleCLCD (a733_cpu_present): where to store the frame pixels of the log
++ * band while composing a frame. *y0 = first portrait row of the band; the
++ * buffer holds (1024 - *y0) rows of 600 pixels.
++ */
++uint32_t *
++a733_fbcon_band(uint32_t *y0)
++{
++	*y0 = A733_BAND_Y0;
++	return a733_band_pixels;
++}
++
++/* AppleCLCD: a real iOS frame is on screen and its band pixels are saved. */
++void
++a733_fbcon_graphics_frame(void)
++{
++	static int keep_console = -1;
++	if (keep_console < 0) {
++		keep_console = 0;
++		PE_parse_boot_argn("a733fb_console", &keep_console, sizeof(keep_console));
++	}
++	a733_band_valid = 1;
++	if (!keep_console && !panic_active()) {
++		a733_fbcon_graphics = 1;
++	}
++}
++
+ /* Overlay the last eight kernel log lines over an actual Apple IOSurface. */
+ void
+ a733_fbcon_overlay(void)
+ {
+ 	if (fbcon_base == NULL || fbcon_height != 600 || fbcon_width != 1024 ||
+ 	    fbcon_stride != 4096) {
+ 		return;
+ 	}
+-	const uint32_t y0 = 1024 - (A733_LOG_ROWS * 16 + 8);
++	const uint32_t y0 = A733_BAND_Y0;
+ 	const uint32_t stride = fbcon_stride / 4;
+-	/* Darken the existing iOS frame; retain some visible pixels underneath. */
++	/* Darkened copy of the frame under the band; never accumulates. */
+ 	for (uint32_t y = y0; y < 1024; y++) {
+ 		for (uint32_t x = 0; x < 600; x++) {
+ 			uint32_t off = (599u - x) * stride + y;
+-			uint32_t color = fbcon_base[off];
++			uint32_t color = a733_band_valid ? a733_band_pixels[(y - y0) * 600u + x] : fbcon_base[off];
+ 			fbcon_base[off] = 0xff000000u | ((color & 0xfefefeu) >> 1);
+ 		}
+ 	}
+ 	for (uint32_t r = 0; r < A733_LOG_ROWS; r++) {
+ 		uint32_t line = (a733_log_row + 1 + r) % A733_LOG_ROWS;
+ 		for (uint32_t col = 0; col < A733_LOG_COLS; col++) {
+ 			unsigned char c = (unsigned char)a733_log_lines[line][col];
+ 			if (c < 32 || c > 126) {
+ 				continue;
+ 			}
+ 			const unsigned char *glyph = iso_font + c * 16;
+ 			for (uint32_t gy = 0; gy < 16; gy++) {
+ 				for (uint32_t gx = 0; gx < 8; gx++) {
+ 					if (glyph[gy] & (1u << gx)) {
+ 						fbcon_portrait_pixel(12 + col * 8 + gx,
+ 						    y0 + r * 16 + gy, 0xffffffffu);
+ 					}
+ 				}
+ 			}
+ 		}
+ 	}
+ }
+ 
+ static unsigned int
+ fbcon_receive_ready(void)
+ {
+ 	return 0;
+ }
+ 
+ static uint8_t
+ fbcon_receive_data(void)
+ {
+ 	return 0;
+ }
+ 
+ SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_functions =
+ {
+ 	.init = fbcon_init,
+ 	.transmit_ready = fbcon_transmit_ready,
+ 	.transmit_data = fbcon_transmit_data,
+ 	.receive_ready = fbcon_receive_ready,
+ 	.receive_data = fbcon_receive_data,
+ 	.device = SERIAL_SWEET_FBCON
+ };
+ 
+ static void
+ fbcon_probe(void)
+ {
+ 	DTEntry entry;
+ 	uint64_t const *reg;
+ 	uint32_t const *val;
+ 	unsigned int size;
+ 
+ 	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
+ 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+ 		return;
+ 	}
+ 	if (SecureDTGetProperty(entry, "width", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_width = *val;
+ 	}
+ 	if (SecureDTGetProperty(entry, "height", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_height = *val;
+ 	}
+ 	if (SecureDTGetProperty(entry, "stride", (void const **)&val, &size) == kSuccess) {
+ 		fbcon_stride = *val;
+ 	}
+ 	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
+ 		return;
+ 	}
+ 	sweet_early_mark(17, "fbcon config read; mapping");
+ 	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
+ 	sweet_early_mark(18, "fbcon mapping returned");
+ 	if (fbcon_base != NULL) {
+ 		register_serial_functions(&sweet_fbcon_serial_functions);
+ 	}
+ }
+ 
+ #if HIBERNATION
+ /**
+  * Transitions the serial driver into a mode that can be run in the hibernation
+  * resume context. In this mode, the serial driver runs at a barebones level
+  * without making sure the serial devices are properly initialized or utilizing
+  * features such as the software drain timer for dockchannels.
+  *
+  * Upon the next call to serial_init (once the hibernation image has been
+  * loaded), this mode is exited and we return to the normal operation of the
+  * driver.
+  */
+ MARK_AS_HIBERNATE_TEXT void
+ serial_hibernation_init(void)
+ {
+ 	uart_hibernation = true;
+ #if defined(APPLE_UART)
+ 	apple_uart_registers = (apple_uart_registers_t *)gHibernateGlobals.hibUartRegPhysBase;
+ #endif /* defined(APPLE_UART) */
+ #if defined(DOCKCHANNEL_UART)
+ 	dockchannel_uart_base = gHibernateGlobals.dockChannelRegPhysBase;
+ #endif /* defined(DOCKCHANNEL_UART) */
+ }
+ 
+ /**
+  * Transitions the serial driver back to non-hibernation mode so it can resume
+  * normal operations. Should only be called from serial_init on a hibernation
+  * resume.
+  */
+ MARK_AS_HIBERNATE_TEXT static void
+ serial_hibernation_cleanup(void)
+ {
+ 	uart_hibernation = false;
+ #if defined(APPLE_UART)
+ 	apple_uart_registers = (apple_uart_registers_t *)gHibernateGlobals.hibUartRegVirtBase;
+ #endif /* defined(APPLE_UART) */
+ #if defined(DOCKCHANNEL_UART)
+ 	dockchannel_uart_base = gHibernateGlobals.dockChannelRegVirtBase;
+ #endif /* defined(DOCKCHANNEL_UART) */
+ }
+ #endif /* HIBERNATION */
+ 
+ int
+ serial_init(void)
+ {
+ 	DTEntry         entryP = NULL;
+ 	uint32_t        prop_size;
+ 	vm_offset_t     soc_base;
+ 	uintptr_t const *reg_prop;
+ 	uint32_t const  *prop_value __unused = NULL;
+ 
+ 	struct pe_serial_functions *fns = gPESF;
+ 
+ 	/**
+ 	 * Even if the serial devices have already been initialized on cold boot,
+ 	 * when coming out of a sleep/wake, they'll need to be re-initialized. Since
+ 	 * the uart_initted value is kept across a sleep/wake, always re-initialize
+ 	 * to be safe.
+ 	 */
+ 	if (uart_initted) {
+ #if HIBERNATION
+ 		if (uart_hibernation) {
+ 			serial_hibernation_cleanup();
+ 		}
+ #endif /* HIBERNATION */
+ 		while (fns != NULL) {
+ 			fns->init();
+ 			fns = fns->next;
+ 		}
+ 
+ 		return 1;
+ 	}
+ 
+ 	soc_base = pe_arm_get_soc_base_phys();
+ 
+ 	if (soc_base == 0) {
+ 		return 0;
+ 	}
+ 
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+ 
+ 	fbcon_probe();
+ 
+ #ifdef PI3_UART
+ 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
+ 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);
+ 		pi3_gpio_base_vaddr = ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
+ 	}
+ 	if (SecureDTFindEntry("name", "aux", &entryP) == kSuccess) {
+ 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);
+ 		pi3_aux_base_vaddr = ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
+ 	}
+ 	if ((pi3_gpio_base_vaddr != 0) && (pi3_aux_base_vaddr != 0)) {
+ 		register_serial_functions(&pi3_uart_serial_functions);
+ 	}
+ #endif /* PI3_UART */
+ 
+ #ifdef VMAPPLE_UART
+ 	if (SecureDTFindEntry("name", "uart0", &entryP) == kSuccess) {
+ 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);
+ 		vmapple_uart0_base_vaddr = ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
+ 	}
+ 
+ 	if (vmapple_uart0_base_vaddr != 0) {
+ 		register_serial_functions(&vmapple_uart_serial_functions);
+ 	}
+ #endif /* VMAPPLE_UART */
+ 
+ #ifdef DOCKCHANNEL_UART
+ 	uint32_t no_dockchannel_uart = 0;
+ 	if (SecureDTFindEntry("name", "dockchannel-uart", &entryP) == kSuccess) {
+ 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);
+ 		// Should be two reg entries
+ 		if (prop_size / sizeof(uintptr_t) != 4) {
+ 			panic("Malformed dockchannel-uart property");
+ 		}
+ 		dockchannel_uart_base = ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
+ 		dock_agent_base = ml_io_map(soc_base + *(reg_prop + 2), *(reg_prop + 3));
+ 		PE_parse_boot_argn("no-dockfifo-uart", &no_dockchannel_uart, sizeof(no_dockchannel_uart));
+ 		// Keep the old name for boot-arg
+ 		if (no_dockchannel_uart == 0) {
+ 			register_serial_functions(&dockchannel_serial_functions);
+ 			SecureDTGetProperty(entryP, "max-aop-clk", (void const **)&prop_value, &prop_size);
+ 			max_dockchannel_drain_period = (uint32_t)((prop_value)?  (*prop_value * 0.03) : DOCKCHANNEL_DRAIN_PERIOD);

@@ -166,3 +166,7 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   Linux), so HFS runs hfs_late_journal_init, which for MNT_ROOTFS skips the read-only journal_is_clean
   path and recreates the journal. Fix without a kernel rebuild: `a733_sdcard_layout.py hfs-journal off`
   clears kHFSVolumeJournaledBit (attributes 0x80002100 -> 0x80000100) in both volume headers.
+- The card's own A733LOG.TXT from test #2 (41748 bytes, 37 mount attempts) was read on the PC:
+  **SD writes (CMD24/25, log file only) work on the real board.**
+- **2026-10-22 11:53, `hfs-journal off` on the real card** (owner confirmed): sectors 196610 and 33751038,
+  attributes 0x80002100 -> 0x80000100, read-back verified, old headers saved locally. Board test #3 pending.

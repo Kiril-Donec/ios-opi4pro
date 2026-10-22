@@ -137,3 +137,8 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   39738424472 (commit a59ab73) artifact `a733-SDROOT-EXPERIMENTAL-readonly-PIO`, sha256 eccb3d03...bd03;
   stage0 = v22's hardware-proven `stage0.uimg` (sha256 40605aeb...3ef3; stage0 sources unchanged since
   7f0ad30). `uefi_stage0.uimg` and the DTB are byte-identical to the card. **Not yet written to the card.**
+- **2026-10-22 11:05, partition 1 switched to XNU sdroot on the real card** (`a733_bootpart.py write`,
+  Disk 1, owner confirmed): wrote `part1-sdroot.img` (sha256 26a5b6c6...1726), read-back verified, exit 0.
+  The replaced UEFI v59.2 partition is saved as `card1-part1-before-bootpart-20261022-110505.bin`
+  (sha256 a5c418d3...b001, local). The card now holds: partition 1 = v22 stage0 + sdroot payload
+  (CI 39738424472), partition 2 = iOS 16 root, partition 3 = A733LOG.TXT. **Board not yet booted.**

@@ -251,3 +251,8 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   "hello" animation, the status bar battery icon and the home indicator, rendered by backboardd through
   AppleCLCD/IOSurface -> CPU path; the console now only draws the 8-line log band at the bottom without
   damaging the frame. Second-A76 / High Speed confirmation pending the card log.
+- Test #6 card log (208 KB): **second Cortex-A76 works** (`cpu=1 CPU_ON target=0x700 ... rc=0`,
+  `cpu=1 mpidr=0x700 came alive; SGI1 OK`, `2/2 CPUs initialized`); **SD High Speed works**
+  (`4-bit bus, High Speed 50000000 Hz`, 1409 MiB read / 30 MiB written, 0 retried errors).
+  SpringBoard exec'd once and stayed up; `SWEET FB: 19000 swaps`; only driverkitd and PosterBoard
+  crashed once; no panic.

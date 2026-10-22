@@ -306,3 +306,10 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   A55 nodes only said arm,cortex-a55. Fix in the ADT only (no kernel rebuild): A55 compatible =
   "arm,cortex-a55" "arm,cortex-a76" "ARM,v8". **22:43, partition 1 v8b (cpus=8) written** (owner
   confirmed): 45923d34...8151, read-back verified; cpus=4 twin 246ea5b8...a56f. Board test #10 pending.
+- **Board test #10 (v8b, photo):** A55 matching fixed; then `SWEET CPU: cpu=2 NOT alive: PSCI CPU_ON
+  rc=-4` (ALREADY_ON) for MPIDR 0x000: Stage0 had parked the boot A55 in WFE after starting the A76.
+  Fix: Stage0 calls PSCI CPU_OFF there (WFE only if it fails; CI 39845482621 stage0 a83430df..., body
+  dc9052e5..., one extra smc with 0x8400xxxx in the disassembly; the old CI stage0 body equals the card's
+  v22 one, 68d2e755...), and mkadt lists 0x000 last so cpus=7 works with any Stage0.
+  **23:05, partition 1 v8c (new Stage0, cpus=8) written** (owner confirmed): 7c16bb15...0117,
+  read-back verified. Fallback v8c-olds0 cpus=7 (old Stage0): 5658cea6...fd81. Board test #11 pending.

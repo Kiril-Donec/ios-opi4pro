@@ -348,3 +348,14 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   + /a733-power sid/ths/ccu, old Stage0 (body 68d2e755...), cpus=7, `a733cpufreq=3`: 9a4ee85b...e270,
   read-back verified. Fallbacks: `a733cpufreq=1` (<=800 mV, no voltage raise) 6ad12951...5a42,
   `a733cpufreq=0` 6e51ed59...f5bd. First boot will also write the Setup-skip preferences. Test #14 pending.
+- **🎉 Board test #14 (v9) card log (local copy): cpufreq, Setup skip and clean shutdown work.** efuse
+  0x593 -> **vf0500**: DCDC3 800 -> 1000 mV, DCDC5 800 -> 950 mV, **A76 936 -> 1992 MHz, A55 936 -> 1800,
+  DSU 720 -> 1248** (`A733 CPUFREQ: done`, PLL read-back matches). THS calibrated 5/5, max 62 C, no
+  throttling (no fan). First boot wrote the 6 preference files + marker (data ark skipped: the
+  mobileactivationd container is not at the upstream UUID); Setup never ran, SpringBoard home screen,
+  Settings/Photos/Safari/Phone/Messages opened (224 touches). Triple press -> `syncing disks... Killing all
+  processes` -> `CPU halted` -> `power off via PSCI`. Open problems: backboardd finds no AGXAccelerator (no
+  GPU / Metal) -> Metal-drawn content (PosterBoard wallpaper, Photos) stays empty; securityd AKS sel 10
+  (wrap_key) unsupported x69 -> keychain writes fail; Preferences crashed 3x (one is the same `pc 0x0`,
+  lr = slide + 0x194b3858c call through NULL seen in SpringBoard in tests #7/#8); Phone/Messages killed
+  0x8badf00d on exit (no CommCenter / modem); mediaserverd abort (no audio).

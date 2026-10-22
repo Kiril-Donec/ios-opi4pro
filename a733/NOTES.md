@@ -300,3 +300,9 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   (owner confirmed): kernel CI 39835724694 (commit 1e5c0de), ADT v7 + `--a55 --power`, cpus=8, image
   15b33e51...69dc, read-back verified; previous v7 (7d3035ef...) saved locally. Fallbacks: v8 cpus=4
   514c8a49...849d, cpus=2 a6567335...8ad8. iOS partition = clean image, journal on. Board test #9 pending.
+- **Board test #9 (v8, cpus=8, photo):** `SWEET CPU: requested=8 selected=8`, then `cpu=2..7 NOT
+  registered (IOKit matching timeout)` -> panic `CPU registration timeout` (before root mount, so the
+  iOS volume was not touched). Cause: SweetCPU's personality is IONameMatch 'arm,cortex-a76' and the
+  A55 nodes only said arm,cortex-a55. Fix in the ADT only (no kernel rebuild): A55 compatible =
+  "arm,cortex-a55" "arm,cortex-a76" "ARM,v8". **22:43, partition 1 v8b (cpus=8) written** (owner
+  confirmed): 45923d34...8151, read-back verified; cpus=4 twin 246ea5b8...a56f. Board test #10 pending.

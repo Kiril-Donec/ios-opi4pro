@@ -155,3 +155,14 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   `card1-part1-sdroot-v2-noirq-20261022.img` sha256 93309c82...58f1 (same boot.cmd, stage0 and UEFI files).
 - **2026-10-22 11:17, v2 partition 1 written to the real card** (`a733_bootpart.py write`, owner
   confirmed): 93309c82...58f1, read-back verified; previous (v1, 26a5b6c6...) saved locally. Board test #2 pending.
+- **2026-10-22 board test #2 (photos): the microSD driver works on the real board.** SMHC0 version
+  0x2050530, module clock 100 MHz (CCU SMHC0_CLK 0x81000003), identification div 125, transfer div 2;
+  OCR 0xc0ff8000 SDHC/SDXC, CID manufacturer 0x02 "SE064" rev 9.0, 59024 MiB, 4-bit bus;
+  `A733 LOG: console saved to A733LOG.TXT on partition 3`; partition 2 found, `HFSX volume v5,
+  4194304 x 4096 bytes, cleanly unmounted, journaled`; `sdroot0 ready`; `BSD root: sdroot0`.
+  Then vfs_mountroot failed in a loop: `hfs: Initializing the journal (joffset 0x82000 sz 0x800000)`,
+  journal header write -> `A733 SD: I/O error 30` (EROFS, read-only driver) -> hfs_mountfs 22 ->
+  `cannot mount root, errno = 19`. Cause: the image's lastMountedVersion is 'H+Lx' (last mounted by
+  Linux), so HFS runs hfs_late_journal_init, which for MNT_ROOTFS skips the read-only journal_is_clean
+  path and recreates the journal. Fix without a kernel rebuild: `a733_sdcard_layout.py hfs-journal off`
+  clears kHFSVolumeJournaledBit (attributes 0x80002100 -> 0x80000100) in both volume headers.

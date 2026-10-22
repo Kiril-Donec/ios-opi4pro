@@ -254,6 +254,100 @@ class CardImage(unittest.TestCase):
         self.assertEqual(self.read(0, 1), self.before[:S])
 
 
+@unittest.skipIf(os.name == "nt", "image tests run on Linux")
+class HfsJournalFlag(unittest.TestCase):
+    """hfs-journal: XNU recreated the journal of the root volume (board test #2)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def fake_volume(self, attrs: int = 0x80002100) -> tuple[Path, lay.Part]:
+        img = self.dir / "vol.img"
+        part = lay.Part(2, 0, 0xAF, 0, 65536)                       # 32 MiB "partition" at sector 0
+        vh = bytearray(S)
+        vh[0:2] = b"HX"
+        struct.pack_into(">HIIII", vh, 2, 5, attrs, 0x482B4C78, 129, 0x11223344)   # version..createDate
+        struct.pack_into(">II", vh, 40, 4096, 8192)                  # 8192 x 4 KiB = 32 MiB
+        with img.open("wb") as f:
+            f.truncate(part.count * S)
+            f.seek(2 * S)
+            f.write(vh)
+            f.seek((part.count - 2) * S)
+            alt = bytearray(vh)
+            alt[8:12] = b"fsck"                                     # lastMountedVersion may differ
+            f.write(alt)
+        return img, part
+
+    def test_clear_and_restore_only_attribute_bytes(self) -> None:
+        img, part = self.fake_volume()
+        before = img.read_bytes()
+        dev = lay.Device(str(img), writable=True)
+        try:
+            self.assertEqual(lay.hfs_set_journaled(dev, CARD_INFO, False, self.dir / "b", lambda: True,
+                                                   part=part, log=lambda *_: None), "changed")
+            after = img.read_bytes()
+            diff = [i for i in range(len(before)) if before[i] != after[i]]
+            self.assertTrue(diff and all(i % S in (4, 5, 6, 7) for i in diff), diff[:8])
+            for sector in (2, part.count - 2):
+                self.assertEqual(struct.unpack_from(">I", after, sector * S + 4)[0], 0x80000100)
+            self.assertEqual(lay.hfs_set_journaled(dev, CARD_INFO, False, self.dir / "b", lambda: True,
+                                                   part=part, log=lambda *_: None), "unchanged")
+            lay.hfs_set_journaled(dev, CARD_INFO, True, self.dir / "b", lambda: True, part=part,
+                                  log=lambda *_: None)
+        finally:
+            dev.close()
+        self.assertEqual(img.read_bytes(), before)
+        self.assertEqual(len(list((self.dir / "b").glob("*.bin"))), 2)
+
+    def test_refusals(self) -> None:
+        img, part = self.fake_volume()
+        before = img.read_bytes()
+        dev = lay.Device(str(img), writable=True)
+        try:
+            with self.assertRaisesRegex(lay.LayoutError, "aborted"):
+                lay.hfs_set_journaled(dev, CARD_INFO, False, self.dir, lambda: False, part=part,
+                                      log=lambda *_: None)
+            self.assertEqual(img.read_bytes(), before)
+        finally:
+            dev.close()
+        img, part = self.fake_volume(attrs=0x80002000)              # not cleanly unmounted
+        dev = lay.Device(str(img), writable=True)
+        try:
+            with self.assertRaisesRegex(lay.LayoutError, "cleanly unmounted"):
+                lay.hfs_set_journaled(dev, CARD_INFO, False, self.dir, lambda: True, part=part,
+                                      log=lambda *_: None)
+            dev.write(part.count - 2, bytes(S))                      # alternate header gone
+            with self.assertRaisesRegex(lay.LayoutError, "alternate"):
+                lay.hfs_set_journaled(dev, CARD_INFO, False, self.dir, lambda: True, part=part)
+            dev.write(2, bytes(S))
+            with self.assertRaisesRegex(lay.LayoutError, "no HFS"):
+                lay.hfs_set_journaled(dev, CARD_INFO, False, self.dir, lambda: True, part=part)
+        finally:
+            dev.close()
+
+    @unittest.skipUnless(shutil.which("mkfs.hfsplus") and shutil.which("fsck.hfsplus"), "hfsprogs not installed")
+    def test_real_journaled_hfsplus_volume(self) -> None:
+        img = self.dir / "real.img"
+        with img.open("wb") as f:
+            f.truncate(64 << 20)
+        subprocess.run(["mkfs.hfsplus", "-J", "-s", "-v", "A733TEST", str(img)], check=True, capture_output=True)
+        part = lay.Part(2, 0, 0xAF, 0, (64 << 20) // S)
+        dev = lay.Device(str(img), writable=True)
+        try:
+            _, primary, _, _ = lay.hfs_headers(dev, part)
+            self.assertTrue(struct.unpack_from(">I", primary, 4)[0] & lay.HFS_JOURNALED)
+            self.assertEqual(lay.hfs_set_journaled(dev, CARD_INFO, False, self.dir, lambda: True,
+                                                   part=part, log=lambda *_: None), "changed")
+        finally:
+            dev.close()
+        fsck = subprocess.run(["fsck.hfsplus", "-f", "-n", str(img)], capture_output=True, text=True)
+        self.assertEqual(fsck.returncode, 0, fsck.stdout + fsck.stderr)
+        self.assertIn("appears to be OK", fsck.stdout + fsck.stderr)
+        self.assertNotRegex(fsck.stdout + fsck.stderr, r"Checking Journaled HFS")
+
+
 class CommandLine(unittest.TestCase):
     def test_disk_zero_refused_before_anything(self) -> None:
         out = subprocess.run([sys.executable, str(A733 / "tools" / "a733_sdcard_layout.py"), "--disk", "0", "apply"],

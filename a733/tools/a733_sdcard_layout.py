@@ -17,6 +17,7 @@ A733LOG.TXT, so Windows never has to format it.
   python a733_sdcard_layout.py apply --backup-dir DIR
   python a733_sdcard_layout.py write-ios IMAGE      raw HFS+ volume -> partition 2
   python a733_sdcard_layout.py restore-mbr BACKUP   put the old sector 0 back
+  python a733_sdcard_layout.py hfs-journal off|on   journaled flag of the iOS volume
 
 Run from an administrator terminal (raw disk access). Only a disk that is
 not number 0, not a system/boot disk, on USB/SD, exactly the expected size,
@@ -413,6 +414,71 @@ def write_ios(dev: Device, info: dict, image: Path, confirm, recheck=None, log=p
     return src.hexdigest()
 
 
+HFS_JOURNALED = 1 << 13       # kHFSVolumeJournaledBit in the volume header attributes
+
+
+def hfs_headers(dev: Device, part: Part = IOS) -> tuple[int, bytes, int, bytes]:
+    """Sector numbers and contents of the primary and alternate HFS+ volume headers."""
+    primary_sector = part.start + 2                    # volume byte 1024
+    primary = dev.read(primary_sector, 1)
+    if primary[:2] not in (b"H+", b"HX"):
+        raise LayoutError("partition 2 has no HFS+/HFSX volume header at byte 1024")
+    block_size, total_blocks = struct.unpack_from(">II", primary, 40)
+    volume_bytes = block_size * total_blocks
+    if block_size < SECTOR or block_size & (block_size - 1) or volume_bytes > part.count * SECTOR:
+        raise LayoutError(f"implausible HFS geometry: {total_blocks} x {block_size} bytes")
+    alternate_sector = part.start + volume_bytes // SECTOR - 2   # volume byte size - 1024
+    alternate = dev.read(alternate_sector, 1)
+    # signature, version, createDate (offset 16), blockSize, totalBlocks must agree
+    if alternate[:4] != primary[:4] or alternate[16:20] != primary[16:20] or alternate[40:48] != primary[40:48]:
+        raise LayoutError("the alternate volume header does not match the primary one")
+    return primary_sector, primary, alternate_sector, alternate
+
+
+def hfs_set_journaled(dev: Device, info: dict, journaled: bool, backup_dir: Path, confirm,
+                      part: Part = IOS, recheck=None, log=print) -> str:
+    """
+    Set or clear kHFSVolumeJournaledBit in both volume headers of the iOS root.
+    XNU's HFS recreates the journal of a root volume last mounted by another OS
+    (hfs_late_journal_init skips its read-only check for MNT_ROOTFS), which
+    fails on the read-only SD driver; a volume without the bit mounts read-only
+    without touching the journal. Only bytes 4-7 of the two header sectors change.
+    """
+    if part is IOS and check_mbr(parse_mbr(dev.read(0, 1)), info["Size"] // SECTOR) != "done":
+        raise LayoutError("partition 2 does not exist yet: run apply first")
+    ps, primary, as_, alternate = hfs_headers(dev, part)
+    attrs = struct.unpack_from(">I", primary, 4)[0]
+    new_attrs = attrs | HFS_JOURNALED if journaled else attrs & ~HFS_JOURNALED
+    log(f"HFS volume header attributes 0x{attrs:08x} -> 0x{new_attrs:08x} "
+        f"(journaled {'on' if attrs & HFS_JOURNALED else 'off'} -> {'on' if journaled else 'off'}); "
+        f"sectors {ps} and {as_}")
+    if new_attrs == attrs and struct.unpack_from(">I", alternate, 4)[0] == attrs:
+        log("Nothing to change.")
+        return "unchanged"
+    if not attrs & (1 << 8):
+        raise LayoutError("the volume is not marked cleanly unmounted; refusing to change the journal flag")
+    if not confirm():
+        raise LayoutError("aborted: confirmation not given")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = backup_dir / f"card{info['Number']}-hfs-headers-before-{stamp}"
+    base.with_suffix(".bin").write_bytes(primary + alternate)
+    base.with_suffix(".json").write_text(json.dumps(
+        {"disk": info, "primary_sector": ps, "alternate_sector": as_, "attributes": f"0x{attrs:08x}"}, indent=2))
+    log(f"Saved both headers to {base.with_suffix('.bin')}")
+    if recheck:
+        recheck()
+    for sector, old in ((ps, primary), (as_, alternate)):
+        if dev.read(sector, 1) != old:
+            raise LayoutError(f"sector {sector} changed during the operation; stopping")
+        new = bytearray(old)
+        struct.pack_into(">I", new, 4, new_attrs)
+        assert new[:4] == old[:4] and new[8:] == old[8:]
+        write_verified(dev, sector, bytes(new), f"HFS header sector {sector}")
+    log("Both volume headers written and verified.")
+    return "changed"
+
+
 def restore_mbr(dev: Device, info: dict, backup: Path, confirm, force: bool = False, log=print) -> None:
     meta_path = backup.with_suffix(".json")
     if meta_path.exists():
@@ -450,6 +516,9 @@ def main() -> int:
     r = sub.add_parser("restore-mbr", help="restore sector 0 from an apply backup")
     r.add_argument("backup", type=Path)
     r.add_argument("--force", action="store_true")
+    j = sub.add_parser("hfs-journal", help="turn the journaled flag of the iOS root volume off/on")
+    j.add_argument("state", choices=("off", "on"))
+    j.add_argument("--backup-dir", type=Path, default=Path.home() / "a733-card-backups")
     args = ap.parse_args()
     cmd = args.cmd or "plan"
 
@@ -502,6 +571,10 @@ def main() -> int:
                 write_ios(dev, info, args.image,
                           lambda: confirm_typed(info, "This overwrites partition 2 (iOS root) completely."),
                           recheck)
+            elif cmd == "hfs-journal":
+                hfs_set_journaled(dev, info, args.state == "on", args.backup_dir,
+                                  lambda: confirm_typed(info, "This changes 4 bytes in both HFS volume headers "
+                                                        "of partition 2."), recheck=recheck)
             else:
                 restore_mbr(dev, info, args.backup,
                             lambda: confirm_typed(info, "This rewrites sector 0 from the backup."), args.force)

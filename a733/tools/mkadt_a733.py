@@ -52,7 +52,10 @@ R_TWI0_BASE = 0x07083000
 R_CCU_BASE = 0x07010000
 CPUPLL_BASE = 0x08870000
 # The six Cortex-A55 cores (vendor DT cpu@0..cpu@500), one core per Aff1.
-A55_MPIDRS = (0x000, 0x100, 0x200, 0x300, 0x400, 0x500)
+# 0x000 is the core the board boots on; Stage0 starts the A76 from it and
+# then powers it off with PSCI CPU_OFF (older Stage0 builds park it in WFE,
+# and CPU_ON answers ALREADY_ON). It is listed last, so cpus=7 never needs it.
+A55_MPIDRS = (0x100, 0x200, 0x300, 0x400, 0x500, 0x000)
 
 USB1_BASE = 0x04200000
 USB1_SIZE = 0x1000

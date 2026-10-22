@@ -92,8 +92,9 @@ def main() -> None:
     # Six A55s after the A76 pair (cpus=N takes the A76s first), one XNU cluster.
     all8, _ = parse(hw.build(sdmmc=True, a76_pair=True, a55=True).serialize())
     cpus = next(n for n in all8.children if n.name == "cpus").children
-    assert [int.from_bytes(c.prop("reg"), "little") for c in cpus] == [0x600, 0x700, 0, 0x100, 0x200, 0x300,
-                                                                       0x400, 0x500]
+    # the boot A55 (0x000) last: with an older Stage0 it is parked, so cpus=7 avoids it
+    assert [int.from_bytes(c.prop("reg"), "little") for c in cpus] == [0x600, 0x700, 0x100, 0x200, 0x300,
+                                                                       0x400, 0x500, 0]
     assert [int.from_bytes(c.prop("cpu-id"), "little") for c in cpus] == list(range(8))
     assert [c.name for c in cpus] == [f"cpu{i}" for i in range(8)]
     assert all(c.prop("state").rstrip(b"\0") == b"waiting" for c in cpus[1:])

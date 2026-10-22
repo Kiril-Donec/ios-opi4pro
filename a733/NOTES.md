@@ -245,3 +245,9 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   `-1cpu-` 12603bde...c408 (cpus=1).
 - **2026-10-22 16:24, partition 1 v6 (v5 + iPhone X /product, cpus=2) written to the real card** (owner
   confirmed): 576dbdfb...3150, read-back verified; previous v5 (d0140d68...) saved locally. Board test #6 pending.
+- **🎉 MILESTONE 2026-10-22 (board test #6, photo): iOS 16.7.16 Setup "hello" screen on the Orange Pi 4 Pro.**
+  Partition 1 v6 (kernel CI 39783367967 + ADT with the real iPhone X /product, cpus=2, SD High Speed,
+  console overlay). SpringBoard no longer aborts on BoundingPathBitmap; the HDMI panel shows the Setup
+  "hello" animation, the status bar battery icon and the home indicator, rendered by backboardd through
+  AppleCLCD/IOSurface -> CPU path; the console now only draws the 8-line log band at the bottom without
+  damaging the frame. Second-A76 / High Speed confirmation pending the card log.

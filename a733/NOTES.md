@@ -375,3 +375,11 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   attempt 2 (attempt 1 lost its macOS runner), commit 66f60d9; CI ADT reproduces its 2cpu payload
   07d87fb5... byte for byte; image 5d13c225...9c23, read-back verified; previous v9 (9a4ee85b...) saved.
   Test #15 pending (look for `securityd sel 10 ... -> 0x0` and sel 11).
+- **Board test #15 (v10) card log:** keychain works: `securityd sel 10 in 2/32 out 1/40 -> 0x0` x29 and
+  `sel 11 in 2/40 out 0/32 -> 0x0` x10, no AKS errors left except profiled sel 31. launchd did a clean
+  shutdown itself this time (`Will be calling reboot(2)`, unmount, `CPU halted`, PSCI off). Settings >
+  General > About hangs: the main thread (killed later with 0x8badf00d) waits in
+  `SystemConfiguration _SCNetworkInterfaceCopyAllWithPreferences -> dispatch_once(__wait_for_IOKit_to_quiesce)`,
+  which waits for configd's InterfaceNamer to post `*InterfaceNamer` once IOKit is quiet ("Waiting for
+  IOKit to quiesce (or timeout)"). So some IOService on our kernel never stops being busy (registerService /
+  matching / start never finishing): next step is a kernel report of busy services.

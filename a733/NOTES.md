@@ -393,3 +393,12 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   bsp/drivers/stmmac/dwmac-sunxi.c), SPI 172 macirq; PHY on MDIO address 1, id 7b74.4412 (JLSemi), reset
   GPIO disabled on this board; rails dc1sw1 (PHY 3.3 V) / dc1sw2 (MAC IO 3.3 V); CCU CLK_GMAC0 / MBUS /
   PHY 25 MHz / PTP, resets GMAC0_AXI / GMAC0.
+- **Patch 9999u (`xnu-a733-sched-bigpref.patch`):** `choose_processor()` on SWEET: threads at
+  sched_pri >= BASEPRI_USER_INITIATED (37) take an idle A76 (MPIDR >= 0x600, logical 0/1) first, also
+  over an idle cache-warm hint on an A55; sched_pri <= BASEPRI_UTILITY (20) prefer an idle A55;
+  realtime and the busy-core search unchanged; only with both core kinds online; `a733bigpref=0` off.
+  (The idle pick was already lsb_first, i.e. A76 first; this adds the hint override and keeps
+  background work off the A76s.)
+- **2026-10-23, partition 1 v12 (v11 + 9999u) written** (owner confirmed): kernel CI 39976367590 (commit
+  0966c27), CI ADT reproduces its 2cpu payload 830a7148... byte for byte, image 23bc9565...a0e2,
+  read-back verified; v11 (6e376ee3...) was never booted. Test #16 pending (IOKit busy report + feel).

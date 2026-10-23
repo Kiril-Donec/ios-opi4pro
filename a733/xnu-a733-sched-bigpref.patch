@@ -1,0 +1,91 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..7d244a6 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5021,6 +5021,56 @@ choose_next_pset(
+  *	The thread must be locked.  The pset must be locked,
+  *	and the resulting pset is locked on return.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * A733: 2x Cortex-A76 + up to 6x Cortex-A55 in one SMP cluster (the kernel has
++ * no Edge scheduler and no CLPC to tell them apart). Interactive threads
++ * (user-initiated QoS and above) take an idle A76 first, background threads
++ * (utility and below) an idle A55, so UI work does not run on a slow core
++ * while a fast one is idle, and background work leaves the A76s free.
++ * Boot-arg a733bigpref=0 turns it off.
++ */
++static uint64_t sweet_big_mask;         /* logical CPUs that are A76 (MPIDR >= 0x600) */
++static int sweet_big_pref = -1;
++
++static uint64_t
++sweet_big_cpus(void)
++{
++	if (__improbable(sweet_big_pref < 0)) {
++		const ml_topology_info_t *topo = ml_get_topology_info();
++		uint64_t mask = 0;
++		for (unsigned int i = 0; i < topo->num_cpus; i++) {
++			if (topo->cpus[i].phys_id >= 0x600) {
++				mask |= 1ULL << topo->cpus[i].cpu_id;
++			}
++		}
++		int on = 1;
++		PE_parse_boot_argn("a733bigpref", &on, sizeof(on));
++		sweet_big_mask = mask;
++		/* Only useful with both kinds of core online. */
++		sweet_big_pref = (on && mask != 0 && (mask & ((1ULL << topo->num_cpus) - 1)) != ((1ULL << topo->num_cpus) - 1)) ? 1 : 0;
++	}
++	return sweet_big_pref ? sweet_big_mask : 0;
++}
++
++/* Preferred idle CPUs for this thread: big for interactive, little for background, 0 = any. */
++static uint64_t
++sweet_preferred(thread_t thread, uint64_t idle_map)
++{
++	uint64_t big = sweet_big_cpus();
++	if (big == 0) {
++		return 0;
++	}
++	if (thread->sched_pri >= BASEPRI_USER_INITIATED) {
++		return idle_map & big;
++	}
++	if (thread->sched_pri <= BASEPRI_UTILITY) {
++		return idle_map & ~big;
++	}
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ processor_t
+ choose_processor(
+ 	processor_set_t         starting_pset,
+@@ -5084,6 +5134,16 @@ choose_processor(
+ 				 * the "least cost idle" processor above.
+ 				 */
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++					/* An idle core of the preferred kind beats the cache-warm hint. */
++					if (thread->sched_pri < BASEPRI_RTQUEUES) {
++						uint64_t pref = sweet_preferred(thread, pset->cpu_state_map[PROCESSOR_IDLE] &
++						    pset->primary_map & pset->recommended_bitmask);
++						if (pref != 0 && !bit_test(pref, processor->cpu_id)) {
++							return processor_array[lsb_first(pref)];
++						}
++					}
++#endif
+ 					return processor;
+ 				}
+ 				processor = PROCESSOR_NULL;
+@@ -5247,6 +5307,12 @@ no_available_cpus:
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
+ 		int cpuid = lsb_first(idle_primary_map);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		uint64_t sweet_pref = sweet_preferred(thread, idle_primary_map);
++		if (sweet_pref != 0) {
++			cpuid = lsb_first(sweet_pref);
++		}
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;

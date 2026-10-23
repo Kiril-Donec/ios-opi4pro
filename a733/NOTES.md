@@ -371,3 +371,7 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   the empty wallpaper/Photos: no GPU.
 - **Patch 9999s (`xnu-a733-keychain.patch`):** AppleKeyStore selectors 10/11 (wrap/unwrap: 8-byte
   header "SWK"+version+class+len+check, key XOR a fixed pad, n + 8 bytes) and 8/32 as no-op success.
+- **2026-10-23, partition 1 v10 (v9 + keychain key wrap) written** (owner confirmed): kernel CI 39944493958
+  attempt 2 (attempt 1 lost its macOS runner), commit 66f60d9; CI ADT reproduces its 2cpu payload
+  07d87fb5... byte for byte; image 5d13c225...9c23, read-back verified; previous v9 (9a4ee85b...) saved.
+  Test #15 pending (look for `securityd sel 10 ... -> 0x0` and sel 11).

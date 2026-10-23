@@ -383,3 +383,13 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   which waits for configd's InterfaceNamer to post `*InterfaceNamer` once IOKit is quiet ("Waiting for
   IOKit to quiesce (or timeout)"). So some IOService on our kernel never stops being busy (registerService /
   matching / start never finishing): next step is a kernel report of busy services.
+- **2026-10-23, partition 1 v11 (v10 + IOKit busy report, 9999t) written** (owner confirmed): kernel CI
+  39967286337 (commit 033b3c7), CI ADT reproduces its 2cpu payload af6a7c57... byte for byte, image
+  6e376ee3...9d5e, read-back verified; previous v10 (5d13c225...) saved. Test #16: look for
+  `A733 IOKIT: LEAF` lines at 60 s / 180 s.
+- **Ethernet research:** gmac0 = Synopsys DWMAC 5.20 (`snps,dwmac-5.20`, Linux stmmac/dwmac4 core) at
+  0x04500000 (0x8000) + Allwinner glue `allwinner,sunxi-gmac-210` (syscon at 0x04508000: EPIT/ETCS RGMII
+  external TX clock `aw,rgmii-clk-ext`, delay chains tx 12 / rx 10 from the board DT, vendor
+  bsp/drivers/stmmac/dwmac-sunxi.c), SPI 172 macirq; PHY on MDIO address 1, id 7b74.4412 (JLSemi), reset
+  GPIO disabled on this board; rails dc1sw1 (PHY 3.3 V) / dc1sw2 (MAC IO 3.3 V); CCU CLK_GMAC0 / MBUS /
+  PHY 25 MHz / PTP, resets GMAC0_AXI / GMAC0.

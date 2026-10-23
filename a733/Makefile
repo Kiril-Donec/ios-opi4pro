@@ -75,6 +75,7 @@ test: build/test_display
 	python3 -m unittest discover -s tests -p test_usbtouch_patch.py -v
 	python3 -m unittest discover -s tests -p test_cores_fb_power_patch.py -v
 	python3 -m unittest discover -s tests -p test_cpufreq_setup_patch.py -v
+	python3 -m unittest discover -s tests -p test_keychain_patch.py -v
 
 test-boot: all
 	python3 tests/test_boot_image.py

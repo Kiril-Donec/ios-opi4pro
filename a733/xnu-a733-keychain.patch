@@ -1,0 +1,348 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..1bc4844 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -1,241 +1,342 @@
+ /*
+  * Built-in AppleKeyStore for SWEET: a device without a passcode whose
+  * system keybag is always loaded and unlocked.
+  *
+  * Apple's AppleKeyStore kext (closed, SEP-backed) owns the keybags behind
+  * data protection. libaks (AppleKeyStore.framework, statically in keybagd)
+  * opens IOServiceMatching("AppleKeyStore") with type 0, calls selector 0,
+  * then one selector per aks_* function (iOS 16.7 numbering below). keybagd
+  * --init asks for the system bag (14) and only loads systembag.kb when the
+  * answer is kIOReturnNotFound; answering with a handle is the path a
+  * userspace reboot takes, so no bag file is needed.
+  *
+  * Every call is logged (selector, caller, argument shapes, result) so the
+  * next selectors the system needs show up on the console; unknown ones fail
+  * with kIOReturnUnsupported.
++ *
++ * A733: key wrapping for the keychain (securityd ks_crypt -> aks_wrap_key /
++ * aks_unwrap_key, selectors 10 / 11). There is no SEP or class key on this
++ * board, so a wrapped key is an 8-byte header (magic, class, length) plus the
++ * key masked with a fixed pad: stable across boots, so items written once can
++ * be read back, and no protection is claimed. 8 (lock) and 32 succeed as
++ * no-ops: SpringBoard calls them when the screen locks.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
+ 
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+ 	kAKSOpen             = 0,
+ 	kAKSCreateBag        = 2,
+ 	kAKSSaveBag          = 3,
+ 	kAKSUnloadBag        = 4,
+ 	kAKSSetSystem        = 5,
+ 	kAKSLoadBag          = 6,
+ 	kAKSGetLockState     = 7,
++	kAKSLockDevice       = 8,       /* SpringBoard on screen lock (board test #14) */
+ 	kAKSUnlockDevice     = 9,
+ 	kAKSWrapKey          = 10,
+ 	kAKSUnwrapKey        = 11,
+ 	kAKSUnlockBag        = 12,
+ 	kAKSLockBag          = 13,
+ 	kAKSGetSystem        = 14,
+ 	kAKSGetDeviceState   = 17,
+ 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
++	kAKSLockNotify       = 32,      /* SpringBoard, 1 scalar in, nothing out */
+ 	kAKSUnloadSessionBags = 55,
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
+ 	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+ };
+ 
+ /* The system (device) bag handle. */
+ #define SWEET_AKS_SYSTEM_HANDLE 0
+ 
+ /*
+  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+  * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
+  */
+ #define SWEET_AKS_LOCK_STATE    0x4
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+ 
+ public:
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStore, IOService);
+ 
+ bool
+ AppleKeyStore::start(IOService *provider)
+ {
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+ 	registerService();
+-	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
++	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked, key wrap v1)\n");
+ 	return true;
+ }
+ 
+ class AppleKeyStoreUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(AppleKeyStoreUserClient);
+ 
+ public:
+ 	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+ 	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+ 	    IOExternalMethodDispatch *dispatch, OSObject *target,
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleKeyStoreUserClient, IOUserClient);
+ 
+ IOReturn
+ AppleKeyStoreUserClient::clientClose(void)
+ {
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+ 
+ /* Copy len bytes to the caller's output structure (inband or descriptor). */
+ static IOReturn
+ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ {
+ 	if (args->structureOutputDescriptor != NULL) {
+ 		if (len > args->structureOutputDescriptor->getLength()) {
+ 			return kIOReturnNoSpace;
+ 		}
+ 		args->structureOutputDescriptor->writeBytes(0, buf, len);
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+ 	if (args->structureOutput == NULL || len > args->structureOutputSize) {
+ 		return kIOReturnNoSpace;
+ 	}
+ 	memcpy(args->structureOutput, buf, len);
+ 	args->structureOutputSize = len;
+ 	return kIOReturnSuccess;
+ }
+ 
+ /* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
+ static uint32_t
+ sweet_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+ {
+ 	uint32_t klen = (uint32_t)strlen(key);
+ 	uint32_t n = 0;
+ 	p[n++] = 0x30;
+ 	p[n++] = (uint8_t)(2 + klen + 3);
+ 	p[n++] = 0x0c;
+ 	p[n++] = (uint8_t)klen;
+ 	memcpy(p + n, key, klen);
+ 	n += klen;
+ 	p[n++] = 0x02;
+ 	p[n++] = 0x01;
+ 	p[n++] = value;
+ 	return n;
+ }
+ 
+ /*
+  * Device state (selector 17): a DER SET of key/INTEGER pairs that libaks
+  * decode_extended_state reads: ss state, sls lock state (MKBGetDeviceLockState:
+  * 0 = unlocked), sb backoff, sfa failed attempts, sgs generation, sas
+  * assertions, sgpe grace period, srcd recovery countdown.
+  */
+ static IOReturn
+ sweet_aks_device_state(IOExternalMethodArguments *args)
+ {
+ 	static const struct {
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+ 		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+ 	uint32_t n = 2;
+ 	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+ 		n += sweet_aks_der_pair(buf + n, fields[i].key, fields[i].value);
+ 	}
+ 	buf[0] = 0x31;
+ 	buf[1] = (uint8_t)(n - 2);
+ 	return sweet_aks_struct_out(args, buf, n);
+ }
+ 
++/*
++ * Wrapped key: "SWK" magic, version 1, key class (16 bits), key length, check
++ * byte, then the key XOR a fixed pad: n + 8 bytes, the RFC 3394 size securityd
++ * reserves (in 2/32 out 1/40 in board test #14).
++ */
++#define SWEET_AKS_WRAP_HDR      8
++#define SWEET_AKS_BAD_LEN       0xffffffffu
++#define SWEET_AKS_KEY_MAX       64
++
++static const uint8_t sweet_aks_pad[SWEET_AKS_KEY_MAX] = {
++	0x53, 0x57, 0x45, 0x45, 0x54, 0x2d, 0x41, 0x37, 0x33, 0x33, 0x2d, 0x6e, 0x6f, 0x2d, 0x53, 0x45,
++	0x50, 0x2d, 0x6b, 0x65, 0x79, 0x2d, 0x77, 0x72, 0x61, 0x70, 0x2d, 0x70, 0x61, 0x64, 0x2d, 0x76,
++	0x31, 0xa7, 0x33, 0x5e, 0x91, 0x0c, 0xd4, 0x6b, 0x28, 0xf1, 0x47, 0xb2, 0x8e, 0x15, 0x6a, 0xc3,
++	0x7d, 0x02, 0xe9, 0x54, 0xbb, 0x31, 0x86, 0x4f, 0xa0, 0x1c, 0x63, 0xde, 0x97, 0x38, 0x45, 0xf2,
++};
++
++static uint32_t
++sweet_aks_struct_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t max)
++{
++	if (args->structureInputDescriptor != NULL) {
++		uint32_t len = (uint32_t)args->structureInputDescriptor->getLength();
++		if (len > max) {
++			return SWEET_AKS_BAD_LEN;
++		}
++		args->structureInputDescriptor->readBytes(0, buf, len);
++		return len;
++	}
++	if (args->structureInputSize > max || (args->structureInputSize && args->structureInput == NULL)) {
++		return SWEET_AKS_BAD_LEN;
++	}
++	memcpy(buf, args->structureInput, args->structureInputSize);
++	return args->structureInputSize;
++}
++
++/* aks_wrap_key: scalars (bag, class), key in; class (scalar) and wrapped key out. */
++static IOReturn
++sweet_aks_wrap(IOExternalMethodArguments *args)
++{
++	uint8_t key[SWEET_AKS_KEY_MAX], out[SWEET_AKS_WRAP_HDR + SWEET_AKS_KEY_MAX];
++	uint32_t n = sweet_aks_struct_in(args, key, sizeof(key));
++	uint64_t keyclass = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
++	if (n == SWEET_AKS_BAD_LEN || n == 0) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(out, "SWK", 3);
++	out[3] = 1;
++	out[4] = (uint8_t)keyclass;
++	out[5] = (uint8_t)(keyclass >> 8);
++	out[6] = (uint8_t)n;
++	out[7] = (uint8_t)(0x5a ^ out[4] ^ out[5] ^ out[6]);
++	for (uint32_t i = 0; i < n; i++) {
++		out[SWEET_AKS_WRAP_HDR + i] = key[i] ^ sweet_aks_pad[i];
++	}
++	IOReturn ret = sweet_aks_struct_out(args, out, SWEET_AKS_WRAP_HDR + n);
++	if (ret == kIOReturnSuccess && args->scalarOutputCount > 0) {
++		args->scalarOutput[0] = keyclass;
++		args->scalarOutputCount = 1;
++	} else {
++		args->scalarOutputCount = 0;
++	}
++	memset(key, 0, sizeof(key));
++	return ret;
++}
++
++/* aks_unwrap_key: scalars (bag, class), wrapped key in; the key out. */
++static IOReturn
++sweet_aks_unwrap(IOExternalMethodArguments *args)
++{
++	uint8_t in[SWEET_AKS_WRAP_HDR + SWEET_AKS_KEY_MAX], key[SWEET_AKS_KEY_MAX];
++	uint32_t n = sweet_aks_struct_in(args, in, sizeof(in));
++	if (n == SWEET_AKS_BAD_LEN || n < SWEET_AKS_WRAP_HDR + 1 || memcmp(in, "SWK", 3) != 0 || in[3] != 1 ||
++	    in[7] != (uint8_t)(0x5a ^ in[4] ^ in[5] ^ in[6]) || (uint32_t)in[6] + SWEET_AKS_WRAP_HDR != n) {
++		return kIOReturnBadArgument;    /* not ours (e.g. written by a real SEP) */
++	}
++	uint32_t len = in[6];
++	for (uint32_t i = 0; i < len; i++) {
++		key[i] = in[SWEET_AKS_WRAP_HDR + i] ^ sweet_aks_pad[i];
++	}
++	IOReturn ret = sweet_aks_struct_out(args, key, len);
++	args->scalarOutputCount = 0;
++	memset(key, 0, sizeof(key));
++	return ret;
++}
++
+ static uint32_t
+ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ {
+ 	return args->structureOutputDescriptor != NULL ?
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+ {
+ 	IOReturn ret = kIOReturnSuccess;
+ 	uint32_t in_scalars = args->scalarInputCount;
+ 	uint32_t in_struct = args->structureInputDescriptor != NULL ?
+ 	    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
+ 	uint32_t out_scalars = args->scalarOutputCount;
+ 	uint32_t out_struct = sweet_aks_struct_out_size(args);
+ 	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
+ 
+ 	switch (selector) {
+ 	case kAKSOpen:
++	case kAKSLockDevice:
++	case kAKSLockNotify:
+ 	case kAKSUnloadBag:
+ 	case kAKSSetSystem:
+ 	case kAKSUnlockDevice:
+ 	case kAKSUnlockBag:
+ 	case kAKSLockBag:
+ 	case kAKSAssertHold:
+ 	case kAKSAssertDrop:
+ 	case kAKSAssertConsume:
+ 	case kAKSUnloadSessionBags:
+ 	case kAKSNotifyStateSet:
+ 		args->scalarOutputCount = 0;
+ 		break;
+ 	case kAKSGetSystem:
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+ 		args->scalarOutput[0] = SWEET_AKS_SYSTEM_HANDLE;
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSGetLockState:
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+ 		args->scalarOutput[0] = SWEET_AKS_LOCK_STATE;
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSNotifyStateIsSet:
+ 		/* Nothing was ever set: answer "not set". */
+ 		if (out_scalars < 1) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+ 		args->scalarOutput[0] = 0;
+ 		args->scalarOutputCount = 1;
+ 		break;
+ 	case kAKSGetDeviceState:
+ 	case kAKSGetExtDeviceState:
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++		ret = sweet_aks_wrap(args);
++		break;
++	case kAKSUnwrapKey:
++		ret = sweet_aks_unwrap(args);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
+ 
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+ 	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+ 	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
+ 	return ret;
+ }
+ #endif /* SWEET */

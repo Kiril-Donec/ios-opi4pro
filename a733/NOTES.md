@@ -359,3 +359,15 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   (wrap_key) unsupported x69 -> keychain writes fail; Preferences crashed 3x (one is the same `pc 0x0`,
   lr = slide + 0x194b3858c call through NULL seen in SpringBoard in tests #7/#8); Phone/Messages killed
   0x8badf00d on exit (no CommCenter / modem); mediaserverd abort (no audio).
+- **The `pc 0x0` crash symbolized (2026-10-23)** with a read-only HFS+ reader + dyld shared cache parser
+  (local `ref/hfsread.py`, `ref/dscsym.py`; the cache files are HFS+ hard links to `iNode<n>`):
+  `UIKitCore -> CoreUI +[CUIShapeEffectStack sharedCIContext] (dispatch_once) -> CoreImage
+  CI::GLContext::GLContext(ShareContextInfo,...) -> CI::GLContext::init() + 0xcc: blr to a NULL GL
+  dispatch entry` (glDisable(GL_DEPTH_TEST)). With no Metal device CoreImage builds an OpenGL ES context;
+  EAGLContext creation succeeds without any GL driver (OpenGLES looks for IOAcceleratorES / GLEngine),
+  `GetMacroContext` returns an empty dispatch table, and init only logs that and goes on. CoreImage has
+  a software renderer (`software_renderer` option, `disable_software_fallback`), so the fix is to make
+  the GL path unavailable (EAGL init -> nil) or force CoreUI's context to software. Same root cause as
+  the empty wallpaper/Photos: no GPU.
+- **Patch 9999s (`xnu-a733-keychain.patch`):** AppleKeyStore selectors 10/11 (wrap/unwrap: 8-byte
+  header "SWK"+version+class+len+check, key XOR a fixed pad, n + 8 bytes) and 8/32 as no-op success.

@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/a733_power.c b/bsd/dev/a733_power.c
+index bd6dcff..bbd65c1 100644
+--- a/bsd/dev/a733_power.c
++++ b/bsd/dev/a733_power.c
+@@ -56,6 +56,7 @@ extern int (*PE_halt_restart)(unsigned int type);
+ extern void a733_sd_log_panic_flush(void);
+ extern bool a733_sd_log_sync(void);
+ extern int reboot_kernel(int howto, char *message);
++extern void a733_iokit_busy_report(unsigned int seconds);
+ #else
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -886,6 +887,11 @@ pw_thread(__unused void *arg, __unused wait_result_t wr)
+ 	    "3 presses: clean shutdown)\n", PK_CHORD_MS);
+ 	bool cf_started = false;
+ 	for (uint32_t tick = 1;; tick++) {
++		/* IOKit quiescence check (About / InterfaceNamer hang, board test #15). */
++		if (tick == 1200 || tick == 3600) {
++			a733_iokit_busy_report(tick / 20);
++			(void)a733_sd_log_sync();
++		}
+ 		/* Once a second: start cpufreq when the card log is up (or after 60 s), then thermal. */
+ 		if (tick % 20 == 0) {
+ 			if (!cf_started && (a733_sd_log_sync() || tick >= 1200)) {
+diff --git a/iokit/Kernel/arm/A733IOKitReport.cpp b/iokit/Kernel/arm/A733IOKitReport.cpp
+new file mode 100644
+index 0000000..4f11cd8
+--- /dev/null
++++ b/iokit/Kernel/arm/A733IOKitReport.cpp
+@@ -0,0 +1,69 @@
++/*
++ * A733: report of IOKit services that are still busy.
++ *
++ * configd's InterfaceNamer and SystemConfiguration (_SCNetworkInterface*,
++ * Settings > General > About) wait until IOKit is quiet, i.e. until no
++ * service is busy any more (matching, probe/start or termination still
++ * running; IOService::waitQuiet on the root). Board test #15 hung there, so
++ * something on this kernel never finishes. a733_power.c calls this one and
++ * three minutes after boot: every busy service is logged with its class,
++ * state bits and provider, deepest first in each branch, so the leaf that
++ * keeps its parents busy is the one to fix.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IOLib.h>
++
++extern "C" void a733_iokit_busy_report(unsigned int seconds);
++
++void
++a733_iokit_busy_report(unsigned int seconds)
++{
++	IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++	unsigned int busy = 0, shown = 0, total = 0;
++	if (it == NULL) {
++		IOLog("A733 IOKIT: no registry iterator\n");
++		return;
++	}
++	IORegistryEntry *entry;
++	while ((entry = it->getNextObject()) != NULL) {
++		IOService *s = OSDynamicCast(IOService, entry);
++		if (s == NULL) {
++			continue;
++		}
++		total++;
++		UInt32 b = s->getBusyState();
++		if (b == 0) {
++			continue;
++		}
++		busy++;
++		/* A leaf: busy itself, not only because a child is. */
++		bool leaf = true;
++		OSIterator *kids = s->getChildIterator(gIOServicePlane);
++		if (kids != NULL) {
++			OSObject *k;
++			while ((k = kids->getNextObject()) != NULL) {
++				IOService *c = OSDynamicCast(IOService, k);
++				if (c != NULL && c->getBusyState() != 0) {
++					leaf = false;
++					break;
++				}
++			}
++			kids->release();
++		}
++		if (shown < 48) {
++			shown++;
++			IOService *p = s->getProvider();
++			IOLog("A733 IOKIT: %s busy %u %s <%s> state 0x%x provider %s <%s>\n", leaf ? "LEAF" : "    ", b,
++			    s->getName(), s->getMetaClass()->getClassName(), (unsigned int)s->getState(),
++			    p ? p->getName() : "-", p ? p->getMetaClass()->getClassName() : "-");
++		}
++	}
++	it->release();
++	IOLog("A733 IOKIT: %u s after boot: %u of %u services busy%s\n", seconds, busy, total,
++	    busy ? " (LEAF lines are the ones that keep IOKit from quiescing)" : ", IOKit is quiet");
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 8b2b868..18fcc30 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitc
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/A733IOKitReport.cpp                             optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp

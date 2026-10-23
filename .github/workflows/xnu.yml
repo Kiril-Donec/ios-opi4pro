@@ -39,6 +39,8 @@ on:
       - "a733/xnu-a733-cores-fb-power.patch"
       - "a733/xnu-a733-cpufreq-setup.patch"
       - "a733/xnu-a733-keychain.patch"
+      - "a733/xnu-a733-iokit-report.patch"
+      - "a733/tests/test_iokit_report_patch.py"
       - "a733/tests/test_keychain_patch.py"
       - "a733/tests/test_aks_wrap.cpp"
       - "a733/tests/test_cpufreq_setup_patch.py"
@@ -145,6 +147,8 @@ jobs:
           cp a733/xnu-a733-cpufreq-setup.patch dxb/patches/9999r-a733-cpufreq-setup.patch
           # AppleKeyStore key wrap/unwrap (selectors 10/11) for securityd's keychain.
           cp a733/xnu-a733-keychain.patch dxb/patches/9999s-a733-keychain.patch
+          # Report of busy IOKit services (About hang waits for IOKit to quiesce).
+          cp a733/xnu-a733-iokit-report.patch dxb/patches/9999t-a733-iokit-report.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -317,6 +321,9 @@ jobs:
           if b"SWEET AKS: AppleKeyStore registered (no passcode, unlocked, key wrap v1)" not in kernel:
               raise SystemExit("FAIL: A733 keychain (AKS wrap) overlay was SKIPPED")
           print("PASS: A733 AppleKeyStore key wrap found in compiled XNU Mach-O")
+          if b"A733 IOKIT: %u s after boot" not in kernel:
+              raise SystemExit("FAIL: A733 IOKit busy report overlay was SKIPPED")
+          print("PASS: A733 IOKit busy report found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)

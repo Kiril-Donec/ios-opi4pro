@@ -438,3 +438,7 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   DT/0, the old 25 MHz setup last), logging which variant got the OFFER. **v3:** checked against
   mainline drivers/net/phy/motorcomm.c (same 0xA012 bits); for phy-mode "rgmii" it also turns the
   PHY internal delays off (0xA001 bit 8 RXC_DLY_EN, 0xA003 RX 13:10 / GE TX 3:0 = 0), now done too.
+- **2026-10-25, partition 1 v15 (v14 + 9999w v3) written** (owner approved): kernel CI 40202631886
+  (commit 53ce4ed, build + packaging success), CI ADT reproduces its 2cpu payload 9a39d0f4... byte for
+  byte, ADT with `--eth`, image 7b9a7007...f64a, read-back verified; v14 (642c8710...) saved. Test #18:
+  `A733 ETH: TX clock variant` / `DHCP OFFER with TX clock variant` lines, router cable in before power-on.

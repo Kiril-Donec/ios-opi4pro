@@ -408,3 +408,16 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   the SWEET kernel uses a macOS-derived config where OSKext::iokitDaemonAvailable() is true, but iOS has
   no kernelmanagerd (never exec'd in any log). **Patch 9999v (`xnu-a733-no-iokitd.patch`):** false on
   SWEET unless `a733iokitd=1` (no root busy hold, no deferred-match list).
+- **2026-10-25, partition 1 v13 (v12 + 9999v) written** (owner approved): kernel CI 40198052086 (commit
+  f466f64), CI ADT reproduces its 2cpu payload c282a6cc... byte for byte, image 369b666f...27bc,
+  read-back verified; v12 (23bc9565...) saved. Test #17: Settings > About should open; the 9999t report
+  at 60 s should list no busy services.
+- **Patch 9999w (`xnu-a733-eth.patch`, not yet on the card):** `bsd/dev/a733_eth.c`, ADT `/a733-eth`
+  (`mkadt_a733.py --eth`): AXP8191 DCDC_CTL2 (0x11) DC1SW1|DC1SW2 on from the power thread; PH0-PH15
+  function 5, pull-up; CCU gmac0 resets/bus gate, mbus gate bit 11 (vendor key 0x40302), PTP, PHY 25 MHz
+  (pll-peri0-150m / 6); syscon 0x11145; DWMAC4 DMA reset, 32 TX / 64 RX descriptors + 2 KiB buffers in
+  the 32-bit window 0x60100000 (256 KiB, after the OHCI window), polled every 2 ms from a thread, no
+  IRQ; MDIO PHY probe (address 1, else scan) + clause-22 autoneg, MAC speed/duplex from the PHY; BSD
+  ifnet `en3` (`a733eth_unit`), MAC 02:xx from the SID chip ID; kernel DHCP client (DISCOVER/REQUEST,
+  broadcast replies) sets the address with SIOCAIFADDR so the board answers ping. iOS (configd) does not
+  see the interface yet: that needs an IOKit IONetworkInterface. `a733eth=0` off. Log lines `A733 ETH:`.

@@ -66,6 +66,16 @@ USB1_BASE = 0x04200000
 USB1_SIZE = 0x1000
 USB_DMA_BASE = 0x60000000
 USB_DMA_SIZE = 0x10000
+# gmac0 (Synopsys DWMAC 5.20 + Allwinner sunxi-gmac-210 glue), board DT of the vendor Linux.
+GMAC0_BASE = 0x04500000
+GMAC0_SIZE = 0x8000
+GMAC0_SYSCON = 0x04508000
+PIO_BASE = 0x02000000
+ETH_DMA_BASE = 0x60100000      # 32-bit DMA window after the USB one: descriptors + buffers
+ETH_DMA_SIZE = 0x40000
+ETH_PHY_ADDR = 1
+ETH_TX_DELAY = 12              # aw,tx-delay / aw,rx-delay of the board DT
+ETH_RX_DELAY = 10
 
 
 def u32(*values: int) -> bytes:
@@ -141,7 +151,7 @@ def read_product(path: Path) -> list[tuple[str, bytes]]:
 
 
 def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = False,
-          usb_touch: bool = False, a55: bool = False, power: bool = False,
+          usb_touch: bool = False, a55: bool = False, power: bool = False, eth: bool = False,
           activation: bool = False, product: list[tuple[str, bytes]] | None = None) -> Node:
     # Opt-in ONLY: never expose an iOS display nub to the legacy Qualcomm
     # AppleCLCD driver unless the A733 CPU scanout overlay is installed.
@@ -300,6 +310,20 @@ def build(*, ios_display: bool = False, sdmmc: bool = False, a76_pair: bool = Fa
             ("ccu-reg", u64(CCU_BASE, CCU_SIZE)),
             ("dma-reg", u64(USB_DMA_BASE, USB_DMA_SIZE)),
         ]))
+    if eth:
+        # Polled, no "interrupts" (see /a733-sdmmc).
+        extra.append(Node("a733-eth", [
+            ("compatible", cstr("allwinner,sunxi-gmac-210") + cstr("snps,dwmac-5.20")),
+            ("reg", u64(GMAC0_BASE, GMAC0_SIZE)),
+            ("syscon-reg", u64(GMAC0_SYSCON, 0x1000)),
+            ("ccu-reg", u64(CCU_BASE, CCU_SIZE)),
+            ("pio-reg", u64(PIO_BASE, 0x1000)),
+            ("sid-reg", u64(SID_BASE, 0x1000)),
+            ("dma-reg", u64(ETH_DMA_BASE, ETH_DMA_SIZE)),
+            ("phy-addr", u32(ETH_PHY_ADDR)),
+            ("tx-delay", u32(ETH_TX_DELAY)),
+            ("rx-delay", u32(ETH_RX_DELAY)),
+        ]))
 
     return Node("device-tree", [
         ("compatible", cstr("D22AP") + cstr("iPhone10,3") +
@@ -349,10 +373,12 @@ def main() -> None:
                         help="/chosen security status of a dev-fused board (upstream Hactivation, Setup skip)")
     parser.add_argument("--usb-touch", action="store_true",
                         help="add /a733-usb for the USB1 OHCI touch screen driver")
+    parser.add_argument("--eth", action="store_true",
+                        help="add /a733-eth for the gmac0 Ethernet driver (polled, kernel DHCP)")
     args = parser.parse_args()
     product = read_product(args.product_adt) if args.product_adt else None
     data = build(ios_display=args.ios_display, sdmmc=args.sdmmc, a76_pair=args.a76_pair,
-                 usb_touch=args.usb_touch, a55=args.a55, power=args.power,
+                 usb_touch=args.usb_touch, a55=args.a55, power=args.power, eth=args.eth,
                  activation=args.activation, product=product).serialize()
     args.output.write_bytes(data)
     print(f"A733 early ADT: {len(data)} bytes -> {args.output}")
@@ -365,6 +391,7 @@ def main() -> None:
     print("Activation security status in /chosen:", "ON (Hactivation)" if args.activation else "OFF")
     print("Power button / PSCI off node:", "ENABLED (/a733-power)" if args.power else "OFF")
     print("USB1 touch screen node:", "ENABLED (/a733-usb)" if args.usb_touch else "OFF")
+    print("Ethernet gmac0 node:", "ENABLED (/a733-eth)" if args.eth else "OFF")
     print("EXPERIMENTAL: A76 PSCI verified; A733 XNU source rebuild still required")
 
 

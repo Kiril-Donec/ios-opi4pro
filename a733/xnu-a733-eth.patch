@@ -1,0 +1,1047 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5f413e4..4d3ea20 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/a733_sdmmc.c			standard
+ bsd/dev/a733_usbtouch.c			standard
+ bsd/dev/a733_power.c			standard
+ bsd/dev/a733_firstboot.c		standard
++bsd/dev/a733_eth.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a733_eth.c b/bsd/dev/a733_eth.c
+new file mode 100644
+index 0000000..adab800
+--- /dev/null
++++ b/bsd/dev/a733_eth.c
+@@ -0,0 +1,971 @@
++/*
++ * Allwinner A733 / Orange Pi 4 Pro gigabit Ethernet (gmac0), first stage.
++ *
++ * gmac0 is a Synopsys DesignWare Ethernet QoS 5.20 ("snps,dwmac-5.20", the
++ * Linux stmmac/dwmac4 core) at 0x04500000 with the Allwinner glue
++ * "allwinner,sunxi-gmac-210" (syscon at 0x04508000: RGMII, external TX
++ * clock, delay chains; vendor bsp/drivers/stmmac/dwmac-sunxi.c). The PHY
++ * (JLSemi, MDIO address 1) gets its 25 MHz reference from the SoC
++ * (aw,soc-phy-clk-en) and its 3.3 V from AXP8191 DC1SW1 (DC1SW2 powers the
++ * PH pins); a733_power.c switches those rails on.
++ *
++ * This stage: clocks, resets, PH0-PH15 as rgmii0, syscon, MDIO + clause-22
++ * autonegotiation, one TX and one RX DMA ring in a low-memory window from the
++ * ADT ("dma-reg", 32-bit addresses; XNU's RAM is above 4 GiB), polled from a
++ * thread (no interrupts), a BSD Ethernet ifnet, and a small DHCP client in
++ * the kernel that configures the interface's IPv4 address, so the board
++ * answers ping on the LAN. iOS itself does not see the interface yet (that
++ * needs an IOKit network interface for configd).
++ *
++ * Boot-args: a733eth=0 off, a733eth_unit=N (interface en<N>, default 3).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(A733_ETH_HOST_TEST)
++
++#ifndef A733_ETH_HOST_TEST
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern volatile int a733_eth_power;     /* a733_power.c: 1 rails on, -1 failed */
++#else
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#endif
++
++/* ------------------------------------------------------------------ pure */
++
++/* sunxi-gmac-210 syscon (dwmac-sunxi.h): RGMII, TX clock source, delay chains. */
++#define SYSCON_EPIT             (1u << 2)
++#define SYSCON_ETCS_EXT         1u
++#define SYSCON_ETCS_INT         2u
++
++static uint32_t
++eth_syscon(uint32_t tx_delay, uint32_t rx_delay, bool clk_ext)
++{
++	uint32_t v = SYSCON_EPIT | (clk_ext ? SYSCON_ETCS_EXT : SYSCON_ETCS_INT);
++	v |= ((tx_delay >> 3) & 3u) << 16;      /* ETXDC_H */
++	v |= (tx_delay & 7u) << 10;             /* ETXDC_L */
++	v |= (rx_delay & 31u) << 5;             /* ERXDC */
++	return v;
++}
++
++/* Clause 22: link speed/duplex from BMSR, ANAR, ANLPAR, 1000BASE-T control/status. */
++static bool
++eth_phy_resolve(uint16_t bmsr, uint16_t anar, uint16_t anlpar, uint16_t gctl, uint16_t gsts,
++    unsigned *speed, bool *full)
++{
++	if (!(bmsr & (1u << 2))) {              /* link status */
++		return false;
++	}
++	if ((gctl & (1u << 9)) && (gsts & (1u << 11))) {
++		*speed = 1000;
++		*full = true;
++	} else if ((gctl & (1u << 8)) && (gsts & (1u << 10))) {
++		*speed = 1000;
++		*full = false;
++	} else {
++		uint16_t common = anar & anlpar;
++		if (common & (1u << 8)) {
++			*speed = 100;
++			*full = true;
++		} else if (common & (1u << 7)) {
++			*speed = 100;
++			*full = false;
++		} else if (common & (1u << 6)) {
++			*speed = 10;
++			*full = true;
++		} else {
++			*speed = 10;
++			*full = false;
++		}
++	}
++	return true;
++}
++
++/* A stable, locally administered unicast MAC from the SoC chip ID. */
++static void
++eth_mac_from_chipid(const uint32_t id[4], uint8_t mac[6])
++{
++	uint32_t h = 2166136261u;
++	for (unsigned i = 0; i < 16; i++) {
++		h = (h ^ ((id[i / 4] >> (8 * (i % 4))) & 0xff)) * 16777619u;
++	}
++	uint32_t h2 = (h ^ id[0] ^ (id[3] << 7)) * 2654435761u;
++	mac[0] = 0x02;                          /* locally administered, unicast */
++	mac[1] = (uint8_t)(h >> 24);
++	mac[2] = (uint8_t)(h >> 16);
++	mac[3] = (uint8_t)(h >> 8);
++	mac[4] = (uint8_t)h2;
++	mac[5] = (uint8_t)(h2 >> 8);
++}
++
++static uint16_t
++ip_csum(const uint8_t *p, unsigned len)
++{
++	uint32_t s = 0;
++	for (unsigned i = 0; i + 1 < len; i += 2) {
++		s += (uint32_t)(p[i] << 8 | p[i + 1]);
++	}
++	if (len & 1) {
++		s += (uint32_t)p[len - 1] << 8;
++	}
++	while (s >> 16) {
++		s = (s & 0xffff) + (s >> 16);
++	}
++	return (uint16_t)~s;
++}
++
++#define DHCP_DISCOVER   1
++#define DHCP_OFFER      2
++#define DHCP_REQUEST    3
++#define DHCP_ACK        5
++#define DHCP_NAK        6
++#define DHCP_FRAME_MAX  400
++
++static void
++put16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static void
++put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v >> 24);
++	p[1] = (uint8_t)(v >> 16);
++	p[2] = (uint8_t)(v >> 8);
++	p[3] = (uint8_t)v;
++}
++
++static uint32_t
++get32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
++/*
++ * Broadcast DHCP DISCOVER / REQUEST as a full Ethernet frame (IPv4 0.0.0.0 ->
++ * 255.255.255.255, UDP 68 -> 67). req_ip / server only for REQUEST.
++ * Returns the frame length (<= DHCP_FRAME_MAX).
++ */
++static unsigned
++dhcp_build(uint8_t *f, const uint8_t mac[6], uint32_t xid, int type, uint32_t req_ip, uint32_t server)
++{
++	memset(f, 0, DHCP_FRAME_MAX);
++	memset(f, 0xff, 6);
++	memcpy(f + 6, mac, 6);
++	put16(f + 12, 0x0800);
++	uint8_t *ip = f + 14, *udp = ip + 20, *b = udp + 8;
++	b[0] = 1;                               /* BOOTREQUEST */
++	b[1] = 1;                               /* Ethernet */
++	b[2] = 6;
++	put32(b + 4, xid);
++	put16(b + 10, 0x8000);                  /* broadcast reply */
++	memcpy(b + 28, mac, 6);
++	put32(b + 236, 0x63825363);             /* magic cookie */
++	uint8_t *o = b + 240;
++	*o++ = 53; *o++ = 1; *o++ = (uint8_t)type;
++	*o++ = 61; *o++ = 7; *o++ = 1; memcpy(o, mac, 6); o += 6;
++	*o++ = 12; *o++ = 11; memcpy(o, "iPhone-A733", 11); o += 11;
++	*o++ = 55; *o++ = 4; *o++ = 1; *o++ = 3; *o++ = 6; *o++ = 15;
++	if (type == DHCP_REQUEST) {
++		*o++ = 50; *o++ = 4; put32(o, req_ip); o += 4;
++		*o++ = 54; *o++ = 4; put32(o, server); o += 4;
++	}
++	*o++ = 255;
++	unsigned blen = (unsigned)(o - b);
++	if (blen < 300) {
++		blen = 300;                     /* BOOTP minimum */
++	}
++	unsigned udp_len = 8 + blen, ip_len = 20 + udp_len;
++	ip[0] = 0x45;
++	put16(ip + 2, (uint16_t)ip_len);
++	put16(ip + 4, (uint16_t)xid);
++	ip[8] = 64;
++	ip[9] = 17;
++	put32(ip + 12, 0);
++	put32(ip + 16, 0xffffffff);
++	put16(ip + 10, ip_csum(ip, 20));
++	put16(udp, 68);
++	put16(udp + 2, 67);
++	put16(udp + 4, (uint16_t)udp_len);      /* UDP checksum 0: none (IPv4) */
++	return 14 + ip_len;
++}
++
++struct dhcp_reply {
++	int type;
++	uint32_t yiaddr, server, mask, router, lease;
++};
++
++/* A DHCP reply to us (xid) in an Ethernet frame: its type, or 0 if not one. */
++static int
++dhcp_parse(const uint8_t *f, unsigned len, uint32_t xid, struct dhcp_reply *r)
++{
++	memset(r, 0, sizeof(*r));
++	if (len < 14 + 20 + 8 + 240 || f[12] != 0x08 || f[13] != 0x00) {
++		return 0;
++	}
++	const uint8_t *ip = f + 14;
++	unsigned ihl = (ip[0] & 15u) * 4;
++	if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17 || 14 + ihl + 8 + 240 > len) {
++		return 0;
++	}
++	const uint8_t *udp = ip + ihl, *b = udp + 8;
++	if (((udp[2] << 8) | udp[3]) != 68 || b[0] != 2 || get32(b + 4) != xid || get32(b + 236) != 0x63825363) {
++		return 0;
++	}
++	r->yiaddr = get32(b + 16);
++	const uint8_t *o = b + 240, *end = f + len;
++	while (o < end && *o != 255) {
++		if (*o == 0) {
++			o++;
++			continue;
++		}
++		if (o + 2 > end || o + 2 + o[1] > end) {
++			break;
++		}
++		uint8_t code = o[0], l = o[1];
++		const uint8_t *v = o + 2;
++		if (code == 53 && l >= 1) {
++			r->type = v[0];
++		} else if (code == 54 && l >= 4) {
++			r->server = get32(v);
++		} else if (code == 1 && l >= 4) {
++			r->mask = get32(v);
++		} else if (code == 3 && l >= 4) {
++			r->router = get32(v);
++		} else if (code == 51 && l >= 4) {
++			r->lease = get32(v);
++		}
++		o += 2 + l;
++	}
++	return r->type;
++}
++
++#ifndef A733_ETH_HOST_TEST
++/* ---------------------------------------------------------------- kernel */
++
++/* CCU (sun60iw2, ccu-sun60iw2.c) */
++#define CCU_MBUS_GATE           0x05e4          /* bit 11 gmac0 mbus, written with the key */
++#define CCU_MBUS_GATE_KEY       0x00040302u     /* MBUS_GATE_KEY_VALUE */
++#define CCU_GMAC_PTP            0x1400          /* gate 31, mux 26:24 (0 sys24M), M 4:0 */
++#define CCU_GMAC0_PHY           0x1410          /* gate 31, M 4:0 of pll-peri0-150m: /6 = 25 MHz */
++#define CCU_GMAC0_BGR           0x141c          /* bit 0 gate, bit 16 reset, bit 17 AXI reset */
++
++/* PIO bank H (sun60iw2 pinctrl hw type 4/10: banks at 0x80 + n * 0x80) */
++#define PIO_PH_CFG0             0x400           /* PH0-PH7, 4 bits each */
++#define PIO_PH_CFG1             0x404           /* PH8-PH15 */
++#define PIO_PH_DRV0             0x420
++#define PIO_PH_DRV1             0x424
++#define PIO_PH_PULL0            0x430           /* PH0-PH15, 2 bits each */
++
++/* DWMAC 5.x (Linux dwmac4.h / dwmac4_dma.h) */
++#define MAC_CONFIG              0x0000
++#define MAC_PACKET_FILTER       0x0008
++#define MAC_RXQ_CTRL0           0x00a0
++#define MAC_INT_EN              0x00b4
++#define MAC_VERSION             0x0110
++#define MAC_HW_FEATURE1         0x0120
++#define MAC_MDIO_ADDR           0x0200
++#define MAC_MDIO_DATA           0x0204
++#define MAC_ADDR0_HIGH          0x0300
++#define MAC_ADDR0_LOW           0x0304
++#define MTL_TXQ0_OPMODE         0x0d00
++#define MTL_RXQ0_OPMODE         0x0d30
++#define DMA_MODE                0x1000
++#define DMA_SYSBUS_MODE         0x1004
++#define DMA_CH0_CTRL            0x1100
++#define DMA_CH0_TX_CTRL         0x1104
++#define DMA_CH0_RX_CTRL         0x1108
++#define DMA_CH0_TXDESC_HI       0x1110
++#define DMA_CH0_TXDESC_LO       0x1114
++#define DMA_CH0_RXDESC_HI       0x1118
++#define DMA_CH0_RXDESC_LO       0x111c
++#define DMA_CH0_TX_TAIL         0x1120
++#define DMA_CH0_RX_TAIL         0x1128
++#define DMA_CH0_TX_RINGLEN      0x112c
++#define DMA_CH0_RX_RINGLEN      0x1130
++#define DMA_CH0_INT_EN          0x1134
++#define DMA_CH0_STATUS          0x1160
++
++#define CFG_RE                  (1u << 0)
++#define CFG_TE                  (1u << 1)
++#define CFG_DM                  (1u << 13)
++#define CFG_FES                 (1u << 14)
++#define CFG_PS                  (1u << 15)
++#define CFG_ACS                 (1u << 20)
++#define CFG_CST                 (1u << 21)
++#define MDIO_GB                 (1u << 0)
++#define MDIO_GOC_WRITE          (1u << 2)
++#define MDIO_GOC_READ           (3u << 2)
++#define MDIO_CR                 (5u << 8)       /* CSR clock / 124: safe up to 300 MHz */
++
++/* DMA window: descriptors, then 2 KiB buffers. */
++#define ETH_DMA_SIZE            0x40000
++#define TX_RING                 32
++#define RX_RING                 64
++#define D_TXDESC                0x00000
++#define D_RXDESC                0x01000
++#define D_TXBUF                 0x10000
++#define D_RXBUF                 0x20000
++#define BUF_SIZE                2048
++
++#define TDES3_OWN               (1u << 31)
++#define TDES3_FD                (1u << 29)
++#define TDES3_LD                (1u << 28)
++#define RDES3_OWN               (1u << 31)
++#define RDES3_IOC               (1u << 30)
++#define RDES3_BUF1V             (1u << 24)
++#define RDES3_FD                (1u << 29)
++#define RDES3_LD                (1u << 28)
++#define RDES3_ES                (1u << 15)
++
++static struct {
++	vm_offset_t mac, syscon, ccu, pio, sid, dma;
++	uint32_t dma_pa;
++	uint32_t phy_addr, tx_delay, rx_delay;
++	uint8_t lladdr[6];
++	bool link;
++	unsigned speed;
++	bool full;
++	unsigned tx_head, tx_tail, rx_next;
++	lck_mtx_t *lock;
++	ifnet_t ifp;
++	unsigned unit;
++	uint64_t rx_frames, tx_frames, rx_errors, tx_drops;
++	/* DHCP */
++	int dhcp_state;                 /* 0 idle, 1 discovering, 2 requesting, 3 bound */
++	uint32_t xid, offer_ip, offer_server, ip, mask, router;
++	unsigned dhcp_tries;
++	uint64_t dhcp_next_ms;
++} eth;
++
++static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
++
++static void
++eth_sleep_ms(uint32_t ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline((event_t)&eth, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++eth_now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static int
++mdio_wait(void)
++{
++	for (unsigned i = 0; i < 20000; i++) {
++		if (!(rd32(eth.mac, MAC_MDIO_ADDR) & MDIO_GB)) {
++			return 0;
++		}
++		delay(5);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++mdio_read(uint32_t phy, uint32_t reg, uint16_t *val)
++{
++	if (mdio_wait()) {
++		return ETIMEDOUT;
++	}
++	wr32(eth.mac, MAC_MDIO_ADDR, (phy << 21) | (reg << 16) | MDIO_CR | MDIO_GOC_READ | MDIO_GB);
++	if (mdio_wait()) {
++		return ETIMEDOUT;
++	}
++	*val = (uint16_t)rd32(eth.mac, MAC_MDIO_DATA);
++	return 0;
++}
++
++static int
++mdio_write(uint32_t phy, uint32_t reg, uint16_t val)
++{
++	if (mdio_wait()) {
++		return ETIMEDOUT;
++	}
++	wr32(eth.mac, MAC_MDIO_DATA, val);
++	wr32(eth.mac, MAC_MDIO_ADDR, (phy << 21) | (reg << 16) | MDIO_CR | MDIO_GOC_WRITE | MDIO_GB);
++	return mdio_wait();
++}
++
++static void
++eth_hw_on(void)
++{
++	printf("A733 ETH: before: CCU bgr 0x%08x phyclk 0x%08x ptp 0x%08x mbus 0x%08x, PH cfg 0x%08x 0x%08x, syscon 0x%08x\n",
++	    rd32(eth.ccu, CCU_GMAC0_BGR), rd32(eth.ccu, CCU_GMAC0_PHY), rd32(eth.ccu, CCU_GMAC_PTP),
++	    rd32(eth.ccu, CCU_MBUS_GATE), rd32(eth.pio, PIO_PH_CFG0), rd32(eth.pio, PIO_PH_CFG1),
++	    rd32(eth.syscon, 0));
++	/* Pins PH0-PH15: function 5 (rgmii0), drive 1, pull-up (board DT gmac0_pins_default). */
++	wr32(eth.pio, PIO_PH_CFG0, 0x55555555);
++	wr32(eth.pio, PIO_PH_CFG1, 0x55555555);
++	wr32(eth.pio, PIO_PH_DRV0, 0x11111111);
++	wr32(eth.pio, PIO_PH_DRV1, 0x11111111);
++	wr32(eth.pio, PIO_PH_PULL0, 0x55555555);
++	/* Clocks and resets as sunxi_dwmac_clk_init(): resets off, bus gate, mbus, PTP, PHY 25 MHz. */
++	wr32(eth.ccu, CCU_GMAC0_BGR, rd32(eth.ccu, CCU_GMAC0_BGR) | (1u << 16) | (1u << 17));
++	wr32(eth.ccu, CCU_GMAC0_BGR, rd32(eth.ccu, CCU_GMAC0_BGR) | 1u);
++	wr32(eth.ccu, CCU_MBUS_GATE, rd32(eth.ccu, CCU_MBUS_GATE) | (1u << 11) | CCU_MBUS_GATE_KEY);
++	wr32(eth.ccu, CCU_GMAC_PTP, (rd32(eth.ccu, CCU_GMAC_PTP) & ~((7u << 24) | 0x1fu)) | (1u << 31));
++	wr32(eth.ccu, CCU_GMAC0_PHY, (rd32(eth.ccu, CCU_GMAC0_PHY) & ~0x1fu) | 5u | (1u << 31));
++	delay(100);
++	wr32(eth.syscon, 0, eth_syscon(eth.tx_delay, eth.rx_delay, true));
++	printf("A733 ETH: after: CCU bgr 0x%08x phyclk 0x%08x ptp 0x%08x, syscon 0x%08x, MAC version 0x%08x hwfeat1 0x%08x\n",
++	    rd32(eth.ccu, CCU_GMAC0_BGR), rd32(eth.ccu, CCU_GMAC0_PHY), rd32(eth.ccu, CCU_GMAC_PTP),
++	    rd32(eth.syscon, 0), rd32(eth.mac, MAC_VERSION), rd32(eth.mac, MAC_HW_FEATURE1));
++}
++
++static int
++eth_phy_init(void)
++{
++	uint16_t id1 = 0xffff, id2 = 0xffff;
++	for (unsigned try = 0; try < 2; try++) {
++		uint32_t a = try == 0 ? eth.phy_addr : 0;
++		for (; a < 32; a++) {
++			if (mdio_read(a, 2, &id1) == 0 && mdio_read(a, 3, &id2) == 0 &&
++			    id1 != 0xffff && id1 != 0 && !(id1 == 0 && id2 == 0)) {
++				eth.phy_addr = a;
++				goto found;
++			}
++			if (try == 0) {
++				break;
++			}
++		}
++	}
++	printf("A733 ETH: no PHY answers on MDIO (last id %04x:%04x)\n", id1, id2);
++	return ENXIO;
++found:
++	printf("A733 ETH: PHY at MDIO %u, id %04x:%04x\n", eth.phy_addr, id1, id2);
++	(void)mdio_write(eth.phy_addr, 0, 1u << 15);            /* BMCR reset */
++	for (unsigned i = 0; i < 100; i++) {
++		uint16_t bmcr;
++		eth_sleep_ms(5);
++		if (mdio_read(eth.phy_addr, 0, &bmcr) == 0 && !(bmcr & (1u << 15))) {
++			break;
++		}
++	}
++	(void)mdio_write(eth.phy_addr, 4, 0x01e1);              /* 10/100 half/full, IEEE 802.3 */
++	(void)mdio_write(eth.phy_addr, 9, 0x0300);              /* 1000 half/full */
++	(void)mdio_write(eth.phy_addr, 0, (1u << 12) | (1u << 9));      /* autoneg on + restart */
++	return 0;
++}
++
++static void
++eth_rx_arm(unsigned i)
++{
++	uint32_t d = D_RXDESC + 16 * i;
++	wr32(eth.dma, d + 0, eth.dma_pa + D_RXBUF + BUF_SIZE * i);
++	wr32(eth.dma, d + 4, 0);
++	wr32(eth.dma, d + 8, 0);
++	__builtin_arm_dsb(0xf);
++	wr32(eth.dma, d + 12, RDES3_OWN | RDES3_IOC | RDES3_BUF1V);
++}
++
++static int
++eth_dma_init(void)
++{
++	wr32(eth.mac, DMA_MODE, rd32(eth.mac, DMA_MODE) | 1u);  /* software reset */
++	for (unsigned i = 0; i < 200 && (rd32(eth.mac, DMA_MODE) & 1u); i++) {
++		eth_sleep_ms(1);
++	}
++	if (rd32(eth.mac, DMA_MODE) & 1u) {
++		printf("A733 ETH: DMA reset does not complete (no RGMII clocks from the PHY?)\n");
++		return ETIMEDOUT;
++	}
++	for (unsigned o = 0; o < D_RXDESC + 16 * RX_RING; o += 4) {
++		wr32(eth.dma, o, 0);
++	}
++	for (unsigned i = 0; i < RX_RING; i++) {
++		eth_rx_arm(i);
++	}
++	eth.tx_head = eth.tx_tail = eth.rx_next = 0;
++
++	wr32(eth.mac, DMA_SYSBUS_MODE, 1u | (1u << 1) | (1u << 2) | (1u << 3));    /* FB, BLEN 4/8/16 */
++	wr32(eth.mac, DMA_CH0_CTRL, 1u << 16);                  /* PBLx8 */
++	wr32(eth.mac, DMA_CH0_TXDESC_HI, 0);
++	wr32(eth.mac, DMA_CH0_TXDESC_LO, eth.dma_pa + D_TXDESC);
++	wr32(eth.mac, DMA_CH0_RXDESC_HI, 0);
++	wr32(eth.mac, DMA_CH0_RXDESC_LO, eth.dma_pa + D_RXDESC);
++	wr32(eth.mac, DMA_CH0_TX_RINGLEN, TX_RING - 1);
++	wr32(eth.mac, DMA_CH0_RX_RINGLEN, RX_RING - 1);
++	wr32(eth.mac, DMA_CH0_TX_CTRL, (8u << 16) | (1u << 4));        /* TxPBL 8, OSF */
++	wr32(eth.mac, DMA_CH0_RX_CTRL, (8u << 16) | (BUF_SIZE << 1));  /* RxPBL 8, RBSZ */
++	wr32(eth.mac, DMA_CH0_INT_EN, 0);
++	wr32(eth.mac, MAC_INT_EN, 0);
++
++	/* MTL queue 0: store and forward, whole FIFOs. */
++	uint32_t hw1 = rd32(eth.mac, MAC_HW_FEATURE1);
++	uint32_t rx_fifo = 128u << (hw1 & 0x1f), tx_fifo = 128u << ((hw1 >> 6) & 0x1f);
++	wr32(eth.mac, MTL_TXQ0_OPMODE, ((tx_fifo / 256 - 1) << 16) | (2u << 2) | (1u << 1));
++	wr32(eth.mac, MTL_RXQ0_OPMODE, ((rx_fifo / 256 - 1) << 20) | (1u << 5));
++	wr32(eth.mac, MAC_RXQ_CTRL0, 2u);                       /* RX queue 0 enabled (generic) */
++
++	wr32(eth.mac, MAC_ADDR0_HIGH, (1u << 31) | (uint32_t)eth.lladdr[5] << 8 | eth.lladdr[4]);
++	wr32(eth.mac, MAC_ADDR0_LOW, (uint32_t)eth.lladdr[3] << 24 | (uint32_t)eth.lladdr[2] << 16 |
++	    (uint32_t)eth.lladdr[1] << 8 | eth.lladdr[0]);
++	wr32(eth.mac, MAC_PACKET_FILTER, 1u << 4);              /* our MAC + broadcast + all multicast */
++
++	__builtin_arm_dsb(0xf);
++	wr32(eth.mac, DMA_CH0_RX_TAIL, eth.dma_pa + D_RXDESC + 16 * RX_RING);
++	wr32(eth.mac, DMA_CH0_TX_TAIL, eth.dma_pa + D_TXDESC);
++	wr32(eth.mac, DMA_CH0_TX_CTRL, rd32(eth.mac, DMA_CH0_TX_CTRL) | 1u);   /* ST */
++	wr32(eth.mac, DMA_CH0_RX_CTRL, rd32(eth.mac, DMA_CH0_RX_CTRL) | 1u);   /* SR */
++	printf("A733 ETH: DMA up: rings %u/%u at 0x%x, FIFOs rx %u tx %u, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
++	    TX_RING, RX_RING, eth.dma_pa, rx_fifo, tx_fifo, eth.lladdr[0], eth.lladdr[1], eth.lladdr[2],
++	    eth.lladdr[3], eth.lladdr[4], eth.lladdr[5]);
++	return 0;
++}
++
++static void
++eth_mac_link(void)
++{
++	uint32_t cfg = rd32(eth.mac, MAC_CONFIG) & ~(CFG_PS | CFG_FES | CFG_DM);
++	if (eth.speed == 100) {
++		cfg |= CFG_PS | CFG_FES;
++	} else if (eth.speed == 10) {
++		cfg |= CFG_PS;
++	}
++	if (eth.full) {
++		cfg |= CFG_DM;
++	}
++	wr32(eth.mac, MAC_CONFIG, cfg | CFG_ACS | CFG_CST | CFG_TE | CFG_RE);
++}
++
++/* Queue one frame (with its Ethernet header). eth.lock held. */
++static bool
++eth_tx_frame_locked(const void *frame, unsigned len, mbuf_t m)
++{
++	/* Reclaim finished descriptors. */
++	while (eth.tx_tail != eth.tx_head && !(rd32(eth.dma, D_TXDESC + 16 * eth.tx_tail + 12) & TDES3_OWN)) {
++		eth.tx_tail = (eth.tx_tail + 1) % TX_RING;
++	}
++	unsigned next = (eth.tx_head + 1) % TX_RING;
++	if (next == eth.tx_tail || len > BUF_SIZE || len < 14 || !eth.link) {
++		eth.tx_drops++;
++		return false;
++	}
++	unsigned i = eth.tx_head;
++	uint8_t *buf = (uint8_t *)(eth.dma + D_TXBUF + BUF_SIZE * i);
++	if (m != NULL) {
++		mbuf_copydata(m, 0, len, buf);
++	} else {
++		memcpy(buf, frame, len);
++	}
++	if (len < 60) {
++		memset(buf + len, 0, 60 - len);
++		len = 60;
++	}
++	uint32_t d = D_TXDESC + 16 * i;
++	wr32(eth.dma, d + 0, eth.dma_pa + D_TXBUF + BUF_SIZE * i);
++	wr32(eth.dma, d + 4, 0);
++	wr32(eth.dma, d + 8, len);
++	__builtin_arm_dsb(0xf);
++	wr32(eth.dma, d + 12, TDES3_OWN | TDES3_FD | TDES3_LD | len);
++	eth.tx_head = next;
++	__builtin_arm_dsb(0xf);
++	wr32(eth.mac, DMA_CH0_TX_TAIL, eth.dma_pa + D_TXDESC + 16 * next);
++	eth.tx_frames++;
++	return true;
++}
++
++static errno_t
++eth_if_output(ifnet_t ifp, mbuf_t m)
++{
++	size_t len = mbuf_pkthdr_len(m);
++	lck_mtx_lock(eth.lock);
++	bool ok = eth_tx_frame_locked(NULL, (unsigned)len, m);
++	lck_mtx_unlock(eth.lock);
++	ifnet_stat_increment_out(ifp, ok ? 1 : 0, ok ? (uint32_t)len : 0, ok ? 0 : 1);
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++eth_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++eth_if_detach(ifnet_t ifp __unused)
++{
++}
++
++static void
++eth_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++
++	grp = lck_grp_alloc_init("a733_eth", LCK_GRP_ATTR_NULL);
++	eth.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "a733-gmac0";
++	init.uniqueid_len = sizeof("a733-gmac0") - 1;
++	init.name = "en";
++	init.unit = eth.unit;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = eth_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = eth_if_ioctl;
++	init.detach = eth_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &eth.ifp) != 0) {
++		printf("A733 ETH: ifnet_allocate failed\n");
++		eth.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(eth.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(eth.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(eth.ifp, ETHERMTU);
++	ifnet_set_baudrate(eth.ifp, 1000000000);
++	ifnet_set_flags(eth.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(eth.ifp, NULL) != 0) {
++		printf("A733 ETH: ifnet_attach failed\n");
++		eth.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(eth.ifp, eth.lladdr, ETHER_ADDR_LEN);
++	(void)proto_plumb(PF_INET, eth.ifp);
++	printf("A733 ETH: interface en%u attached\n", eth.unit);
++}
++
++static void
++eth_if_set_ip(void)
++{
++	socket_t so = NULL;
++	errno_t err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en%u", eth.unit);
++		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(eth.ip);
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(eth.mask);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(eth.ip | ~eth.mask);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	ifnet_set_flags(eth.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	printf("A733 ETH: en%u %u.%u.%u.%u/%u.%u.%u.%u router %u.%u.%u.%u %s (err %d): ping it from the LAN\n",
++	    eth.unit, eth.ip >> 24, (eth.ip >> 16) & 255, (eth.ip >> 8) & 255, eth.ip & 255,
++	    eth.mask >> 24, (eth.mask >> 16) & 255, (eth.mask >> 8) & 255, eth.mask & 255,
++	    eth.router >> 24, (eth.router >> 16) & 255, (eth.router >> 8) & 255, eth.router & 255,
++	    err ? "NOT configured" : "configured", err);
++}
++
++static void
++eth_dhcp_send(int type)
++{
++	static uint8_t f[DHCP_FRAME_MAX];
++	unsigned len = dhcp_build(f, eth.lladdr, eth.xid, type, eth.offer_ip, eth.offer_server);
++	lck_mtx_lock(eth.lock);
++	(void)eth_tx_frame_locked(f, len, NULL);
++	lck_mtx_unlock(eth.lock);
++}
++
++static void
++eth_dhcp_tick(void)
++{
++	uint64_t now = eth_now_ms();
++	if (!eth.link || eth.dhcp_state == 3 || now < eth.dhcp_next_ms) {
++		return;
++	}
++	if (eth.dhcp_state == 0 || (eth.dhcp_state == 2 && eth.dhcp_tries >= 4)) {
++		eth.dhcp_state = 1;
++		eth.dhcp_tries = 0;
++		eth.xid = (uint32_t)mach_absolute_time() ^ ((uint32_t)eth.lladdr[4] << 8 | eth.lladdr[5]);
++	}
++	eth_dhcp_send(eth.dhcp_state == 1 ? DHCP_DISCOVER : DHCP_REQUEST);
++	if (eth.dhcp_tries++ < 3 || (eth.dhcp_tries % 10) == 0) {
++		printf("A733 ETH: DHCP %s sent (try %u)\n", eth.dhcp_state == 1 ? "DISCOVER" : "REQUEST", eth.dhcp_tries);
++	}
++	eth.dhcp_next_ms = now + 3000;
++}
++
++static void
++eth_dhcp_reply(const uint8_t *f, unsigned len)
++{
++	struct dhcp_reply r;
++	int type = dhcp_parse(f, len, eth.xid, &r);
++	if (type == DHCP_OFFER && eth.dhcp_state == 1) {
++		eth.offer_ip = r.yiaddr;
++		eth.offer_server = r.server;
++		eth.dhcp_state = 2;
++		eth.dhcp_tries = 0;
++		eth.dhcp_next_ms = 0;
++		printf("A733 ETH: DHCP OFFER %u.%u.%u.%u from %u.%u.%u.%u\n", r.yiaddr >> 24, (r.yiaddr >> 16) & 255,
++		    (r.yiaddr >> 8) & 255, r.yiaddr & 255, r.server >> 24, (r.server >> 16) & 255,
++		    (r.server >> 8) & 255, r.server & 255);
++		eth_dhcp_tick();
++	} else if (type == DHCP_ACK && eth.dhcp_state == 2) {
++		eth.ip = r.yiaddr;
++		eth.mask = r.mask ? r.mask : 0xffffff00;
++		eth.router = r.router;
++		eth.dhcp_state = 3;
++		printf("A733 ETH: DHCP ACK, lease %u s\n", r.lease);
++		eth_if_set_ip();
++	} else if (type == DHCP_NAK) {
++		printf("A733 ETH: DHCP NAK, starting over\n");
++		eth.dhcp_state = 0;
++		eth.dhcp_next_ms = eth_now_ms() + 1000;
++	}
++}
++
++static void
++eth_rx_poll(void)
++{
++	unsigned done = 0;
++	while (done < RX_RING) {
++		unsigned i = eth.rx_next;
++		uint32_t d = D_RXDESC + 16 * i, des3 = rd32(eth.dma, d + 12);
++		if (des3 & RDES3_OWN) {
++			break;
++		}
++		unsigned len = des3 & 0x7fff;
++		const uint8_t *buf = (const uint8_t *)(eth.dma + D_RXBUF + BUF_SIZE * i);
++		if ((des3 & (RDES3_FD | RDES3_LD)) != (RDES3_FD | RDES3_LD) || (des3 & RDES3_ES) || len < 14 ||
++		    len > BUF_SIZE) {
++			eth.rx_errors++;
++		} else {
++			eth.rx_frames++;
++			if (len > 14 + 20 + 8 && buf[12] == 0x08 && buf[13] == 0x00 && buf[14 + 9] == 17 &&
++			    buf[14 + 20 + 2] == 0 && buf[14 + 20 + 3] == 68) {
++				eth_dhcp_reply(buf, len);
++			} else if (eth.ifp != NULL) {
++				mbuf_t m = NULL;
++				if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++				    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++				    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++					struct ifnet_stat_increment_param stats = {};
++					memcpy(mbuf_data(m), buf, len);
++					mbuf_setlen(m, len);
++					mbuf_pkthdr_setlen(m, len);
++					void *frame_header = mbuf_data(m);
++					mbuf_pkthdr_setrcvif(m, eth.ifp);
++					mbuf_pkthdr_setheader(m, frame_header);
++					mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++					(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++					stats.packets_in = 1;
++					stats.bytes_in = len;
++					ifnet_input(eth.ifp, m, &stats);
++				} else if (m != NULL) {
++					mbuf_freem(m);
++				}
++			}
++		}
++		eth_rx_arm(i);
++		eth.rx_next = (i + 1) % RX_RING;
++		done++;
++	}
++	if (done) {
++		__builtin_arm_dsb(0xf);
++		wr32(eth.mac, DMA_CH0_RX_TAIL, eth.dma_pa + D_RXDESC + 16 * eth.rx_next);
++	}
++}
++
++static void
++eth_link_check(void)
++{
++	uint16_t bmsr = 0, anar = 0, anlpar = 0, gctl = 0, gsts = 0;
++	unsigned speed = 0;
++	bool full = false;
++	(void)mdio_read(eth.phy_addr, 1, &bmsr);
++	(void)mdio_read(eth.phy_addr, 1, &bmsr);                /* latched low */
++	(void)mdio_read(eth.phy_addr, 4, &anar);
++	(void)mdio_read(eth.phy_addr, 5, &anlpar);
++	(void)mdio_read(eth.phy_addr, 9, &gctl);
++	(void)mdio_read(eth.phy_addr, 10, &gsts);
++	bool up = (bmsr & (1u << 5)) && eth_phy_resolve(bmsr, anar, anlpar, gctl, gsts, &speed, &full);
++	if (up && (!eth.link || speed != eth.speed || full != eth.full)) {
++		eth.speed = speed;
++		eth.full = full;
++		eth_mac_link();
++		eth.link = true;
++		eth.dhcp_state = 0;
++		eth.dhcp_next_ms = eth_now_ms() + 500;
++		printf("A733 ETH: link up %u Mbit/s %s duplex\n", speed, full ? "full" : "half");
++		if (eth.ifp) {
++			ifnet_set_flags(eth.ifp, IFF_RUNNING, IFF_RUNNING);
++		}
++	} else if (!up && eth.link) {
++		eth.link = false;
++		eth.dhcp_state = 0;
++		printf("A733 ETH: link down (rx %llu tx %llu frames, %llu rx errors, %llu tx drops)\n",
++		    eth.rx_frames, eth.tx_frames, eth.rx_errors, eth.tx_drops);
++		if (eth.ifp) {
++			ifnet_set_flags(eth.ifp, 0, IFF_RUNNING);
++		}
++	}
++}
++
++static void
++eth_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	/* a733_power.c switches DC1SW1/DC1SW2 on from its PMIC thread. */
++	for (unsigned i = 0; i < 300 && a733_eth_power == 0; i++) {
++		eth_sleep_ms(100);
++	}
++	if (a733_eth_power <= 0) {
++		printf("A733 ETH: PHY power rails not confirmed (%d); trying anyway\n", a733_eth_power);
++	}
++	eth_hw_on();
++	eth_sleep_ms(200);                      /* PHY reference clock and power up */
++	if (eth_phy_init() != 0 || eth_dma_init() != 0) {
++		return;
++	}
++	eth_if_create();
++	uint64_t last_link = 0, last_stats = eth_now_ms();
++	for (;;) {
++		eth_sleep_ms(2);
++		uint64_t now = eth_now_ms();
++		if (now - last_link >= 500) {
++			last_link = now;
++			eth_link_check();
++		}
++		eth_rx_poll();
++		eth_dhcp_tick();
++		uint32_t st = rd32(eth.mac, DMA_CH0_STATUS);
++		if (st) {
++			wr32(eth.mac, DMA_CH0_STATUS, st);
++		}
++		if (now - last_stats >= 60000) {
++			last_stats = now;
++			printf("A733 ETH: rx %llu tx %llu frames, %llu rx errors, %llu tx drops, DMA status 0x%x\n",
++			    eth.rx_frames, eth.tx_frames, eth.rx_errors, eth.tx_drops, st);
++		}
++	}
++}
++
++/* Called from IOFindBSDRoot (once); the controller runs in its own thread. */
++void a733_eth_start(void);
++
++void
++a733_eth_start(void)
++{
++	DTEntry node;
++	uintptr_t const *mac = NULL, *syscon = NULL, *ccu = NULL, *pio = NULL, *sid = NULL, *dma = NULL;
++	uint32_t const *v32 = NULL;
++	unsigned int s = 0;
++	uint32_t on = 1, unit = 3;
++	thread_t thread;
++	static bool started;
++
++	PE_parse_boot_argn("a733eth", &on, sizeof(on));
++	if (started || !on || SecureDTLookupEntry(NULL, "/a733-eth", &node) != kSuccess) {
++		return;
++	}
++#define ETH_REG(name, var) \
++	if (SecureDTGetProperty(node, name, (void const **)&var, &s) != kSuccess || s < 2 * sizeof(uintptr_t)) { \
++	        printf("A733 ETH: /a733-eth has no %s\n", name); \
++	        return; \
++	}
++	ETH_REG("reg", mac);
++	ETH_REG("syscon-reg", syscon);
++	ETH_REG("ccu-reg", ccu);
++	ETH_REG("pio-reg", pio);
++	ETH_REG("sid-reg", sid);
++	ETH_REG("dma-reg", dma);
++#undef ETH_REG
++	if (dma[1] < ETH_DMA_SIZE || dma[0] + ETH_DMA_SIZE > 0x100000000ull || (dma[0] & 0xfff)) {
++		printf("A733 ETH: bad dma-reg window\n");
++		return;
++	}
++	eth.phy_addr = 1;
++	eth.tx_delay = 12;
++	eth.rx_delay = 10;
++	if (SecureDTGetProperty(node, "phy-addr", (void const **)&v32, &s) == kSuccess && s >= 4) {
++		eth.phy_addr = *v32 & 31;
++	}
++	if (SecureDTGetProperty(node, "tx-delay", (void const **)&v32, &s) == kSuccess && s >= 4) {
++		eth.tx_delay = *v32;
++	}
++	if (SecureDTGetProperty(node, "rx-delay", (void const **)&v32, &s) == kSuccess && s >= 4) {
++		eth.rx_delay = *v32;
++	}
++	PE_parse_boot_argn("a733eth_unit", &unit, sizeof(unit));
++	eth.unit = unit;
++	eth.mac = ml_io_map(mac[0], 0x8000);
++	eth.syscon = ml_io_map(syscon[0], 0x1000);
++	eth.ccu = ml_io_map(ccu[0], 0x2000);
++	eth.pio = ml_io_map(pio[0], 0x1000);
++	eth.sid = ml_io_map(sid[0], 0x1000);
++	eth.dma = ml_io_map_wcomb(dma[0], ETH_DMA_SIZE);        /* normal non-cacheable: memcpy is fine */
++	if (!eth.mac || !eth.syscon || !eth.ccu || !eth.pio || !eth.sid || !eth.dma) {
++		return;
++	}
++	started = true;
++	eth.dma_pa = (uint32_t)dma[0];
++	uint32_t id[4];
++	for (unsigned i = 0; i < 4; i++) {
++		id[i] = rd32(eth.sid, 0x200 + 4 * i);
++	}
++	eth_mac_from_chipid(id, eth.lladdr);
++	printf("A733 ETH: gmac0 at 0x%lx, DMA window 0x%x, PHY %u, delays tx %u rx %u\n", (unsigned long)mac[0],
++	    eth.dma_pa, eth.phy_addr, eth.tx_delay, eth.rx_delay);
++	if (kernel_thread_start(eth_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* !A733_ETH_HOST_TEST */
++#endif /* ARM64_BOARD_CONFIG_SWEET || A733_ETH_HOST_TEST */
+diff --git a/bsd/dev/a733_power.c b/bsd/dev/a733_power.c
+index bbd65c1..dd83bfa 100644
+--- a/bsd/dev/a733_power.c
++++ b/bsd/dev/a733_power.c
+@@ -389,6 +389,9 @@ cf_thermal_action(int mc)
+ #define AXP8191_IRQ_ST2         0x49
+ #define AXP8191_PRESS           (1u << 5)
+ #define AXP8191_RELEASE         (1u << 6)
++#define AXP8191_DCDC_CTL2       0x11
++#define AXP8191_DC1SW1          (1u << 3)
++#define AXP8191_DC1SW2          (1u << 4)
+ #define AXP515_ADDR             0x34
+ #define AXP515_INTEN4           0x43
+ #define AXP515_INTSTS4          0x4b
+@@ -405,6 +408,9 @@ static struct {
+ 	bool have[2];
+ } pw;
+ 
++/* Read by a733_eth.c: 1 the Ethernet rails are on, -1 they could not be switched. */
++volatile int a733_eth_power;
++
+ static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
+ static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
+ 
+@@ -879,6 +885,19 @@ pw_thread(__unused void *arg, __unused wait_result_t wr)
+ 		(void)twi_write(pk_chips[c].addr, pk_chips[c].st_reg, pk_chips[c].press | pk_chips[c].release);
+ 		printf("A733 POWER: %s power key IRQ enable 0x%02x -> 0x%02x\n", pk_chips[c].name, en, want);
+ 	}
++	/* Ethernet (a733_eth.c): DC1SW1 powers the PHY, DC1SW2 the PH pin bank (AXP8191 DCDC_CTL2). */
++	if (pw.have[0]) {
++		uint8_t ctl = 0;
++		int rc = twi_read(AXP8191_ADDR, AXP8191_DCDC_CTL2, &ctl);
++		uint8_t want = ctl | AXP8191_DC1SW1 | AXP8191_DC1SW2;
++		if (rc == 0 && want != ctl) {
++			rc = twi_write(AXP8191_ADDR, AXP8191_DCDC_CTL2, want);
++		}
++		printf("A733 POWER: Ethernet rails DC1SW1/DC1SW2: 0x%02x -> 0x%02x%s\n", ctl, want, rc ? " FAILED" : "");
++		a733_eth_power = rc ? -1 : 1;
++	} else {
++		a733_eth_power = -1;
++	}
+ 	if (!pw.have[0] && !pw.have[1]) {
+ 		printf("A733 POWER: no PMIC on R_TWI0; power button off\n");
+ 		return;
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index dd0fd5c..c032582 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -780,6 +780,9 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		/* Power button, PSCI power-off, CPU clock report (bsd/dev/a733_power.c). */
+ 		extern void a733_power_start(void);
+ 		a733_power_start();
++		/* gmac0 Ethernet, polled, kernel DHCP (bsd/dev/a733_eth.c). */
++		extern void a733_eth_start(void);
++		a733_eth_start();
+ 	}
+ 	{
+ 		uint32_t sdlog = 0;

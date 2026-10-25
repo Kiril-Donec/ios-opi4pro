@@ -42,6 +42,10 @@ on:
       - "a733/xnu-a733-iokit-report.patch"
       - "a733/xnu-a733-sched-bigpref.patch"
       - "a733/xnu-a733-no-iokitd.patch"
+      - "a733/xnu-a733-eth.patch"
+      - "a733/tests/test_eth_patch.py"
+      - "a733/tests/test_eth_logic.c"
+      - "a733/tests/eth_kernel_stubs.h"
       - "a733/tests/test_no_iokitd_patch.py"
       - "a733/tests/test_sched_bigpref_patch.py"
       - "a733/tests/test_sched_bigpref.c"
@@ -158,6 +162,8 @@ jobs:
           cp a733/xnu-a733-sched-bigpref.patch dxb/patches/9999u-a733-sched-bigpref.patch
           # No kernelmanagerd on iOS: do not hold the IOKit root busy for it.
           cp a733/xnu-a733-no-iokitd.patch dxb/patches/9999v-a733-no-iokitd.patch
+          # gmac0 Ethernet: polled DWMAC, PHY rails, BSD ifnet en3, kernel DHCP.
+          cp a733/xnu-a733-eth.patch dxb/patches/9999w-a733-eth.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -339,6 +345,10 @@ jobs:
           if b"a733iokitd" not in kernel:
               raise SystemExit("FAIL: A733 no-kernelmanagerd overlay was SKIPPED")
           print("PASS: A733 no-kernelmanagerd overlay found in compiled XNU Mach-O")
+          for m in (b"A733 ETH: DHCP ACK, lease %u s", b"A733 POWER: Ethernet rails DC1SW1/DC1SW2"):
+              if m not in kernel:
+                  raise SystemExit(f"FAIL: A733 Ethernet overlay was SKIPPED (missing {m!r})")
+          print("PASS: A733 Ethernet driver found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)

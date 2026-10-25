@@ -19,6 +19,26 @@ test_syscon(void)
 }
 
 static void
+test_yt8531(void)
+{
+	/* Linux motorcomm.c, 125 MHz from the PLL: enable bit 6 | 125M bit 4, source 0. */
+	CHECK(yt8531_clkout(0x0000, true) == 0x0050);
+	CHECK(yt8531_clkout(0x0000, false) == 0x0040);
+	/* Other bits kept, old source / rate cleared. */
+	CHECK(yt8531_clkout(0x810e, true) == 0x8150);
+	CHECK(yt8531_clkout(0xffff, false) == (0xffff & ~0x5eu) + 0x40u);
+	/* Variant 0 is the vendor setup; the test #17 setup is still in the list. */
+	CHECK(eth_variants[0].clk_ext && eth_variants[0].phy125 && eth_variants[0].tx_delay == -1);
+	bool saw_internal = false, saw_25m = false;
+	for (unsigned i = 0; i < ETH_VARIANTS; i++) {
+		saw_internal |= !eth_variants[i].clk_ext;
+		saw_25m |= !eth_variants[i].phy125;
+		CHECK(eth_variants[i].tx_delay >= -1 && eth_variants[i].tx_delay <= 31);
+	}
+	CHECK(saw_internal && saw_25m);
+}
+
+static void
 test_phy(void)
 {
 	unsigned speed = 0;
@@ -135,6 +155,7 @@ int
 main(void)
 {
 	test_syscon();
+	test_yt8531();
 	test_phy();
 	test_mac();
 	test_csum();

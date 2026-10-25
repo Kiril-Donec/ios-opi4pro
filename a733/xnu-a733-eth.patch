@@ -12,10 +12,10 @@ index 5f413e4..4d3ea20 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a733_eth.c b/bsd/dev/a733_eth.c
 new file mode 100644
-index 0000000..adab800
+index 0000000..27ef717
 --- /dev/null
 +++ b/bsd/dev/a733_eth.c
-@@ -0,0 +1,971 @@
+@@ -0,0 +1,1078 @@
 +/*
 + * Allwinner A733 / Orange Pi 4 Pro gigabit Ethernet (gmac0), first stage.
 + *
@@ -89,6 +89,49 @@ index 0000000..adab800
 +	v |= (rx_delay & 31u) << 5;             /* ERXDC */
 +	return v;
 +}
++
++/*
++ * Motorcomm YT8531 (id 4f51:e91b, the PHY on this board) SyncE / CLK_OUT,
++ * extended register 0xA012 (Linux drivers/net/phy/motorcomm.c): enable bit 6,
++ * 125 MHz select bit 4 (reset default 25 MHz), source bits 3:1 (0 = PLL 125M).
++ * With aw,rgmii-clk-ext the MAC takes its RGMII TX reference from that pin.
++ */
++#define YT8531_PHY_ID1          0x4f51
++#define YT8531_SYNCE_CFG        0xa012
++#define YT8531_SCR_ENABLE       (1u << 6)
++#define YT8531_SCR_125M         (1u << 4)
++#define YT8531_SCR_SRC_MASK     (7u << 1)
++
++static uint16_t
++yt8531_clkout(uint16_t old, bool m125)
++{
++	uint16_t v = (uint16_t)(old & ~(YT8531_SCR_ENABLE | YT8531_SCR_125M | YT8531_SCR_SRC_MASK));
++	v |= YT8531_SCR_ENABLE;                 /* source 0: PLL 125M */
++	if (m125) {
++		v |= YT8531_SCR_125M;
++	}
++	return v;
++}
++
++/*
++ * TX clocking variants tried in turn while DHCP gets no answer (board test #17:
++ * RX fine, nothing we sent was answered). 0 is the vendor Linux setup.
++ */
++struct eth_variant {
++	bool clk_ext;           /* syscon ETCS external (PHY CLK_OUT) or internal */
++	bool phy125;            /* PHY CLK_OUT 125 MHz (else 25 MHz) */
++	int tx_delay;           /* -1: board DT value */
++};
++
++static const struct eth_variant eth_variants[] = {
++	{ true, true, -1 },
++	{ false, true, -1 },
++	{ true, true, 0 },
++	{ false, true, 0 },
++	{ true, false, -1 },    /* the test #17 setup, for comparison */
++};
++#define ETH_VARIANTS            (sizeof(eth_variants) / sizeof(eth_variants[0]))
++#define ETH_VARIANT_TRIES       6       /* DISCOVERs (3 s apart) before the next variant */
 +
 +/* Clause 22: link speed/duplex from BMSR, ANAR, ANLPAR, 1000BASE-T control/status. */
 +static bool
@@ -366,6 +409,8 @@ index 0000000..adab800
 +	vm_offset_t mac, syscon, ccu, pio, sid, dma;
 +	uint32_t dma_pa;
 +	uint32_t phy_addr, tx_delay, rx_delay;
++	uint16_t phy_id1;
++	unsigned variant, variant_tries;
 +	uint8_t lladdr[6];
 +	bool link;
 +	unsigned speed;
@@ -439,6 +484,49 @@ index 0000000..adab800
 +	return mdio_wait();
 +}
 +
++/* Motorcomm extended registers: address to 0x1e, data through 0x1f. */
++static int
++phy_ext_read(uint16_t reg, uint16_t *val)
++{
++	int err = mdio_write(eth.phy_addr, 0x1e, reg);
++	return err ? err : mdio_read(eth.phy_addr, 0x1f, val);
++}
++
++static int
++phy_ext_write(uint16_t reg, uint16_t val)
++{
++	int err = mdio_write(eth.phy_addr, 0x1e, reg);
++	return err ? err : mdio_write(eth.phy_addr, 0x1f, val);
++}
++
++/* MMC counters (Linux mmc_core.c offsets, DWMAC4 block at 0x700). */
++static void
++eth_mmc_report(const char *why)
++{
++	printf("A733 ETH: %s: MAC counters tx %u frames (%u good, %u bcast), underflow %u, carrier %u; "
++	    "rx %u frames, %u CRC errors\n", why,
++	    rd32(eth.mac, 0x718), rd32(eth.mac, 0x768), rd32(eth.mac, 0x71c), rd32(eth.mac, 0x748),
++	    rd32(eth.mac, 0x760), rd32(eth.mac, 0x780), rd32(eth.mac, 0x794));
++}
++
++/* Apply TX clocking variant n: syscon clock source / TX delay and the YT8531 CLK_OUT. */
++static void
++eth_apply_variant(unsigned n)
++{
++	const struct eth_variant *v = &eth_variants[n % ETH_VARIANTS];
++	uint32_t txd = v->tx_delay < 0 ? eth.tx_delay : (uint32_t)v->tx_delay;
++	uint16_t old = 0, now = 0;
++	eth.variant = n % ETH_VARIANTS;
++	if (eth.phy_id1 == YT8531_PHY_ID1 && phy_ext_read(YT8531_SYNCE_CFG, &old) == 0) {
++		(void)phy_ext_write(YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125));
++		(void)phy_ext_read(YT8531_SYNCE_CFG, &now);
++	}
++	wr32(eth.syscon, 0, eth_syscon(txd, eth.rx_delay, v->clk_ext));
++	printf("A733 ETH: TX clock variant %u: %s clock, PHY CLK_OUT %s (0x%04x -> 0x%04x), tx delay %u, syscon 0x%08x\n",
++	    eth.variant, v->clk_ext ? "external" : "internal", v->phy125 ? "125 MHz" : "25 MHz", old, now, txd,
++	    rd32(eth.syscon, 0));
++}
++
 +static void
 +eth_hw_on(void)
 +{
@@ -485,7 +573,16 @@ index 0000000..adab800
 +	printf("A733 ETH: no PHY answers on MDIO (last id %04x:%04x)\n", id1, id2);
 +	return ENXIO;
 +found:
-+	printf("A733 ETH: PHY at MDIO %u, id %04x:%04x\n", eth.phy_addr, id1, id2);
++	printf("A733 ETH: PHY at MDIO %u, id %04x:%04x%s\n", eth.phy_addr, id1, id2,
++	    id1 == YT8531_PHY_ID1 ? " (Motorcomm YT8531)" : "");
++	eth.phy_id1 = id1;
++	if (id1 == YT8531_PHY_ID1) {
++		uint16_t c1 = 0, r1 = 0, sc = 0;
++		(void)phy_ext_read(0xa001, &c1);
++		(void)phy_ext_read(0xa003, &r1);
++		(void)phy_ext_read(YT8531_SYNCE_CFG, &sc);
++		printf("A733 ETH: YT8531 chip config 0x%04x, RGMII config 0x%04x, SyncE 0x%04x\n", c1, r1, sc);
++	}
 +	(void)mdio_write(eth.phy_addr, 0, 1u << 15);            /* BMCR reset */
 +	for (unsigned i = 0; i < 100; i++) {
 +		uint16_t bmcr;
@@ -494,6 +591,7 @@ index 0000000..adab800
 +			break;
 +		}
 +	}
++	eth_apply_variant(0);
 +	(void)mdio_write(eth.phy_addr, 4, 0x01e1);              /* 10/100 half/full, IEEE 802.3 */
 +	(void)mdio_write(eth.phy_addr, 9, 0x0300);              /* 1000 half/full */
 +	(void)mdio_write(eth.phy_addr, 0, (1u << 12) | (1u << 9));      /* autoneg on + restart */
@@ -749,6 +847,12 @@ index 0000000..adab800
 +	if (!eth.link || eth.dhcp_state == 3 || now < eth.dhcp_next_ms) {
 +		return;
 +	}
++	if (eth.dhcp_state == 1 && eth.dhcp_tries > 0 && eth.dhcp_tries % ETH_VARIANT_TRIES == 0) {
++		char why[48];
++		snprintf(why, sizeof(why), "no DHCP answer with variant %u", eth.variant);
++		eth_mmc_report(why);
++		eth_apply_variant(eth.variant + 1);
++	}
 +	if (eth.dhcp_state == 0 || (eth.dhcp_state == 2 && eth.dhcp_tries >= 4)) {
 +		eth.dhcp_state = 1;
 +		eth.dhcp_tries = 0;
@@ -772,6 +876,7 @@ index 0000000..adab800
 +		eth.dhcp_state = 2;
 +		eth.dhcp_tries = 0;
 +		eth.dhcp_next_ms = 0;
++		printf("A733 ETH: DHCP OFFER with TX clock variant %u\n", eth.variant);
 +		printf("A733 ETH: DHCP OFFER %u.%u.%u.%u from %u.%u.%u.%u\n", r.yiaddr >> 24, (r.yiaddr >> 16) & 255,
 +		    (r.yiaddr >> 8) & 255, r.yiaddr & 255, r.server >> 24, (r.server >> 16) & 255,
 +		    (r.server >> 8) & 255, r.server & 255);
@@ -862,7 +967,8 @@ index 0000000..adab800
 +		eth.link = true;
 +		eth.dhcp_state = 0;
 +		eth.dhcp_next_ms = eth_now_ms() + 500;
-+		printf("A733 ETH: link up %u Mbit/s %s duplex\n", speed, full ? "full" : "half");
++		printf("A733 ETH: link up %u Mbit/s %s duplex (partner 0x%04x, 1000BASE-T status 0x%04x)\n", speed,
++		    full ? "full" : "half", anlpar, gsts);
 +		if (eth.ifp) {
 +			ifnet_set_flags(eth.ifp, IFF_RUNNING, IFF_RUNNING);
 +		}
@@ -911,6 +1017,7 @@ index 0000000..adab800
 +			last_stats = now;
 +			printf("A733 ETH: rx %llu tx %llu frames, %llu rx errors, %llu tx drops, DMA status 0x%x\n",
 +			    eth.rx_frames, eth.tx_frames, eth.rx_errors, eth.tx_drops, st);
++			eth_mmc_report("minute");
 +		}
 +	}
 +}

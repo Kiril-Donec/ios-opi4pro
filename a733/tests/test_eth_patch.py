@@ -58,6 +58,16 @@ class EthPatch(unittest.TestCase):
         self.assertIn("extern volatile int a733_eth_power;", self.eth)
         self.assertIn('PE_parse_boot_argn("a733eth", &on, sizeof(on));', self.eth)
 
+    def test_yt8531_clkout(self) -> None:
+        # Board test #17: PHY 4f51:e91b (Motorcomm YT8531), RX fine, TX unanswered; CLK_OUT 125 MHz.
+        self.assertRegex(self.code, r"#define YT8531_PHY_ID1\s+0x4f51")
+        self.assertRegex(self.code, r"#define YT8531_SYNCE_CFG\s+0xa012")
+        self.assertIn("eth_apply_variant(0);\n\t(void)mdio_write(eth.phy_addr, 4, 0x01e1);", self.eth)
+        # Extended registers only for the YT8531, and only 0xA012 is written.
+        self.assertEqual(re.findall(r"\(void\)phy_ext_write\(([^;]*)\);", self.code),
+                         ["YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125)"])
+        self.assertIn("if (eth.phy_id1 == YT8531_PHY_ID1 && phy_ext_read(YT8531_SYNCE_CFG, &old) == 0) {", self.eth)
+
     def test_power_rails(self) -> None:
         power = "\n".join(l[1:] for l in self.sections["bsd/dev/a733_power.c"] if l.startswith("+"))
         self.assertRegex(power, r"#define AXP8191_DCDC_CTL2\s+0x11\b")
@@ -89,7 +99,7 @@ class EthPatch(unittest.TestCase):
         # SID is read only; syscon gets the computed value.
         self.assertNotIn("wr32(eth.sid", code)
         self.assertEqual(re.findall(r"wr32\(eth\.syscon, ([^;]*)\);", code),
-                         ["0, eth_syscon(eth.tx_delay, eth.rx_delay, true)"])
+                         ["0, eth_syscon(txd, eth.rx_delay, v->clk_ext)", "0, eth_syscon(eth.tx_delay, eth.rx_delay, true)"])
         # The DMA window must sit below 4 GiB (32-bit descriptors) and be page aligned.
         self.assertIn("dma[0] + ETH_DMA_SIZE > 0x100000000ull || (dma[0] & 0xfff)", code)
         self.assertIn("eth.dma = ml_io_map_wcomb(dma[0], ETH_DMA_SIZE);", code)

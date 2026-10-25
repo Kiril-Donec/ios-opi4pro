@@ -426,3 +426,13 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   reproduces its 2cpu payload 556d160d... byte for byte, ADT with `--eth`, image 642c8710...ff3b,
   read-back verified; v13 (369b666f...) saved. Test #17: About page, and `A733 ETH:` lines (rails,
   PHY id, link, DHCP OFFER/ACK, address) with the router cable plugged in before power-on.
+- **Board test #17 (v14) card log:** 9999v works: `A733 IOKIT: 60 s / 180 s after boot: 0 of 132 / 160
+  services busy, IOKit is quiet`; no panic; triple-press shutdown clean. Ethernet: rails 0x17 -> 0x1f,
+  clocks/syscon 0x11145 as planned, MAC version 0x2053 (5.20), FIFOs rx 8192 / tx 4096, **PHY id
+  4f51:e91b = Motorcomm YT8531** (not JLSemi), link 100 Mbit/s full, RX 352 frames / 0 errors, TX
+  descriptors complete (0 drops) but 200 DHCP DISCOVERs never answered. Likely cause: with
+  `aw,rgmii-clk-ext` the MAC's RGMII TX reference is the PHY CLK_OUT, which on the YT8531 resets to
+  25 MHz (Linux motorcomm.c sets 125 MHz from ext reg 0xA012). **9999w v2:** CLK_OUT 125 MHz (PLL)
+  before autoneg, YT8531 ext regs 0xA001/0xA003/0xA012 logged, MAC MMC counters logged, and while
+  DISCOVERs stay unanswered the driver rotates TX clock variants every 6 tries (ext/int clock, tx delay
+  DT/0, the old 25 MHz setup last), logging which variant got the OFFER.

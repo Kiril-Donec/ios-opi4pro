@@ -442,3 +442,13 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   (commit 53ce4ed, build + packaging success), CI ADT reproduces its 2cpu payload 9a39d0f4... byte for
   byte, ADT with `--eth`, image 7b9a7007...f64a, read-back verified; v14 (642c8710...) saved. Test #18:
   `A733 ETH: TX clock variant` / `DHCP OFFER with TX clock variant` lines, router cable in before power-on.
+- **Board test #18 (v15) card log:** YT8531 straps: chip config 0x8120 (RXC_DLY_EN on), RGMII config
+  0x00f1, SyncE 0x00c8; CLK_OUT 125 MHz took (0x00d0). With the PHY delays off (mainline behaviour) RX
+  broke: MAC MMC rx 116 frames / 64 CRC errors, none delivered. All five TX clock variants (ext/int,
+  tx delay 12/0, CLK_OUT 25/125 MHz) sent good frames per the MAC counters (no underflow/carrier
+  errors) and none got a DHCP answer. Link 100 Mbit/s (partner 0x41e1, no 1000BASE-T).
+  **9999w v4:** PHY delays back to the straps; before autonegotiation the driver puts the PHY in
+  loopback (BMCR bit 14, forced 100 and 1000 Mbit/s) and sweeps the syscon delay chains (tx 0..31 x
+  rx 0..31, 11 x 11 points) for the external and internal TX clock, 4 test frames per point
+  (EtherType 0x88b5); per-speed best = passing point farthest from any failure, applied on link up.
+  The log prints the grids (`#` all back, `+` some, `x` CRC errors only, `.` nothing).

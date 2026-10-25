@@ -62,12 +62,11 @@ class EthPatch(unittest.TestCase):
         # Board test #17: PHY 4f51:e91b (Motorcomm YT8531), RX fine, TX unanswered; CLK_OUT 125 MHz.
         self.assertRegex(self.code, r"#define YT8531_PHY_ID1\s+0x4f51")
         self.assertRegex(self.code, r"#define YT8531_SYNCE_CFG\s+0xa012")
-        self.assertIn("eth_apply_variant(0);\n\t(void)mdio_write(eth.phy_addr, 4, 0x01e1);", self.eth)
-        # YT8531 extended registers: delays off (0xA001/0xA003, motorcomm.c "rgmii") and CLK_OUT (0xA012).
-        self.assertCountEqual(re.findall(r"\(void\)phy_ext_write\(([^;]*)\);", self.code),
-                         ["YT8531_CHIP_CONFIG, (uint16_t)(c1 & ~YT8531_CCR_RXC_DLY_EN)",
-                          "YT8531_RGMII_CONFIG1,\n\t\t    (uint16_t)(r1 & ~(YT8531_RC1R_RX_DELAY | YT8531_RC1R_GE_TX_DELAY))",
-                          "YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125)"])
+        self.assertIn("eth.clk_ext = true;\n\teth_apply_variant(0);", self.eth)
+        # YT8531 extended registers: only CLK_OUT (0xA012). Test #18: turning the PHY delays off
+        # (mainline motorcomm.c for "rgmii") broke RX, so they stay as strapped.
+        self.assertEqual(re.findall(r"\(void\)phy_ext_write\(([^;]*)\);", self.code),
+                         ["YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125)"])
         self.assertIn("if (eth.phy_id1 == YT8531_PHY_ID1 && phy_ext_read(YT8531_SYNCE_CFG, &old) == 0) {", self.eth)
 
     def test_power_rails(self) -> None:
@@ -100,8 +99,15 @@ class EthPatch(unittest.TestCase):
             self.assertRegex(code, rf"#define PIO_PH_{name}\s+{off}\b")
         # SID is read only; syscon gets the computed value.
         self.assertNotIn("wr32(eth.sid", code)
-        self.assertEqual(re.findall(r"wr32\(eth\.syscon, ([^;]*)\);", code),
-                         ["0, eth_syscon(txd, eth.rx_delay, v->clk_ext)", "0, eth_syscon(eth.tx_delay, eth.rx_delay, true)"])
+        writes = re.findall(r"wr32\(eth\.syscon, ([^;]*)\);", code)
+        self.assertGreaterEqual(len(writes), 4)
+        for w in writes:
+            self.assertRegex(w, r"^0, eth_syscon\([^()]*\)$")
+        # Calibration: PHY loopback with forced speed, autonegotiation only afterwards.
+        self.assertIn("(void)mdio_write(eth.phy_addr, 0, (1u << 14) | (1u << 8) | (k ? (1u << 6) : (1u << 13)));",
+                      code)
+        self.assertIn("\teth_calibrate();\n\teth_if_create();", code)
+        self.assertIn("eth_mmc_report(\"after loopback calibration\");\n\teth.link = false;", code)
         # The DMA window must sit below 4 GiB (32-bit descriptors) and be page aligned.
         self.assertIn("dma[0] + ETH_DMA_SIZE > 0x100000000ull || (dma[0] & 0xfff)", code)
         self.assertIn("eth.dma = ml_io_map_wcomb(dma[0], ETH_DMA_SIZE);", code)

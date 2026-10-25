@@ -12,10 +12,10 @@ index 5f413e4..4d3ea20 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a733_eth.c b/bsd/dev/a733_eth.c
 new file mode 100644
-index 0000000..cd5dd2e
+index 0000000..86ff47c
 --- /dev/null
 +++ b/bsd/dev/a733_eth.c
-@@ -0,0 +1,1093 @@
+@@ -0,0 +1,1284 @@
 +/*
 + * Allwinner A733 / Orange Pi 4 Pro gigabit Ethernet (gmac0), first stage.
 + *
@@ -101,11 +101,6 @@ index 0000000..cd5dd2e
 +#define YT8531_SCR_ENABLE       (1u << 6)
 +#define YT8531_SCR_125M         (1u << 4)
 +#define YT8531_SCR_SRC_MASK     (7u << 1)
-+#define YT8531_CHIP_CONFIG      0xa001
-+#define YT8531_CCR_RXC_DLY_EN   (1u << 8)
-+#define YT8531_RGMII_CONFIG1    0xa003
-+#define YT8531_RC1R_RX_DELAY    (0xfu << 10)
-+#define YT8531_RC1R_GE_TX_DELAY 0xfu
 +
 +static uint16_t
 +yt8531_clkout(uint16_t old, bool m125)
@@ -137,6 +132,59 @@ index 0000000..cd5dd2e
 +};
 +#define ETH_VARIANTS            (sizeof(eth_variants) / sizeof(eth_variants[0]))
 +#define ETH_VARIANT_TRIES       6       /* DISCOVERs (3 s apart) before the next variant */
++
++/*
++ * RGMII delay calibration through PHY loopback (board test #18: with the PHY
++ * RX delay off RX had ~55 % CRC errors at 100 Mbit/s, and no TX setting got a
++ * DHCP answer). Every (TX delay, RX delay) point of the syscon delay chains
++ * sends LB_FRAMES frames that the PHY loops back; the point used is the passing
++ * one farthest from any failing point.
++ */
++#define LB_FRAMES               4
++static const uint8_t lb_txd[] = { 0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 31 };
++static const uint8_t lb_rxd[] = { 0, 3, 6, 10, 13, 16, 19, 22, 25, 28, 31 };
++#define LB_NT                   (sizeof(lb_txd) / sizeof(lb_txd[0]))
++#define LB_NR                   (sizeof(lb_rxd) / sizeof(lb_rxd[0]))
++
++/* score[t][r] = frames back intact; picks the passing cell with the largest Chebyshev distance to a failure. */
++static bool
++lb_pick(const uint8_t score[LB_NT][LB_NR], unsigned *bt, unsigned *br)
++{
++	int best = -1;
++	unsigned best_c = 0;
++	for (unsigned t = 0; t < LB_NT; t++) {
++		for (unsigned r = 0; r < LB_NR; r++) {
++			if (score[t][r] != LB_FRAMES) {
++				continue;
++			}
++			int d = 1000;
++			for (unsigned t2 = 0; t2 < LB_NT; t2++) {
++				for (unsigned r2 = 0; r2 < LB_NR; r2++) {
++					if (score[t2][r2] == LB_FRAMES) {
++						continue;
++					}
++					int dt = (int)t2 - (int)t, dr = (int)r2 - (int)r;
++					dt = dt < 0 ? -dt : dt;
++					dr = dr < 0 ? -dr : dr;
++					int c = dt > dr ? dt : dr;
++					if (c < d) {
++						d = c;
++					}
++				}
++			}
++			/* ties: closer to the middle of the grid */
++			int mt = 2 * (int)t - (int)(LB_NT - 1), mr = 2 * (int)r - (int)(LB_NR - 1);
++			unsigned centre = (unsigned)(mt * mt + mr * mr);
++			if (d > best || (d == best && centre < best_c)) {
++				best = d;
++				best_c = centre;
++				*bt = t;
++				*br = r;
++			}
++		}
++	}
++	return best >= 0;
++}
 +
 +/* Clause 22: link speed/duplex from BMSR, ANAR, ANLPAR, 1000BASE-T control/status. */
 +static bool
@@ -416,6 +464,12 @@ index 0000000..cd5dd2e
 +	uint32_t phy_addr, tx_delay, rx_delay;
 +	uint16_t phy_id1;
 +	unsigned variant, variant_tries;
++	bool clk_ext;
++	struct {
++		bool ok, clk_ext;
++		uint32_t txd, rxd;
++	} lb[2];                        /* calibrated delays: [0] 10/100, [1] 1000 Mbit/s */
++	uint32_t lb_seq;
 +	uint8_t lladdr[6];
 +	bool link;
 +	unsigned speed;
@@ -520,25 +574,27 @@ index 0000000..cd5dd2e
 +{
 +	const struct eth_variant *v = &eth_variants[n % ETH_VARIANTS];
 +	uint32_t txd = v->tx_delay < 0 ? eth.tx_delay : (uint32_t)v->tx_delay;
++	bool clk_ext = n % ETH_VARIANTS == 0 ? eth.clk_ext : v->clk_ext;
 +	uint16_t old = 0, now = 0;
 +	eth.variant = n % ETH_VARIANTS;
 +	if (eth.phy_id1 == YT8531_PHY_ID1 && phy_ext_read(YT8531_SYNCE_CFG, &old) == 0) {
 +		(void)phy_ext_write(YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125));
 +		(void)phy_ext_read(YT8531_SYNCE_CFG, &now);
 +	}
-+	wr32(eth.syscon, 0, eth_syscon(txd, eth.rx_delay, v->clk_ext));
-+	printf("A733 ETH: TX clock variant %u: %s clock, PHY CLK_OUT %s (0x%04x -> 0x%04x), tx delay %u, syscon 0x%08x\n",
-+	    eth.variant, v->clk_ext ? "external" : "internal", v->phy125 ? "125 MHz" : "25 MHz", old, now, txd,
-+	    rd32(eth.syscon, 0));
++	wr32(eth.syscon, 0, eth_syscon(txd, eth.rx_delay, clk_ext));
++	printf("A733 ETH: TX clock variant %u: %s clock, PHY CLK_OUT %s (0x%04x -> 0x%04x), tx delay %u, rx delay %u, "
++	    "syscon 0x%08x\n", eth.variant, clk_ext ? "external" : "internal", v->phy125 ? "125 MHz" : "25 MHz", old,
++	    now, txd, eth.rx_delay, rd32(eth.syscon, 0));
 +}
 +
 +static void
 +eth_hw_on(void)
 +{
-+	printf("A733 ETH: before: CCU bgr 0x%08x phyclk 0x%08x ptp 0x%08x mbus 0x%08x, PH cfg 0x%08x 0x%08x, syscon 0x%08x\n",
++	printf("A733 ETH: before: CCU bgr 0x%08x phyclk 0x%08x ptp 0x%08x mbus 0x%08x, PH cfg 0x%08x 0x%08x, syscon 0x%08x, "
++	    "PIO power mode sel 0x%08x val 0x%08x\n",
 +	    rd32(eth.ccu, CCU_GMAC0_BGR), rd32(eth.ccu, CCU_GMAC0_PHY), rd32(eth.ccu, CCU_GMAC_PTP),
 +	    rd32(eth.ccu, CCU_MBUS_GATE), rd32(eth.pio, PIO_PH_CFG0), rd32(eth.pio, PIO_PH_CFG1),
-+	    rd32(eth.syscon, 0));
++	    rd32(eth.syscon, 0), rd32(eth.pio, 0x40), rd32(eth.pio, 0x48));
 +	/* Pins PH0-PH15: function 5 (rgmii0), drive 1, pull-up (board DT gmac0_pins_default). */
 +	wr32(eth.pio, PIO_PH_CFG0, 0x55555555);
 +	wr32(eth.pio, PIO_PH_CFG1, 0x55555555);
@@ -586,17 +642,13 @@ index 0000000..cd5dd2e
 +		(void)phy_ext_read(0xa001, &c1);
 +		(void)phy_ext_read(0xa003, &r1);
 +		(void)phy_ext_read(YT8531_SYNCE_CFG, &sc);
-+		printf("A733 ETH: YT8531 chip config 0x%04x, RGMII config 0x%04x, SyncE 0x%04x\n", c1, r1, sc);
 +		/*
-+		 * phy-mode "rgmii" (board DT): the MAC delay chains add the skew, so the PHY adds none
-+		 * (motorcomm.c ytphy_rgmii_clk_delay_config: RXC_DLY_EN off, RX / GE TX delay 0).
++		 * The PHY's own RGMII delays stay as strapped: mainline motorcomm.c turns them off for
++		 * phy-mode "rgmii", but on this board that gave RX CRC errors (test #18); the vendor
++		 * driver evidently keeps them. The MAC delay chains are calibrated by loopback instead.
 +		 */
-+		(void)phy_ext_write(YT8531_CHIP_CONFIG, (uint16_t)(c1 & ~YT8531_CCR_RXC_DLY_EN));
-+		(void)phy_ext_write(YT8531_RGMII_CONFIG1,
-+		    (uint16_t)(r1 & ~(YT8531_RC1R_RX_DELAY | YT8531_RC1R_GE_TX_DELAY)));
-+		(void)phy_ext_read(0xa001, &c1);
-+		(void)phy_ext_read(0xa003, &r1);
-+		printf("A733 ETH: YT8531 internal RGMII delays off: chip config 0x%04x, RGMII config 0x%04x\n", c1, r1);
++		printf("A733 ETH: YT8531 chip config 0x%04x, RGMII config 0x%04x, SyncE 0x%04x (delays as strapped)\n",
++		    c1, r1, sc);
 +	}
 +	(void)mdio_write(eth.phy_addr, 0, 1u << 15);            /* BMCR reset */
 +	for (unsigned i = 0; i < 100; i++) {
@@ -606,11 +658,17 @@ index 0000000..cd5dd2e
 +			break;
 +		}
 +	}
-+	eth_apply_variant(0);
++	eth.clk_ext = true;
++	eth_apply_variant(0);                   /* CLK_OUT 125 MHz before anything is clocked from it */
++	return 0;
++}
++
++static void
++eth_autoneg(void)
++{
 +	(void)mdio_write(eth.phy_addr, 4, 0x01e1);              /* 10/100 half/full, IEEE 802.3 */
 +	(void)mdio_write(eth.phy_addr, 9, 0x0300);              /* 1000 half/full */
 +	(void)mdio_write(eth.phy_addr, 0, (1u << 12) | (1u << 9));      /* autoneg on + restart */
-+	return 0;
 +}
 +
 +static void
@@ -682,6 +740,13 @@ index 0000000..cd5dd2e
 +static void
 +eth_mac_link(void)
 +{
++	unsigned k = eth.speed == 1000;
++	if (eth.lb[k].ok) {
++		eth.clk_ext = eth.lb[k].clk_ext;
++		eth.tx_delay = eth.lb[k].txd;
++		eth.rx_delay = eth.lb[k].rxd;
++		wr32(eth.syscon, 0, eth_syscon(eth.tx_delay, eth.rx_delay, eth.clk_ext));
++	}
 +	uint32_t cfg = rd32(eth.mac, MAC_CONFIG) & ~(CFG_PS | CFG_FES | CFG_DM);
 +	if (eth.speed == 100) {
 +		cfg |= CFG_PS | CFG_FES;
@@ -862,7 +927,8 @@ index 0000000..cd5dd2e
 +	if (!eth.link || eth.dhcp_state == 3 || now < eth.dhcp_next_ms) {
 +		return;
 +	}
-+	if (eth.dhcp_state == 1 && eth.dhcp_tries > 0 && eth.dhcp_tries % ETH_VARIANT_TRIES == 0) {
++	if (eth.dhcp_state == 1 && eth.dhcp_tries > 0 && eth.dhcp_tries % ETH_VARIANT_TRIES == 0 &&
++	    !eth.lb[eth.speed == 1000].ok) {
 +		char why[48];
 +		snprintf(why, sizeof(why), "no DHCP answer with variant %u", eth.variant);
 +		eth_mmc_report(why);
@@ -998,6 +1064,130 @@ index 0000000..cd5dd2e
 +	}
 +}
 +
++/* Discard everything the RX ring holds; with a buffer, count intact copies of loopback sequence seq. */
++static unsigned
++eth_lb_collect(uint32_t seq)
++{
++	unsigned good = 0;
++	for (unsigned n = 0; n < RX_RING; n++) {
++		unsigned i = eth.rx_next;
++		uint32_t d = D_RXDESC + 16 * i, des3 = rd32(eth.dma, d + 12);
++		if (des3 & RDES3_OWN) {
++			break;
++		}
++		unsigned len = des3 & 0x7fff;
++		const uint8_t *b = (const uint8_t *)(eth.dma + D_RXBUF + BUF_SIZE * i);
++		if ((des3 & (RDES3_FD | RDES3_LD | RDES3_ES)) == (RDES3_FD | RDES3_LD) && len >= 96 &&
++		    b[12] == 0x88 && b[13] == 0xb5 && get32(b + 14) == 0x41373333 && get32(b + 18) == seq) {
++			bool ok = true;
++			for (unsigned j = 24; j < 96; j++) {
++				ok &= b[j] == (uint8_t)(j * 7 + b[22]);
++			}
++			good += ok;
++		}
++		eth_rx_arm(i);
++		eth.rx_next = (i + 1) % RX_RING;
++	}
++	__builtin_arm_dsb(0xf);
++	wr32(eth.mac, DMA_CH0_RX_TAIL, eth.dma_pa + D_RXDESC + 16 * eth.rx_next);
++	return good;
++}
++
++static unsigned
++eth_lb_trial(bool clk_ext, uint32_t txd, uint32_t rxd, uint32_t *crc)
++{
++	static uint8_t f[96];
++	uint32_t seq = ++eth.lb_seq;
++	wr32(eth.syscon, 0, eth_syscon(txd, rxd, clk_ext));
++	delay(200);
++	(void)eth_lb_collect(0);
++	uint32_t crc0 = rd32(eth.mac, 0x794);
++	for (unsigned k = 0; k < LB_FRAMES; k++) {
++		memset(f, 0xff, 6);
++		memcpy(f + 6, eth.lladdr, 6);
++		f[12] = 0x88;                   /* local experimental EtherType */
++		f[13] = 0xb5;
++		put32(f + 14, 0x41373333);      /* "A733" */
++		put32(f + 18, seq);
++		f[22] = (uint8_t)k;
++		f[23] = 0;
++		for (unsigned j = 24; j < 96; j++) {
++			f[j] = (uint8_t)(j * 7 + k);
++		}
++		(void)eth_tx_frame_locked(f, sizeof(f), NULL);
++	}
++	delay(2000);
++	unsigned good = eth_lb_collect(seq);
++	*crc = rd32(eth.mac, 0x794) - crc0;
++	return good;
++}
++
++static void
++eth_calibrate(void)
++{
++	static const unsigned speeds[2] = { 100, 1000 };
++	static uint8_t score[LB_NT][LB_NR];
++	eth.link = true;                        /* eth_tx_frame_locked sends only with a link */
++	eth.full = true;
++	for (unsigned k = 0; k < 2; k++) {
++		eth.speed = speeds[k];
++		eth.lb[k].ok = false;
++		eth_mac_link();
++		/* PHY loopback: forced speed, full duplex, no autonegotiation. */
++		(void)mdio_write(eth.phy_addr, 0, (1u << 14) | (1u << 8) | (k ? (1u << 6) : (1u << 13)));
++		eth_sleep_ms(100);
++		unsigned best_d = 0;
++		for (unsigned c = 0; c < 2; c++) {
++			bool clk_ext = c == 0;
++			uint32_t crc_total = 0;
++			unsigned pass = 0;
++			for (unsigned t = 0; t < LB_NT; t++) {
++				char row[LB_NR + 1];
++				for (unsigned r = 0; r < LB_NR; r++) {
++					uint32_t crc = 0;
++					score[t][r] = (uint8_t)eth_lb_trial(clk_ext, lb_txd[t], lb_rxd[r], &crc);
++					crc_total += crc;
++					pass += score[t][r] == LB_FRAMES;
++					row[r] = score[t][r] == LB_FRAMES ? '#' : score[t][r] ? '+' : crc ? 'x' : '.';
++				}
++				row[LB_NR] = 0;
++				printf("A733 ETH: loop %4u %s tx %2u: rx 0..31 [%s]\n", speeds[k], clk_ext ? "ext" : "int",
++				    lb_txd[t], row);
++			}
++			unsigned bt = 0, br = 0;
++			bool ok = lb_pick(score, &bt, &br);
++			printf("A733 ETH: loop %u Mbit/s %s clock: %u of %u points pass, %u CRC errors%s", speeds[k],
++			    clk_ext ? "external" : "internal", pass, (unsigned)(LB_NT * LB_NR), crc_total,
++			    ok ? "" : ", no usable point\n");
++			if (ok) {
++				printf(", best tx %u rx %u\n", lb_txd[bt], lb_rxd[br]);
++				/* External (vendor) clock first; internal only if it has a wider window. */
++				unsigned d = pass;
++				if (!eth.lb[k].ok || d > best_d) {
++					best_d = d;
++					eth.lb[k].ok = true;
++					eth.lb[k].clk_ext = clk_ext;
++					eth.lb[k].txd = lb_txd[bt];
++					eth.lb[k].rxd = lb_rxd[br];
++				}
++			}
++		}
++		if (eth.lb[k].ok) {
++			printf("A733 ETH: %u Mbit/s uses %s clock, tx delay %u, rx delay %u\n", speeds[k],
++			    eth.lb[k].clk_ext ? "external" : "internal", eth.lb[k].txd, eth.lb[k].rxd);
++		} else {
++			printf("A733 ETH: %u Mbit/s: loopback found nothing, keeping DT delays tx %u rx %u\n",
++			    speeds[k], eth.tx_delay, eth.rx_delay);
++		}
++	}
++	eth_mmc_report("after loopback calibration");
++	eth.link = false;
++	if (!eth.lb[0].ok) {
++		wr32(eth.syscon, 0, eth_syscon(eth.tx_delay, eth.rx_delay, eth.clk_ext));
++	}
++	eth_autoneg();
++}
++
 +static void
 +eth_thread(__unused void *arg, __unused wait_result_t wr)
 +{
@@ -1013,6 +1203,7 @@ index 0000000..cd5dd2e
 +	if (eth_phy_init() != 0 || eth_dma_init() != 0) {
 +		return;
 +	}
++	eth_calibrate();
 +	eth_if_create();
 +	uint64_t last_link = 0, last_stats = eth_now_ms();
 +	for (;;) {

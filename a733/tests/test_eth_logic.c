@@ -39,6 +39,31 @@ test_yt8531(void)
 }
 
 static void
+test_lb_pick(void)
+{
+	static uint8_t g[LB_NT][LB_NR];
+	unsigned t = 99, r = 99;
+	memset(g, 0, sizeof(g));
+	CHECK(!lb_pick(g, &t, &r));                             /* nothing passes */
+	g[2][9] = LB_FRAMES;
+	CHECK(lb_pick(g, &t, &r) && t == 2 && r == 9);          /* single point */
+	g[2][9] = 3;
+	CHECK(!lb_pick(g, &t, &r));                             /* partial is a failure */
+	/* A 5x5 passing window at t 3..7, r 1..5: its centre (5, 3) is the farthest from failures. */
+	memset(g, 0, sizeof(g));
+	for (unsigned a = 3; a <= 7; a++) {
+		for (unsigned b = 1; b <= 5; b++) {
+			g[a][b] = LB_FRAMES;
+		}
+	}
+	CHECK(lb_pick(g, &t, &r) && t == 5 && r == 3);
+	/* Everything passes: the middle of the grid. */
+	memset(g, LB_FRAMES, sizeof(g));
+	CHECK(lb_pick(g, &t, &r) && t == (LB_NT - 1) / 2 && r == (LB_NR - 1) / 2);
+	CHECK(LB_NT == 11 && LB_NR == 11 && lb_txd[LB_NT - 1] == 31 && lb_rxd[LB_NR - 1] == 31);
+}
+
+static void
 test_phy(void)
 {
 	unsigned speed = 0;
@@ -156,6 +181,7 @@ main(void)
 {
 	test_syscon();
 	test_yt8531();
+	test_lb_pick();
 	test_phy();
 	test_mac();
 	test_csum();

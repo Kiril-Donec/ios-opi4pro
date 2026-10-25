@@ -477,3 +477,7 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   taps, DHCP replies passed to the stack as well, SIOCGIFMEDIA, vendor PHY LED/sleep setup, log lines
   `iOS DHCP request on en3`, `DHCP reply for iOS`, and at 30/60/120/300 s en3's addresses and the route
   to 1.1.1.1 (via en3 = configd took the service).
+- **2026-10-25, partition 1 v17 (v16 + 9999w v5) written** (owner approved): kernel CI 40215535045
+  (commit 9144be3), CI ADT reproduces its 2cpu payload 9a2764ae... byte for byte, image
+  106f4a01...bec1, read-back verified; v16 (675bd25f...) saved. Test #20: `A733 NETPREFS`, `iOS DHCP
+  request`, route-to-1.1.1.1 lines; Safari http://neverssl.com (clock may be 1970 for HTTPS).

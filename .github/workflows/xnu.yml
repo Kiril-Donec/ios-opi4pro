@@ -41,6 +41,8 @@ on:
       - "a733/xnu-a733-keychain.patch"
       - "a733/xnu-a733-iokit-report.patch"
       - "a733/xnu-a733-sched-bigpref.patch"
+      - "a733/xnu-a733-no-iokitd.patch"
+      - "a733/tests/test_no_iokitd_patch.py"
       - "a733/tests/test_sched_bigpref_patch.py"
       - "a733/tests/test_sched_bigpref.c"
       - "a733/tests/test_iokit_report_patch.py"
@@ -154,6 +156,8 @@ jobs:
           cp a733/xnu-a733-iokit-report.patch dxb/patches/9999t-a733-iokit-report.patch
           # Scheduler: interactive threads to an idle A76 first, background to an A55.
           cp a733/xnu-a733-sched-bigpref.patch dxb/patches/9999u-a733-sched-bigpref.patch
+          # No kernelmanagerd on iOS: do not hold the IOKit root busy for it.
+          cp a733/xnu-a733-no-iokitd.patch dxb/patches/9999v-a733-no-iokitd.patch
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -332,6 +336,9 @@ jobs:
           if b"a733bigpref" not in kernel:
               raise SystemExit("FAIL: A733 scheduler big-core preference overlay was SKIPPED")
           print("PASS: A733 scheduler big-core preference found in compiled XNU Mach-O")
+          if b"a733iokitd" not in kernel:
+              raise SystemExit("FAIL: A733 no-kernelmanagerd overlay was SKIPPED")
+          print("PASS: A733 no-kernelmanagerd overlay found in compiled XNU Mach-O")
           PY
 
       - name: Build static PID1 and HFSX root (native macOS, no Linux mount)

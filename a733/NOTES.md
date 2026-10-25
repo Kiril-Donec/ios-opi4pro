@@ -402,3 +402,9 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - **2026-10-23, partition 1 v12 (v11 + 9999u) written** (owner confirmed): kernel CI 39976367590 (commit
   0966c27), CI ADT reproduces its 2cpu payload 830a7148... byte for byte, image 23bc9565...a0e2,
   read-back verified; v11 (6e376ee3...) was never booted. Test #16 pending (IOKit busy report + feel).
+- **Board test #16 (v12) card log:** the 9999t report found exactly one busy service at 60 s and 180 s:
+  `LEAF busy 1 D22AP <IOPlatformExpertDevice> state 0x1e` (132 / 161 services). Cause: StartIOKitMatching
+  adds a root busy count until the IOKit daemon (kernelmanagerd) checks in (IOService::iokitDaemonLaunched);
+  the SWEET kernel uses a macOS-derived config where OSKext::iokitDaemonAvailable() is true, but iOS has
+  no kernelmanagerd (never exec'd in any log). **Patch 9999v (`xnu-a733-no-iokitd.patch`):** false on
+  SWEET unless `a733iokitd=1` (no root busy hold, no deferred-match list).

@@ -1,0 +1,26 @@
+diff --git a/libkern/c++/OSKext.cpp b/libkern/c++/OSKext.cpp
+index 82661cf..7056a60 100644
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -1485,6 +1485,21 @@ OSKext::iokitDaemonAvailable(void)
+ 	if (PE_parse_boot_argn("-restore", &notused, sizeof(notused))) {
+ 		return false;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * A733: the kernel is built from a macOS-derived config, but the iOS
++	 * userland has no kernelmanagerd. With the daemon "available" the root
++	 * stays busy until it checks in (StartIOKitMatching), so IOKit never
++	 * quiesces: configd's InterfaceNamer and Settings > About waited forever
++	 * (board test #16: only D22AP <IOPlatformExpertDevice> busy). Boot-arg
++	 * a733iokitd=1 restores the wait.
++	 */
++	int wait_daemon = 0;
++	PE_parse_boot_argn("a733iokitd", &wait_daemon, sizeof(wait_daemon));
++	if (!wait_daemon) {
++		return false;
++	}
++#endif
+ 	return true;
+ }
+ 

@@ -455,3 +455,10 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
 - **2026-10-25, partition 1 v16 (v15 + 9999w v4) written** (owner approved): kernel CI 40205427879
   (commit f68f90c), CI ADT reproduces its 2cpu payload 31ed955a... byte for byte, image
   675bd25f...ea3b, read-back verified; v15 (7b9a7007...) saved. Test #19: loopback grids in the log.
+- **Board test #19 (v16): Ethernet works in the kernel.** Loopback grids: 100 Mbit/s passes at every
+  point (ext and int clock, 121/121); 1000 Mbit/s passes only at rx 3..13 (tx 0..15) with either
+  clock, chosen tx 12 rx 13. Live link 100 Mbit/s with tx 15 rx 16: **DHCP OFFER/ACK 192.168.0.190/24
+  from 192.168.0.1 (lease 7200 s)**, no RX CRC errors after calibration, ~20 unicast frames sent by
+  the IP stack (ARP replies). So the v15 failure was RX delay (DHCP offers lost to CRC errors), not
+  TX. iOS apps still have no network: configd/mDNSResponder run but do not know en3 (no IOKit
+  network interface, no default route or DNS). IOKit quiet, clean shutdown.

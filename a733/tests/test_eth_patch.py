@@ -63,9 +63,11 @@ class EthPatch(unittest.TestCase):
         self.assertRegex(self.code, r"#define YT8531_PHY_ID1\s+0x4f51")
         self.assertRegex(self.code, r"#define YT8531_SYNCE_CFG\s+0xa012")
         self.assertIn("eth_apply_variant(0);\n\t(void)mdio_write(eth.phy_addr, 4, 0x01e1);", self.eth)
-        # Extended registers only for the YT8531, and only 0xA012 is written.
-        self.assertEqual(re.findall(r"\(void\)phy_ext_write\(([^;]*)\);", self.code),
-                         ["YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125)"])
+        # YT8531 extended registers: delays off (0xA001/0xA003, motorcomm.c "rgmii") and CLK_OUT (0xA012).
+        self.assertCountEqual(re.findall(r"\(void\)phy_ext_write\(([^;]*)\);", self.code),
+                         ["YT8531_CHIP_CONFIG, (uint16_t)(c1 & ~YT8531_CCR_RXC_DLY_EN)",
+                          "YT8531_RGMII_CONFIG1,\n\t\t    (uint16_t)(r1 & ~(YT8531_RC1R_RX_DELAY | YT8531_RC1R_GE_TX_DELAY))",
+                          "YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125)"])
         self.assertIn("if (eth.phy_id1 == YT8531_PHY_ID1 && phy_ext_read(YT8531_SYNCE_CFG, &old) == 0) {", self.eth)
 
     def test_power_rails(self) -> None:

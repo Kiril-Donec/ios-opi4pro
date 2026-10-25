@@ -12,10 +12,10 @@ index 5f413e4..4d3ea20 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a733_eth.c b/bsd/dev/a733_eth.c
 new file mode 100644
-index 0000000..27ef717
+index 0000000..cd5dd2e
 --- /dev/null
 +++ b/bsd/dev/a733_eth.c
-@@ -0,0 +1,1078 @@
+@@ -0,0 +1,1093 @@
 +/*
 + * Allwinner A733 / Orange Pi 4 Pro gigabit Ethernet (gmac0), first stage.
 + *
@@ -101,6 +101,11 @@ index 0000000..27ef717
 +#define YT8531_SCR_ENABLE       (1u << 6)
 +#define YT8531_SCR_125M         (1u << 4)
 +#define YT8531_SCR_SRC_MASK     (7u << 1)
++#define YT8531_CHIP_CONFIG      0xa001
++#define YT8531_CCR_RXC_DLY_EN   (1u << 8)
++#define YT8531_RGMII_CONFIG1    0xa003
++#define YT8531_RC1R_RX_DELAY    (0xfu << 10)
++#define YT8531_RC1R_GE_TX_DELAY 0xfu
 +
 +static uint16_t
 +yt8531_clkout(uint16_t old, bool m125)
@@ -582,6 +587,16 @@ index 0000000..27ef717
 +		(void)phy_ext_read(0xa003, &r1);
 +		(void)phy_ext_read(YT8531_SYNCE_CFG, &sc);
 +		printf("A733 ETH: YT8531 chip config 0x%04x, RGMII config 0x%04x, SyncE 0x%04x\n", c1, r1, sc);
++		/*
++		 * phy-mode "rgmii" (board DT): the MAC delay chains add the skew, so the PHY adds none
++		 * (motorcomm.c ytphy_rgmii_clk_delay_config: RXC_DLY_EN off, RX / GE TX delay 0).
++		 */
++		(void)phy_ext_write(YT8531_CHIP_CONFIG, (uint16_t)(c1 & ~YT8531_CCR_RXC_DLY_EN));
++		(void)phy_ext_write(YT8531_RGMII_CONFIG1,
++		    (uint16_t)(r1 & ~(YT8531_RC1R_RX_DELAY | YT8531_RC1R_GE_TX_DELAY)));
++		(void)phy_ext_read(0xa001, &c1);
++		(void)phy_ext_read(0xa003, &r1);
++		printf("A733 ETH: YT8531 internal RGMII delays off: chip config 0x%04x, RGMII config 0x%04x\n", c1, r1);
 +	}
 +	(void)mdio_write(eth.phy_addr, 0, 1u << 15);            /* BMCR reset */
 +	for (unsigned i = 0; i < 100; i++) {

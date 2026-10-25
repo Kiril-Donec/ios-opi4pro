@@ -26,7 +26,8 @@ PATCH = A733 / "xnu-a733-eth.patch"
 TESTS = A733 / "tests"
 NET_HEADERS = ("sys/errno.h", "kern/locks.h", "sys/kpi_mbuf.h", "sys/kpi_socket.h", "sys/sockio.h", "net/if.h",
                "net/if_types.h", "net/ethernet.h", "net/if_ether.h", "net/ether_if_module.h",
-               "net/kpi_interface.h", "net/kpi_protocol.h", "netinet/in.h")
+               "net/kpi_interface.h", "net/kpi_protocol.h", "netinet/in.h", "net/bpf.h", "net/if_media.h",
+               "net/route.h")
 
 
 class EthPatch(unittest.TestCase):
@@ -39,7 +40,7 @@ class EthPatch(unittest.TestCase):
 
     def test_shape(self) -> None:
         self.assertEqual(set(self.sections), {"bsd/conf/files", "bsd/dev/a733_eth.c", "bsd/dev/a733_power.c",
-                                              "iokit/bsddev/IOKitBSDInit.cpp"})
+                                              "bsd/dev/a733_firstboot.c", "iokit/bsddev/IOKitBSDInit.cpp"})
         for path, section in self.sections.items():
             check_hunk_counts(section)
             self.assertEqual([l for l in section if l.startswith("-") and not l.startswith("---")], [], path)
@@ -66,7 +67,9 @@ class EthPatch(unittest.TestCase):
         # YT8531 extended registers: only CLK_OUT (0xA012). Test #18: turning the PHY delays off
         # (mainline motorcomm.c for "rgmii") broke RX, so they stay as strapped.
         self.assertEqual(re.findall(r"\(void\)phy_ext_write\(([^;]*)\);", self.code),
-                         ["YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125)"])
+                         ["YT8531_SYNCE_CFG, yt8531_clkout(old, v->phy125)",
+                          "YT8531_SLEEP_CTRL1, (uint16_t)(sleep & ~YT8531_SLEEP_SW)",
+                          "YT8531_LED1_CFG, 0x2600", "YT8531_LED2_CFG, 0x2070", "YT8531_LED_BLINK_CFG, 0x000a"])
         self.assertIn("if (eth.phy_id1 == YT8531_PHY_ID1 && phy_ext_read(YT8531_SYNCE_CFG, &old) == 0) {", self.eth)
 
     def test_power_rails(self) -> None:
@@ -135,6 +138,60 @@ class EthPatch(unittest.TestCase):
         usb = re.search(r"USB_DMA_BASE = (0x[0-9a-fA-F]+)\nUSB_DMA_SIZE = (0x[0-9a-fA-F]+)", tool)
         self.assertLessEqual(int(usb.group(1), 16) + int(usb.group(2), 16), 0x60100000)
         self.assertNotIn('"interrupts"', tool[tool.index('Node("a733-eth"'):tool.index("return Node(\"device-tree\"")])
+
+    def test_ios_integration(self) -> None:
+        code = self.code
+        # IPConfiguration sends its first DHCP packets through BPF and gets the replies on a UDP socket.
+        self.assertIn("bpfattach(eth.ifp, DLT_EN10MB, ETHER_HDR_LEN);", code)
+        self.assertIn("bpf_tap_out(ifp, DLT_EN10MB, m, NULL, 0);", code)
+        self.assertIn("bpf_tap_in(eth.ifp, DLT_EN10MB, m, frame_header, ETHER_HDR_LEN);", code)
+        # DHCP replies reach the stack too (no "else" after the kernel client).
+        self.assertRegex(code, r"eth_dhcp_reply\(buf, len\);(?s:(?:(?!else).)*?)\n\t\t\t}\n\t\t\tif \(eth\.ifp != NULL\) \{")
+        # ... and the log shows whether iOS's own DHCP client runs on en3.
+        self.assertIn('printf("A733 ETH: iOS DHCP request on en%u', code)
+        self.assertIn('printf("A733 ETH: DHCP reply for iOS (xid %08x) passed to the stack\\n",', code)
+        # Media status for KernelEventMonitor / IPConfiguration.
+        self.assertIn("case SIOCGIFMEDIA32:\n\tcase SIOCGIFMEDIA64: {", code)
+        self.assertIn("ifmr->ifm_status = IFM_AVALID | (eth.link ? IFM_ACTIVE : 0);", code)
+        # Vendor PHY setup (BSP motorcomm.c phy_yt8531_led_fixup, auto sleep off).
+        for reg, val in (("YT8531_LED1_CFG", "0x2600"), ("YT8531_LED2_CFG", "0x2070"),
+                         ("YT8531_LED_BLINK_CFG", "0x000a")):
+            self.assertIn(f"(void)phy_ext_write({reg}, {val});", code)
+        self.assertRegex(code, r"#define YT8531_LED1_CFG\s+0xa00d")
+        self.assertRegex(code, r"#define YT8531_LED2_CFG\s+0xa00e")
+        self.assertRegex(code, r"#define YT8531_LED_BLINK_CFG\s+0xa00f")
+        self.assertRegex(code, r"#define YT8531_SLEEP_CTRL1\s+0x0027")
+
+    def test_netprefs_plist(self) -> None:
+        import plistlib
+        fb = "\n".join(l[1:] for l in self.sections["bsd/dev/a733_firstboot.c"] if l.startswith("+"))
+        macros = dict(re.findall(r'#define (NP_\w+)\s+"([^"]*)"', fb))
+        body = fb[fb.index("static const char np_body[] =") + len("static const char np_body[] ="):]
+        body = body[:body.index(";\n")]
+        text = ""
+        for lit, name in re.findall(r'"((?:[^"\\]|\\.)*)"|(NP_\w+)', body):
+            text += macros[name] if name else lit.encode().decode("unicode_escape")
+        head = ('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n')
+        prefs = plistlib.loads((head + text + "</dict>\n</plist>\n").encode())
+        svc, setid = macros["NP_SERVICE"], macros["NP_SET"]
+        self.assertEqual(prefs["CurrentSet"], f"/Sets/{setid}")
+        self.assertEqual(prefs["__VERSION__"], 20191120)        # NETWORK_CONFIGURATION_VERSION, configd-1241
+        self.assertNotIn("Model", prefs)                         # no "Hardware model changed" archive
+        s = prefs["NetworkServices"][svc]
+        self.assertEqual(s["Interface"], {"DeviceName": "en3", "Hardware": "Ethernet", "Type": "Ethernet",
+                                          "UserDefinedName": "Ethernet"})
+        self.assertEqual(s["IPv4"], {"ConfigMethod": "DHCP"})
+        net = prefs["Sets"][setid]["Network"]
+        self.assertEqual(net["Service"][svc]["__LINK__"], f"/NetworkServices/{svc}")
+        self.assertEqual(net["Global"]["IPv4"]["ServiceOrder"], [svc])
+        for u in (svc, setid):
+            self.assertRegex(u, r"^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}$")
+        self.assertIn('#define NP_FILE         NP_DIR "/preferences.plist"', fb)
+        self.assertIn('#define NP_DIR          "/private/var/preferences/SystemConfiguration"', fb)
+        self.assertIn('+\tfb_netprefs();\n \tPE_parse_boot_argn("a733setupskip"',
+                      "\n".join(self.sections["bsd/dev/a733_firstboot.c"]))
+        self.assertIn('PE_parse_boot_argn("a733netprefs", &mode, sizeof(mode));', fb)
 
     @unittest.skipUnless(CC, "no host C compiler")
     def test_logic_host(self) -> None:

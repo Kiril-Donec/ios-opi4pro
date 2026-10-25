@@ -462,3 +462,18 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   the IP stack (ARP replies). So the v15 failure was RX delay (DHCP offers lost to CRC errors), not
   TX. iOS apps still have no network: configd/mDNSResponder run but do not know en3 (no IOKit
   network interface, no default route or DNS). IOKit quiet, clean shutdown.
+- **iOS network research (offline, configd-1241.140.6 / bootp-441.140.2 sources = the versions in the
+  image):** configd's built-in PreferencesMonitor flattens /Library/Preferences/SystemConfiguration/
+  preferences.plist (`/Library/Preferences` -> `/private/var/preferences`) into Setup:; it never
+  removes a service for a missing IOKit interface (only "excluded"/"pre-configured" ones), skips the
+  upgrade/clean pass when `__VERSION__` = 20191120, and archives the file only if a `Model` key differs.
+  IPConfiguration takes any Setup: service with Interface Type + DeviceName, finds the interface by
+  getifaddrs, sends the first DHCP packets through BPF and receives on a UDP socket (SO_RECV_ANYIF);
+  IPMonitor then sets the default route and DNS. So no IOKit interface is needed. Vendor BSP
+  motorcomm.c for id 0x4f51e91b: CLK_OUT 0xa012=0xd0, auto sleep off (ext 0x27 bit 15), LEDs
+  0xa00d=0x2600 / 0xa00e=0x2070 / 0xa00f=0x0a; PHY delays untouched.
+  **9999w v5:** a733_firstboot.c writes that preferences.plist once (Ethernet service on en3, IPv4 DHCP,
+  marker /private/var/root/.a733-netprefs-v1, boot-arg a733netprefs=0/2); a733_eth.c: bpfattach +
+  taps, DHCP replies passed to the stack as well, SIOCGIFMEDIA, vendor PHY LED/sleep setup, log lines
+  `iOS DHCP request on en3`, `DHCP reply for iOS`, and at 30/60/120/300 s en3's addresses and the route
+  to 1.1.1.1 (via en3 = configd took the service).

@@ -12,10 +12,10 @@ index 5f413e4..4d3ea20 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a733_eth.c b/bsd/dev/a733_eth.c
 new file mode 100644
-index 0000000..86ff47c
+index 0000000..a92d8b8
 --- /dev/null
 +++ b/bsd/dev/a733_eth.c
-@@ -0,0 +1,1284 @@
+@@ -0,0 +1,1403 @@
 +/*
 + * Allwinner A733 / Orange Pi 4 Pro gigabit Ethernet (gmac0), first stage.
 + *
@@ -60,6 +60,9 @@ index 0000000..86ff47c
 +#include <net/ether_if_module.h>
 +#include <net/kpi_interface.h>
 +#include <net/kpi_protocol.h>
++#include <net/bpf.h>
++#include <net/if_media.h>
++#include <net/route.h>
 +#include <netinet/in.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -101,6 +104,11 @@ index 0000000..86ff47c
 +#define YT8531_SCR_ENABLE       (1u << 6)
 +#define YT8531_SCR_125M         (1u << 4)
 +#define YT8531_SCR_SRC_MASK     (7u << 1)
++#define YT8531_SLEEP_CTRL1      0x0027
++#define YT8531_SLEEP_SW         (1u << 15)
++#define YT8531_LED1_CFG         0xa00d
++#define YT8531_LED2_CFG         0xa00e
++#define YT8531_LED_BLINK_CFG    0xa00f
 +
 +static uint16_t
 +yt8531_clkout(uint16_t old, bool m125)
@@ -483,6 +491,7 @@ index 0000000..86ff47c
 +	int dhcp_state;                 /* 0 idle, 1 discovering, 2 requesting, 3 bound */
 +	uint32_t xid, offer_ip, offer_server, ip, mask, router;
 +	unsigned dhcp_tries;
++	unsigned ios_dhcp_tx, ios_dhcp_rx;
 +	uint64_t dhcp_next_ms;
 +} eth;
 +
@@ -660,6 +669,21 @@ index 0000000..86ff47c
 +	}
 +	eth.clk_ext = true;
 +	eth_apply_variant(0);                   /* CLK_OUT 125 MHz before anything is clocked from it */
++	if (eth.phy_id1 == YT8531_PHY_ID1) {
++		/*
++		 * As the vendor kernel does for this PHY (BSP motorcomm.c genphy_config_init /
++		 * phy_yt8531_led_fixup): auto sleep off, and its LED setup (one LED on with a
++		 * link at any speed, one blinking on traffic) instead of the strapped one.
++		 */
++		uint16_t sleep = 0;
++		if (phy_ext_read(YT8531_SLEEP_CTRL1, &sleep) == 0) {
++			(void)phy_ext_write(YT8531_SLEEP_CTRL1, (uint16_t)(sleep & ~YT8531_SLEEP_SW));
++		}
++		(void)phy_ext_write(YT8531_LED1_CFG, 0x2600);
++		(void)phy_ext_write(YT8531_LED2_CFG, 0x2070);
++		(void)phy_ext_write(YT8531_LED_BLINK_CFG, 0x000a);
++		printf("A733 ETH: YT8531 vendor setup: auto sleep off (0x%04x), LEDs 0x2600 / 0x2070 / 0x000a\n", sleep);
++	}
 +	return 0;
 +}
 +
@@ -796,10 +820,30 @@ index 0000000..86ff47c
 +	return true;
 +}
 +
++/* Current medium for SIOCGIFMEDIA: Ethernet, speed and duplex of the link (autoselect without one). */
++static int
++eth_media_word(void)
++{
++	if (!eth.link) {
++		return IFM_ETHER | IFM_AUTO;
++	}
++	int m = IFM_ETHER | (eth.speed == 1000 ? IFM_1000_T : eth.speed == 100 ? IFM_100_TX : IFM_10_T);
++	return m | (eth.full ? IFM_FDX : IFM_HDX);
++}
++
 +static errno_t
 +eth_if_output(ifnet_t ifp, mbuf_t m)
 +{
 +	size_t len = mbuf_pkthdr_len(m);
++	bpf_tap_out(ifp, DLT_EN10MB, m, NULL, 0);
++	/* DHCP from iOS itself (configd's IPConfiguration): proof that it took en3. */
++	uint8_t h[14 + 20 + 8 + 4 + 8];
++	if (len >= sizeof(h) && eth.ios_dhcp_tx < 5 && mbuf_copydata(m, 0, sizeof(h), h) == 0 &&
++	    h[12] == 0x08 && h[13] == 0x00 && h[14 + 9] == 17 && h[14 + 20 + 1] == 68 && h[14 + 20 + 3] == 67) {
++		eth.ios_dhcp_tx++;
++		printf("A733 ETH: iOS DHCP request on en%u (xid %08x, %zu bytes)\n", eth.unit, get32(h + 14 + 20 + 8 + 4),
++		    len);
++	}
 +	lck_mtx_lock(eth.lock);
 +	bool ok = eth_tx_frame_locked(NULL, (unsigned)len, m);
 +	lck_mtx_unlock(eth.lock);
@@ -809,9 +853,27 @@ index 0000000..86ff47c
 +}
 +
 +static errno_t
-+eth_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++eth_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
 +{
 +	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = cmd == SIOCGIFMEDIA64 ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = eth_media_word();
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (eth.link ? IFM_ACTIVE : 0);
++		if (list == USER_ADDR_NULL) {
++			ifmr->ifm_count = 1;
++		} else if (ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		return 0;
++	}
 +	case SIOCSIFADDR:
 +	case SIOCAIFADDR:
 +		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
@@ -874,6 +936,7 @@ index 0000000..86ff47c
 +		return;
 +	}
 +	ifnet_set_lladdr(eth.ifp, eth.lladdr, ETHER_ADDR_LEN);
++	bpfattach(eth.ifp, DLT_EN10MB, ETHER_HDR_LEN);
 +	(void)proto_plumb(PF_INET, eth.ifp);
 +	printf("A733 ETH: interface en%u attached\n", eth.unit);
 +}
@@ -996,7 +1059,13 @@ index 0000000..86ff47c
 +			if (len > 14 + 20 + 8 && buf[12] == 0x08 && buf[13] == 0x00 && buf[14 + 9] == 17 &&
 +			    buf[14 + 20 + 2] == 0 && buf[14 + 20 + 3] == 68) {
 +				eth_dhcp_reply(buf, len);
-+			} else if (eth.ifp != NULL) {
++				if (len > 14 + 20 + 8 + 8 && get32(buf + 14 + 20 + 8 + 4) != eth.xid && eth.ios_dhcp_rx < 5) {
++					eth.ios_dhcp_rx++;
++					printf("A733 ETH: DHCP reply for iOS (xid %08x) passed to the stack\n",
++					    get32(buf + 14 + 20 + 8 + 4));
++				}
++			}
++			if (eth.ifp != NULL) {
 +				mbuf_t m = NULL;
 +				if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
 +				    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
@@ -1010,6 +1079,7 @@ index 0000000..86ff47c
 +					mbuf_pkthdr_setheader(m, frame_header);
 +					mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
 +					(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++					bpf_tap_in(eth.ifp, DLT_EN10MB, m, frame_header, ETHER_HDR_LEN);
 +					stats.packets_in = 1;
 +					stats.bytes_in = len;
 +					ifnet_input(eth.ifp, m, &stats);
@@ -1188,6 +1258,49 @@ index 0000000..86ff47c
 +	eth_autoneg();
 +}
 +
++/* Log en3's IPv4 addresses and the route the stack would use for 1.1.1.1 (default route by configd?). */
++static void
++eth_net_report(unsigned secs)
++{
++	ifaddr_t *addrs = NULL;
++	unsigned n4 = 0;
++	char line[160];
++	int pos = snprintf(line, sizeof(line), "A733 ETH: %u s: en%u IPv4", secs, eth.unit);
++	if (eth.ifp != NULL && ifnet_get_address_list_family(eth.ifp, &addrs, AF_INET) == 0 && addrs != NULL) {
++		for (unsigned i = 0; addrs[i] != NULL && pos < (int)sizeof(line) - 20; i++) {
++			struct sockaddr_in sin;
++			if (ifaddr_address(addrs[i], (struct sockaddr *)&sin, sizeof(sin)) == 0) {
++				uint32_t a = ntohl(sin.sin_addr.s_addr);
++				pos += snprintf(line + pos, sizeof(line) - (size_t)pos, " %u.%u.%u.%u", a >> 24, (a >> 16) & 255,
++				    (a >> 8) & 255, a & 255);
++				n4++;
++			}
++		}
++		ifnet_free_address_list(addrs);
++	}
++	printf("%s%s\n", line, n4 ? "" : " none");
++
++	struct sockaddr_in dst;
++	bzero(&dst, sizeof(dst));
++	dst.sin_len = sizeof(dst);
++	dst.sin_family = AF_INET;
++	dst.sin_addr.s_addr = htonl(0x01010101);
++	struct rtentry *rt = rtalloc1((struct sockaddr *)&dst, 0, 0);
++	if (rt == NULL) {
++		printf("A733 ETH: %u s: no route to 1.1.1.1 (no default route: configd has not taken en%u)\n", secs,
++		    eth.unit);
++		return;
++	}
++	uint32_t gw = 0;
++	if (rt->rt_gateway != NULL && rt->rt_gateway->sa_family == AF_INET) {
++		gw = ntohl(((struct sockaddr_in *)(void *)rt->rt_gateway)->sin_addr.s_addr);
++	}
++	printf("A733 ETH: %u s: route to 1.1.1.1 via %u.%u.%u.%u on %s%u%s\n", secs, gw >> 24, (gw >> 16) & 255,
++	    (gw >> 8) & 255, gw & 255, rt->rt_ifp ? ifnet_name(rt->rt_ifp) : "?", rt->rt_ifp ? ifnet_unit(rt->rt_ifp) : 0,
++	    rt->rt_ifp == eth.ifp ? " (default route on Ethernet: configd configured it)" : "");
++	rtfree(rt);
++}
++
 +static void
 +eth_thread(__unused void *arg, __unused wait_result_t wr)
 +{
@@ -1205,7 +1318,9 @@ index 0000000..86ff47c
 +	}
 +	eth_calibrate();
 +	eth_if_create();
-+	uint64_t last_link = 0, last_stats = eth_now_ms();
++	uint64_t last_link = 0, last_stats = eth_now_ms(), t_attach = eth_now_ms();
++	unsigned report = 0;
++	static const unsigned report_s[] = { 30, 60, 120, 300 };
 +	for (;;) {
 +		eth_sleep_ms(2);
 +		uint64_t now = eth_now_ms();
@@ -1218,6 +1333,10 @@ index 0000000..86ff47c
 +		uint32_t st = rd32(eth.mac, DMA_CH0_STATUS);
 +		if (st) {
 +			wr32(eth.mac, DMA_CH0_STATUS, st);
++		}
++		if (report < sizeof(report_s) / sizeof(report_s[0]) && now - t_attach >= 1000ull * report_s[report]) {
++			eth_net_report(report_s[report]);
++			report++;
 +		}
 +		if (now - last_stats >= 60000) {
 +			last_stats = now;
@@ -1300,6 +1419,111 @@ index 0000000..86ff47c
 +}
 +#endif /* !A733_ETH_HOST_TEST */
 +#endif /* ARM64_BOARD_CONFIG_SWEET || A733_ETH_HOST_TEST */
+diff --git a/bsd/dev/a733_firstboot.c b/bsd/dev/a733_firstboot.c
+index e4e5c17..dab5031 100644
+--- a/bsd/dev/a733_firstboot.c
++++ b/bsd/dev/a733_firstboot.c
+@@ -184,6 +184,92 @@ fb_file_has(const char *path, const char *needle)
+ 	return false;
+ }
+ 
++/*
++ * Ethernet for iOS (a733_eth.c attaches the bare BSD interface en3; there is no
++ * IOKit network interface, so configd never creates a service for it). A
++ * SystemConfiguration preferences.plist with one Ethernet service on en3, IPv4
++ * by DHCP: PreferencesMonitor publishes it as Setup:, IPConfiguration runs DHCP
++ * on en3 and IPMonitor makes it the primary service (default route, DNS for
++ * mDNSResponder). Layout as written by SCPreferences (configd-1241.140.6);
++ * __VERSION__ = NETWORK_CONFIGURATION_VERSION so no upgrade/clean pass runs, and
++ * no Model key so PreferencesMonitor does not archive it as "other hardware".
++ * Written whole once (own marker); boot-arg a733netprefs=0 off, =2 rewrite.
++ */
++#define NP_DIR          "/private/var/preferences/SystemConfiguration"
++#define NP_FILE         NP_DIR "/preferences.plist"
++#define NP_MARKER       "/private/var/root/.a733-netprefs-v1"
++#define NP_SERVICE      "A7330E73-0000-4000-8000-0000000000E3"
++#define NP_SET          "A7330E73-0000-4000-8000-00000000005E"
++
++static const char np_body[] =
++    "\t<key>CurrentSet</key>\n\t<string>/Sets/" NP_SET "</string>\n"
++    "\t<key>NetworkServices</key>\n\t<dict>\n"
++    "\t\t<key>" NP_SERVICE "</key>\n\t\t<dict>\n"
++    "\t\t\t<key>DNS</key>\n\t\t\t<dict/>\n"
++    "\t\t\t<key>IPv4</key>\n\t\t\t<dict>\n"
++    "\t\t\t\t<key>ConfigMethod</key>\n\t\t\t\t<string>DHCP</string>\n"
++    "\t\t\t</dict>\n"
++    "\t\t\t<key>Interface</key>\n\t\t\t<dict>\n"
++    "\t\t\t\t<key>DeviceName</key>\n\t\t\t\t<string>en3</string>\n"
++    "\t\t\t\t<key>Hardware</key>\n\t\t\t\t<string>Ethernet</string>\n"
++    "\t\t\t\t<key>Type</key>\n\t\t\t\t<string>Ethernet</string>\n"
++    "\t\t\t\t<key>UserDefinedName</key>\n\t\t\t\t<string>Ethernet</string>\n"
++    "\t\t\t</dict>\n"
++    "\t\t\t<key>Proxies</key>\n\t\t\t<dict/>\n"
++    "\t\t\t<key>UserDefinedName</key>\n\t\t\t<string>Ethernet</string>\n"
++    "\t\t</dict>\n"
++    "\t</dict>\n"
++    "\t<key>Sets</key>\n\t<dict>\n"
++    "\t\t<key>" NP_SET "</key>\n\t\t<dict>\n"
++    "\t\t\t<key>Network</key>\n\t\t\t<dict>\n"
++    "\t\t\t\t<key>Global</key>\n\t\t\t\t<dict>\n"
++    "\t\t\t\t\t<key>IPv4</key>\n\t\t\t\t\t<dict>\n"
++    "\t\t\t\t\t\t<key>ServiceOrder</key>\n\t\t\t\t\t\t<array>\n"
++    "\t\t\t\t\t\t\t<string>" NP_SERVICE "</string>\n"
++    "\t\t\t\t\t\t</array>\n"
++    "\t\t\t\t\t</dict>\n"
++    "\t\t\t\t</dict>\n"
++    "\t\t\t\t<key>Service</key>\n\t\t\t\t<dict>\n"
++    "\t\t\t\t\t<key>" NP_SERVICE "</key>\n\t\t\t\t\t<dict>\n"
++    "\t\t\t\t\t\t<key>__LINK__</key>\n"
++    "\t\t\t\t\t\t<string>/NetworkServices/" NP_SERVICE "</string>\n"
++    "\t\t\t\t\t</dict>\n"
++    "\t\t\t\t</dict>\n"
++    "\t\t\t</dict>\n"
++    "\t\t\t<key>UserDefinedName</key>\n\t\t\t<string>Automatic</string>\n"
++    "\t\t</dict>\n"
++    "\t</dict>\n"
++    "\t<key>__VERSION__</key>\n\t<integer>20191120</integer>\n";
++
++static void
++fb_netprefs(void)
++{
++	uint32_t mode = 1;
++	PE_parse_boot_argn("a733netprefs", &mode, sizeof(mode));
++	if (mode == 0) {
++		return;
++	}
++	if (mode != 2 && fb_exists(NP_MARKER)) {
++		printf("A733 NETPREFS: done before (%s)\n", NP_MARKER);
++		return;
++	}
++	if (!fb_exists("/private/var/preferences")) {
++		printf("A733 NETPREFS: /private/var/preferences missing, not an iOS root; skipped\n");
++		return;
++	}
++	bool had = fb_exists(NP_FILE);
++	int error = fb_mkdir(NP_DIR, 0);
++	if (!error) {
++		error = fb_write(NP_FILE, FB_HEAD, np_body, FB_TAIL, 0, 0644);
++	}
++	printf("A733 NETPREFS: %s Ethernet service on en3 (DHCP) %s (%d)\n", NP_FILE,
++	    error ? "FAILED" : had ? "written over configd's" : "written", error);
++	if (!error) {
++		error = fb_write(NP_MARKER, "", "A733 network preferences v1 (Ethernet en3, DHCP)\n", "", 0, 0644);
++		printf("A733 NETPREFS: marker %s (%d)\n", error ? "FAILED" : "written", error);
++	}
++}
++
+ void a733_firstboot_tweaks(void);
+ 
+ void
+@@ -193,6 +279,7 @@ a733_firstboot_tweaks(void)
+ 	uint32_t mode = 1;
+ 	unsigned ok = 0, failed = 0;
+ 
++	fb_netprefs();
+ 	PE_parse_boot_argn("a733setupskip", &mode, sizeof(mode));
+ 	if (mode == 0) {
+ 		return;
 diff --git a/bsd/dev/a733_power.c b/bsd/dev/a733_power.c
 index bbd65c1..dd83bfa 100644
 --- a/bsd/dev/a733_power.c

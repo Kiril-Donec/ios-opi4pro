@@ -19,7 +19,11 @@ typedef struct socket *socket_t;
 typedef u_int32_t mbuf_flags_t;
 typedef int mbuf_how_t;
 typedef int mbuf_type_t;
-struct sockaddr;
+struct sockaddr {
+	u_int8_t sa_len;
+	u_int8_t sa_family;
+	char sa_data[14];
+};
 struct sockaddr_dl;
 
 #define EOPNOTSUPP 102
@@ -72,16 +76,11 @@ struct sockaddr_in {
 	struct in_addr sin_addr;
 	char sin_zero[8];
 };
-struct sockaddr_stub {
-	u_int8_t sa_len;
-	u_int8_t sa_family;
-	char sa_data[14];
-};
 struct ifaliasreq {
 	char ifra_name[IFNAMSIZ];
-	struct sockaddr_stub ifra_addr;
-	struct sockaddr_stub ifra_broadaddr;
-	struct sockaddr_stub ifra_mask;
+	struct sockaddr ifra_addr;
+	struct sockaddr ifra_broadaddr;
+	struct sockaddr ifra_mask;
 };
 struct ifnet_stat_increment_param {
 	u_int32_t packets_in, bytes_in, errors_in, packets_out, bytes_out, errors_out, collisions, dropped;
@@ -160,3 +159,65 @@ typedef void (*sock_upcall)(socket_t so, void *cookie, int waitf);
 errno_t sock_socket(int domain, int type, int protocol, sock_upcall callback, void *cookie, socket_t *new_so);
 errno_t sock_ioctl(socket_t so, unsigned long request, void *argp);
 void sock_close(socket_t so);
+
+/* 9999w v5: BPF, media status, address / route report (bsd/net/bpf.h, if_media.h, if_private.h,
+ * route_private.h, kpi_interface.h, sys/sockio.h). */
+#define DLT_EN10MB 1
+void bpfattach(ifnet_t interface, unsigned int data_link_type, unsigned int header_length);
+void bpf_tap_in(ifnet_t interface, u_int32_t dlt, mbuf_t packet, void *header, size_t header_len);
+void bpf_tap_out(ifnet_t interface, u_int32_t dlt, mbuf_t packet, void *header, size_t header_len);
+#define IFM_ETHER 0x00000020
+#define IFM_AUTO 0
+#define IFM_10_T 3
+#define IFM_100_TX 6
+#define IFM_1000_T 16
+#define IFM_FDX 0x00100000
+#define IFM_HDX 0x00200000
+#define IFM_AVALID 0x00000001
+#define IFM_ACTIVE 0x00000002
+typedef u_int64_t user_addr_t;
+#define USER_ADDR_NULL ((user_addr_t)0)
+#define CAST_USER_ADDR_T(a) ((user_addr_t)(uintptr_t)(a))
+int copyout(const void *kaddr, user_addr_t udaddr, size_t len);
+struct ifmediareq {
+	char ifm_name[IFNAMSIZ];
+	int ifm_current;
+	int ifm_mask;
+	int ifm_status;
+	int ifm_active;
+	int ifm_count;
+	int *ifm_ulist;
+};
+struct ifmediareq64 {
+	char ifm_name[IFNAMSIZ];
+	int ifm_current;
+	int ifm_mask;
+	int ifm_status;
+	int ifm_active;
+	int ifm_count;
+	user_addr_t ifmu_ulist __attribute__((aligned(8)));
+};
+struct ifmediareq32 {
+	char ifm_name[IFNAMSIZ];
+	int ifm_current;
+	int ifm_mask;
+	int ifm_status;
+	int ifm_active;
+	int ifm_count;
+	u_int32_t ifmu_ulist;
+};
+#define SIOCGIFMEDIA32 0xc02c6938UL
+#define SIOCGIFMEDIA64 0xc0306938UL
+typedef struct ifaddr *ifaddr_t;
+errno_t ifnet_get_address_list_family(ifnet_t interface, ifaddr_t **addresses, int family);
+void ifnet_free_address_list(ifaddr_t *addresses);
+errno_t ifaddr_address(ifaddr_t ifaddr, struct sockaddr *out_addr, u_int32_t addr_size);
+const char *ifnet_name(ifnet_t interface);
+u_int32_t ifnet_unit(ifnet_t interface);
+static inline uint32_t ntohl(uint32_t x) { return __builtin_bswap32(x); }
+struct rtentry {
+	struct sockaddr *rt_gateway;
+	ifnet_t rt_ifp;
+};
+struct rtentry *rtalloc1(struct sockaddr *dst, int report, uint32_t ignflags);
+void rtfree(struct rtentry *rt);

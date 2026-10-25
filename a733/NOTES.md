@@ -421,3 +421,8 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   ifnet `en3` (`a733eth_unit`), MAC 02:xx from the SID chip ID; kernel DHCP client (DISCOVER/REQUEST,
   broadcast replies) sets the address with SIOCAIFADDR so the board answers ping. iOS (configd) does not
   see the interface yet: that needs an IOKit IONetworkInterface. `a733eth=0` off. Log lines `A733 ETH:`.
+- **2026-10-25, partition 1 v14 (v13 + 9999w Ethernet) written** (owner approved; v13 was never
+  booted): kernel CI 40199401128 (build job success, packaging cancelled by the force-push), CI ADT
+  reproduces its 2cpu payload 556d160d... byte for byte, ADT with `--eth`, image 642c8710...ff3b,
+  read-back verified; v13 (369b666f...) saved. Test #17: About page, and `A733 ETH:` lines (rails,
+  PHY id, link, DHCP OFFER/ACK, address) with the router cable plugged in before power-on.

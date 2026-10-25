@@ -481,3 +481,11 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   (commit 9144be3), CI ADT reproduces its 2cpu payload 9a2764ae... byte for byte, image
   106f4a01...bec1, read-back verified; v16 (675bd25f...) saved. Test #20: `A733 NETPREFS`, `iOS DHCP
   request`, route-to-1.1.1.1 lines; Safari http://neverssl.com (clock may be 1970 for HTTPS).
+- **Board test #20 (v17): iOS uses the Ethernet.** `A733 NETPREFS` wrote preferences.plist over
+  configd's; configd's IPConfiguration sent its own DHCP (xid 4be4d081) through BPF and got the reply
+  via the stack; at 60 s the route to 1.1.1.1 goes via 192.168.0.1 on en3 (IPMonitor default route).
+  Traffic afterwards: ~38k frames in / 20k out over ~15 min (softwareupdated, nsurlsessiond, timed,
+  mDNSResponder running), 0 RX errors after calibration, 0 TX drops. The YT8531 vendor LED setup works
+  (green LED on/blinking, owner). IOKit quiet, clean triple-press shutdown. Not yet checked by the
+  owner in an app (Safari); possible next items: watch softwareupdated (OTA download attempts),
+  IOKit-visible interface for Settings, gigabit (partner offered only 100 Mbit/s here).

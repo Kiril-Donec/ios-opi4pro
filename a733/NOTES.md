@@ -452,3 +452,6 @@ See `a733/V4-XNU.md` for address bounds and safety assumptions. Do not risk the 
   rx 0..31, 11 x 11 points) for the external and internal TX clock, 4 test frames per point
   (EtherType 0x88b5); per-speed best = passing point farthest from any failure, applied on link up.
   The log prints the grids (`#` all back, `+` some, `x` CRC errors only, `.` nothing).
+- **2026-10-25, partition 1 v16 (v15 + 9999w v4) written** (owner approved): kernel CI 40205427879
+  (commit f68f90c), CI ADT reproduces its 2cpu payload 31ed955a... byte for byte, image
+  675bd25f...ea3b, read-back verified; v15 (7b9a7007...) saved. Test #19: loopback grids in the log.
